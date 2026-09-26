@@ -508,6 +508,7 @@ def claim_recovery_metadata(
             continue
         ownership_flags = ("provisional", "adopted")
         recovery_control_flags = (
+            "entry_price_unverified", "spot_entry_quote_first",
             "claim_release_pending",
             "partial_sold",
             "funding_booked_on_partials_known",
@@ -543,6 +544,127 @@ def claim_recovery_metadata(
         entry_id = _safe_entry_id(extra.get("entry_id"))
         if entry_id is not None:
             metadata["entry_id"] = entry_id
+        basis_keys = (
+            "entry_price_unverified", "entry_basis_pending_closes", "entry_basis_remaining_amount",
+            "spot_entry_client_order_id", "spot_entry_order_id", "spot_entry_observed_amount",
+            "spot_entry_requested_amount", "spot_entry_quote_budget", "spot_entry_quote_first",
+            "spot_entry_initial_invested_usdt", "futures_entry_client_order_id",
+            "futures_entry_order_id", "futures_entry_observed_amount", "futures_entry_requested_amount",
+        )
+        has_basis = any(key in extra for key in basis_keys)
+        if has_basis:
+            from bot_utils.order_utils import order_id_text_or_none
+            from bot_utils.state_persist import _valid_entry_basis_close_fragments
+
+            valid_basis = entry_id is not None
+            for key in basis_keys:
+                if key not in extra:
+                    continue
+                value = extra[key]
+                if key in {"entry_price_unverified", "spot_entry_quote_first"}:
+                    valid = type(value) is bool
+                elif key == "entry_basis_pending_closes":
+                    valid = _valid_entry_basis_close_fragments(value)
+                elif key.endswith("_id"):
+                    valid = value is None or order_id_text_or_none(value) is not None
+                else:
+                    number = _strict_nonnegative_float(value)
+                    valid = number is not None and (
+                        number > 0 or key.endswith("observed_amount")
+                        or key == "entry_basis_remaining_amount")
+                valid_basis = valid_basis and valid
+                if valid:
+                    metadata[key] = copy.deepcopy(value)
+            for key in ("original_amount", "initial_entry_fee", "fees_paid", "entry_contract_size"):
+                if key in extra:
+                    value = _strict_finite_float(extra[key])
+                    valid = value is not None and (value > 0 if key in {"original_amount", "entry_contract_size"} else True)
+                    valid_basis = valid_basis and valid
+                    if valid:
+                        metadata[key] = value
+            boolean_wal = ("verified_flat_pending_accounting", "accounting_pending",
+                           "accounting_already_booked", "accounting_pending_mode_is_sim",
+                           "entry_funding_window_unverified", "accounting_pending_funding_unverified")
+            numeric_wal = ("accounting_pending_sell_price", "accounting_pending_profit_pct",
+                           "accounting_pending_profit_usdt", "accounting_pending_invested_usdt",
+                           "accounting_pending_fees_usdt", "funding_paid", "accounting_pending_funding_paid")
+            text_wal = ("verified_flat_reason", "verified_flat_time", "verified_flat_at", "accounting_pending_sell_time",
+                        "accounting_pending_exchange_order_id", "accounting_pending_reason")
+            for key in boolean_wal + numeric_wal + text_wal:
+                if key not in extra:
+                    continue
+                value = extra[key]
+                valid = (type(value) is bool if key in boolean_wal
+                         else _strict_finite_float(value) is not None if key in numeric_wal
+                         else isinstance(value, str) and bool(value.strip()) and len(value) <= 512)
+                if key in {"verified_flat_time", "verified_flat_at", "accounting_pending_sell_time"}:
+                    valid = _canonical_trade_timestamp(value) is not None
+                valid_basis = valid_basis and valid
+                if valid:
+                    metadata[key] = copy.deepcopy(value)
+            if "accounting_pending_partials" in extra:
+                from bot_utils.state_persist import _valid_pending_accounting_items
+                value = extra["accounting_pending_partials"]
+                valid = _valid_pending_accounting_items(value)
+                valid_basis = valid_basis and valid
+                if valid:
+                    metadata["accounting_pending_partials"] = copy.deepcopy(value)
+            if not valid_basis:
+                recovered[symbol] = {"claim_recovery_invalid": True}
+                continue
+            if extra.get("entry_price_unverified") is True and not any(
+                order_id_text_or_none(extra.get(key)) is not None
+                for key in ("spot_entry_client_order_id", "spot_entry_order_id",
+                            "futures_entry_client_order_id", "futures_entry_order_id")
+            ):
+                recovered[symbol] = {"claim_recovery_invalid": True}
+                continue
+            fragment_keys = ("pending_close_filled_amount", "pending_close_notional_sum",
+                             "pending_close_price", "pending_close_fee", "pending_close_order_id",
+                             "pending_close_reason")
+            if any(key in extra for key in fragment_keys):
+                from bot_utils.close_fragments import pending_close_values
+                try:
+                    close_amount, close_price, _fee, close_oid = pending_close_values(extra)
+                    fragment_valid = (close_amount > 0 and close_price > 0 and close_oid is not None
+                                      and isinstance(extra.get("pending_close_reason"), str)
+                                      and bool(extra["pending_close_reason"].strip()))
+                except (TypeError, ValueError, OverflowError):
+                    fragment_valid = False
+                if not fragment_valid:
+                    recovered[symbol] = {"claim_recovery_invalid": True}
+                    continue
+                metadata.update({key: copy.deepcopy(extra[key]) for key in fragment_keys if key in extra})
+            exit_valid = True
+            for leg in ("partial", "full", "emergency", "launcher"):
+                for suffix in ("client_order_id", "requested_amount", "position_side", "mode",
+                               "created_at", "base_filled_amount", "base_notional_sum", "base_fee",
+                               "observed_filled", "outcome_uncertain"):
+                    key = f"{leg}_exit_{suffix}"
+                    if key not in extra:
+                        continue
+                    value = extra[key]
+                    if value is None:
+                        valid = True
+                    elif suffix == "client_order_id":
+                        valid = order_id_text_or_none(value) is not None
+                    elif suffix == "position_side":
+                        valid = isinstance(value, str) and value in {"LONG", "SHORT"}
+                    elif suffix == "mode":
+                        valid = isinstance(value, str) and value in {"LIVE", "SIM"}
+                    elif suffix == "created_at":
+                        valid = _canonical_trade_timestamp(value) is not None
+                    elif suffix == "outcome_uncertain":
+                        valid = type(value) is bool
+                    else:
+                        number = _strict_finite_float(value)
+                        valid = number is not None and (number >= 0 or suffix == "base_fee")
+                    exit_valid = exit_valid and valid
+                    if valid:
+                        metadata[key] = copy.deepcopy(value)
+            if not exit_valid:
+                recovered[symbol] = {"claim_recovery_invalid": True}
+                continue
         if _has_raw_partial_evidence(extra):
             metadata["partial_claim_recovery_invalid"] = True
 
@@ -567,7 +689,8 @@ def claim_recovery_metadata(
             and state not in {"OPEN", "CLAIMING", "ADOPTING"}
         ) or (
             "position_type" in row
-            and claim_side not in {"FUTURES", "LONG", "SHORT"}
+            and claim_side not in ({"FUTURES", "LONG", "SHORT", "SPOT"} if has_basis
+                                   else {"FUTURES", "LONG", "SHORT"})
         ):
             recovered[symbol] = {"claim_recovery_invalid": True}
             continue

@@ -2313,11 +2313,19 @@ def print_report(s, strategy, days, use_maker, params):
 def run_backtest(strategy, days=DEFAULT_DAYS, use_maker=False, params=None):
     days = _coerce_backtest_days(days)
     params = params or {}
+    # This OHLCV loader has no historical settlement-mark evidence. Scalar
+    # funding must not start a costly run that later cannot settle truthfully.
+    if float(params.get("funding_rate_8h", 0.0) or 0.0) != 0.0:
+        raise ValueError(
+            "OHLCV backtest cannot model scalar --funding without historical "
+            "settlement-mark evidence. This OHLCV CLI does not support it."
+        )
     if strategy == "FUTURES" and not float(params.get("funding_rate_8h", 0.0) or 0.0):
         print(
             "  FUNDING NOT MODELLED  perpetual funding is 0 for this run. "
-            "Real leveraged FUTURES pays funding every 8h; reported edge is "
-            "OPTIMISTIC. Pass --funding R (e.g. --funding 0.0001) to include it.\n"
+            "Real leveraged FUTURES incurs funding at venue settlement times; reported edge is "
+            "OPTIMISTIC. Scalar --funding is unsupported here without "
+            "historical settlement-mark evidence.\n"
         )
     print(
         f"Backtest {strategy} | {days} days | RT {calc_round_trip(use_maker, strategy) * 100:.2f}%\n"

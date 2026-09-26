@@ -118,29 +118,6 @@ def _norm(text: str) -> str:
     return str(text or "").replace("\\", "/").lower()
 
 
-def _module_token_seen(cmdline: str, module: str) -> bool:
-    if not module:
-        return False
-    escaped = re.escape(module)
-    return bool(
-        re.search(
-            rf"(?:^|\s)-m\s+(?:\"{escaped}\"|'{escaped}'|{escaped})(?=\s|$)",
-            cmdline,
-        )
-    )
-
-
-def _script_token_seen(cmdline: str, script: str) -> bool:
-    if not script:
-        return False
-    return bool(
-        re.search(
-            rf"(?:^|[/\s\"']){re.escape(script)}(?=$|[\s\"'])",
-            cmdline,
-        )
-    )
-
-
 def _unquote_cmdline_token(token: str) -> str:
     if (
         len(token) >= 2

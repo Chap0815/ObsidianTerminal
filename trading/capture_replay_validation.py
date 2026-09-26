@@ -32,6 +32,8 @@ DEFAULT_MARKOUT_HORIZONS = (1, 10, 60, 300, 900)
 MAX_EVIDENCE_BYTES = 4 * 1024 * 1024
 MIN_COST_EVIDENCE_SAMPLES = 50
 MIN_COST_EVIDENCE_COVERAGE = 0.95
+# Existing runtime markout budget: late diagnostic rows do not certify a horizon.
+MAX_MARKOUT_EVIDENCE_LAG_SECONDS = 30
 
 
 def _canonical_bytes(value) -> bytes:
@@ -442,6 +444,12 @@ def _markout_horizon_summary(
         ):
             invalid_complete_entries.add(entry_id)
             rejected["noncausal_complete_markout"] += 1
+            continue
+        if measured_at > fill_at + timedelta(
+            seconds=horizon + MAX_MARKOUT_EVIDENCE_LAG_SECONDS
+        ):
+            invalid_complete_entries.add(entry_id)
+            rejected["late_complete_markout"] += 1
             continue
         complete_by_entry[entry_id] = markout
     paired = len(valid_entry_ids)

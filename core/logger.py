@@ -2397,15 +2397,6 @@ def _reset_tg_failures(recipient_key: str) -> int:
         return int(state["count"]) if state is not None else 0
 
 
-def _rotate_overflow_if_needed() -> bool:
-    return _rotate_if_needed(
-        _TG_OVERFLOW_LOG,
-        TG_OVERFLOW_MAX_BYTES,
-        TG_OVERFLOW_BACKUPS,
-        jsonl=True,
-    )
-
-
 def _write_telegram_overflow(
     cid: str,
     msg: str,

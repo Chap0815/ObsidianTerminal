@@ -77,7 +77,10 @@ def _schedule_persist_locked(delay: float) -> None:
         try:
             timer.start()
         except Exception:
-            if _persist_timer is timer:
+            if (
+                _persist_timer is timer
+                and thread_definitely_never_started(timer)
+            ):
                 _persist_timer = None
 
 

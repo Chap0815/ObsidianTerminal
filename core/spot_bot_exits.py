@@ -33,6 +33,7 @@ from bot_utils import (
     spot_sell_requires_terminal_recovery,
 )
 from bot_utils.safe_numeric import safe_daily_loss_limit, safe_positive_float
+from bot_utils.spot_exits import has_pending_spot_exit_for_other_leg
 from bot_utils.state_persist import persisted_epoch_ttl_active
 from bot_utils.order_utils import (
     explicit_trade_symbol_matches,
@@ -301,6 +302,8 @@ class ExitsMixin:
                     pass
 
     def _retry_pending_partial_accounting(self, sym: str, d: dict) -> None:
+        if d.get("entry_price_unverified"):
+            return
         from bot_utils.trade_state import (
             normalize_pending_accounting_items,
             same_position_generation,
@@ -1083,6 +1086,9 @@ class ExitsMixin:
         """
         from core.logger import log_event
 
+        from bot_utils.spot_exits import service_spot_entry_basis
+        if not service_spot_entry_basis(self, sym, d):
+            return
         if d.get("accounting_already_booked"):
             ExitsMixin._cleanup_accounted_close_state(self, sym, d)
             return
@@ -1618,6 +1624,13 @@ class ExitsMixin:
         current_invested = _positive_finite(d.get("invested_usdt"))
         curr = _positive_finite(curr)
         sld_test = _positive_finite(sld_test)
+        if not self.simulation and d.get("entry_price_unverified"):
+            from bot_utils.spot_exits import spot_entry_close_amount
+            amount = spot_entry_close_amount(d)
+            sld_test = min(sld_test, amount)
+        if not self.simulation and has_pending_spot_exit_for_other_leg(d, "partial"):
+            log_event(f"{sym}: partial sell deferred while another sell intent is pending", "WARN")
+            return False
         if buy <= 0 or amount <= 0 or current_invested <= 0 or curr <= 0:
             log_event(
                 f" {sym}: invalid partial-TP state "
@@ -1680,7 +1693,11 @@ class ExitsMixin:
                             f"{sym}/USDT",
                             client_order_id,
                             expected_amount=requested_sell,
+                            require_price=True,
                         )
+                        if order is None:
+                            log_event(f"{sym}: durable partial sell intent not found; retry blocked", "WARN")
+                            return False
                     except Exception as recovery_error:
                         log_event(
                             f"Partial-Sell {sym} outcome still unknown "
@@ -1695,6 +1712,8 @@ class ExitsMixin:
                         self.state, sym, d
                     ) as ownership_live:
                         if not isinstance(ownership_live, dict):
+                            return False
+                        if has_pending_spot_exit_for_other_leg(ownership_live, "partial"):
                             return False
                         if ownership_live.get("claim_conflict"):
                             log_event(
@@ -1773,8 +1792,11 @@ class ExitsMixin:
                     order_id_text_or_none(order.get("id"))
                     or order_id_text_or_none(order.get("orderId"))
                 )
-                fill_price = _positive_finite(
-                    extract_fill_price(order, curr), curr)
+                fill_price = _positive_finite(extract_fill_price(order, 0.0))
+                if fill_price <= 0:
+                    _mark_spot_exit_outcome_uncertain(self, sym, d, "partial")
+                    log_event(f"{sym}: partial sell price unproven; accounting and retry deferred", "WARN")
+                    return False
                 try:
                     from trading.fee_utils import extract_or_estimate_with_refetch
                     partial_fee = extract_or_estimate_with_refetch(
@@ -1797,6 +1819,14 @@ class ExitsMixin:
             except Exception as e:
                 log_event(f"Partial-Sell {sym} failed: {e}", "WARN")
                 return False
+
+        if not self.simulation and d.get("entry_price_unverified"):
+            from bot_utils.spot_exits import defer_spot_close_for_entry_basis
+            defer_spot_close_for_entry_basis(
+                self.state, sym, d, leg="partial", order=order,
+                filled=sold_amount, price=fill_price, fee=partial_fee,
+                reason="Partial Take-Profit")
+            return False
 
         # Compute PnL with proportional entry fee
         real_prof_pct = ((fill_price - buy) / buy) * 100 if buy > 0 else 0.0
@@ -1830,6 +1860,7 @@ class ExitsMixin:
             rsi_15m=d.get("rsi_15m"), rsi_1h=d.get("rsi_1h"),
             rsi_4h=d.get("rsi_4h"), change_pct=d.get("change_pct"),
             is_partial=True, btc_trend=d.get("btc_trend"),
+            is_futures=False,
             fear_greed=d.get("fear_greed"),
             fees_usdt=slice_fees_total,
             exchange_order_id=exch_oid,
@@ -2007,6 +2038,18 @@ class ExitsMixin:
         # make us sell a stale `amount`.
         d = d_live
 
+        if not self.simulation and has_pending_spot_exit_for_other_leg(d, "full"):
+            log_event(f"{sym}: full sell deferred while another sell intent is pending", "WARN")
+            return
+
+        if not self.simulation and d.get("entry_price_unverified"):
+            from bot_utils.spot_exits import recover_spot_entry_basis, spot_entry_close_amount
+            recover_spot_entry_basis(self, sym, d, already_locked=True)
+            if d.get("entry_basis_remaining_amount") == 0:
+                return
+            if d.get("entry_price_unverified") and spot_entry_close_amount(d) <= 0:
+                return
+
         if _has_pending_spot_partial_exit(d):
             log_event(
                 f" {sym}: full exit deferred while partial-TP client-id "
@@ -2017,6 +2060,8 @@ class ExitsMixin:
 
         buy = _positive_finite(d.get("buy"))
         remaining_amount = _positive_finite(d.get("amount"))
+        if not self.simulation and d.get("entry_price_unverified"):
+            remaining_amount = spot_entry_close_amount(d)
         current_invested = _positive_finite(d.get("invested_usdt"))
         if remaining_amount <= 0:
             log_event(
@@ -2064,7 +2109,11 @@ class ExitsMixin:
                             f"{sym}/USDT",
                             client_order_id,
                             expected_amount=requested_amount,
+                            require_price=True,
                         )
+                        if order is None:
+                            log_event(f"{sym}: durable full sell intent not found; retry blocked", "WARN")
+                            return
                     except Exception as recovery_error:
                         log_event(
                             f"Sell order {sym} outcome still unknown "
@@ -2084,6 +2133,8 @@ class ExitsMixin:
                         self.state, sym, d
                     ) as ownership_live:
                         if not isinstance(ownership_live, dict):
+                            return
+                        if has_pending_spot_exit_for_other_leg(ownership_live, "full"):
                             return
                         if ownership_live.get("claim_conflict"):
                             log_event(
@@ -2179,8 +2230,11 @@ class ExitsMixin:
                     order_id_text_or_none(order.get("id"))
                     or order_id_text_or_none(order.get("orderId"))
                 )
-                fill_price = _positive_finite(
-                    extract_fill_price(order, fill_price), fill_price)
+                fill_price = _positive_finite(extract_fill_price(order, 0.0))
+                if fill_price <= 0:
+                    _mark_spot_exit_outcome_uncertain(self, sym, d, "full")
+                    log_event(f"{sym}: full sell price unproven; accounting and retry deferred", "WARN")
+                    return
                 residual_amount = safe_remaining(requested_amount, filled_amount)
                 if residual_amount * fill_price > _LIVE_RESIDUAL_DUST_USDT:
                     partial_live_fill = True
@@ -2210,70 +2264,12 @@ class ExitsMixin:
                 )
                 return
             except InsufficientSellBalance as ib:
-                # The BASE coins are not actually on the exchange (already sold,
-                # or only dust below the min lot). Selling will never succeed,
-                # but dropping state before accounting can lose realized PnL
-                # after a manual/external sell.
+                # Free-only rejection does not prove flatness or an external
+                # fill. Keep both priced and unpriced generations untouched;
+                # reconcile owns total-balance strikes and historical fills.
                 log_event(
-                    f"{sym}: nothing left to sell ({ib})  booking offline "
-                    f"close before removing state", "WARN")
-                if d.get("unpriced_external_partials"):
-                    flat_pending = {
-                        "verified_flat_pending_accounting": True,
-                        "verified_flat_reason": reason,
-                        "verified_flat_at": _utc_now_str(),
-                    }
-                    try:
-                        from bot_utils.trade_state import update_many_if_current
-
-                        flat_persisted = update_many_if_current(
-                            self.state,
-                            sym,
-                            flat_pending,
-                            d,
-                        )
-                    except Exception as state_err:
-                        flat_persisted = False
-                        self._log_error(
-                            f"spot orphan combined accounting {sym}", state_err
-                        )
-                    level = (
-                        "WARN"
-                        if flat_persisted is None or flat_persisted is True
-                        else "ERROR"
-                    )
-                    log_event(
-                        f"{sym}: base balance is zero with unpriced earlier "
-                        f"partials; direct accounting deferred to combined "
-                        f"offline reconcile",
-                        level,
-                    )
-                    return
-                try:
-                    from core.spot_bot_reconcile import _record_spot_offline_close
-                    if not _record_spot_offline_close(self, sym, d):
-                        log_event(
-                            f"{sym}: orphan accounting failed  state kept "
-                            f"for retry", "WARN")
-                        return
-                except Exception as acc_err:
-                    self._log_error(f"spot orphan accounting {sym}", acc_err)
-                    return
-                try:
-                    if not self.simulation:
-                        send_telegram(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
-                            f" [{self.BOT_NAME}] {sym} orphan cleared\n"
-                            f"Base balance ~0 on exchange  offline close booked "
-                            f"and position removed from tracking."
-                        )
-                except Exception:
-                    pass
-                cleanup_row = dict(d)
-                cleanup_row.update({
-                    "accounting_already_booked": True,
-                    "accounting_booked_reason": "Offline orphan close",
-                })
-                ExitsMixin._cleanup_accounted_close_state(self, sym, cleanup_row)
+                    f"{sym}: sell unavailable ({ib}); state/claim kept "
+                    "until total-balance and fill reconciliation", "WARN")
                 return
             except Exception as e:
                 log_event(f"Sell order {sym} failed: {e}", "WARN")
@@ -2285,6 +2281,14 @@ class ExitsMixin:
                 except Exception as ce:
                     self._log_error(f"sell-fail cooldown set {sym}", ce)
                 return
+
+        if not self.simulation and d.get("entry_price_unverified"):
+            from bot_utils.spot_exits import defer_spot_close_for_entry_basis
+            defer_spot_close_for_entry_basis(
+                self.state, sym, d, leg="full", order=order,
+                filled=remaining_amount, price=fill_price, fee=close_fee,
+                reason=reason)
+            return
 
         real_prof_pct = ((fill_price - buy) / buy) * 100 if buy > 0 else 0.0
 

@@ -51,6 +51,10 @@ _SPOT_TERMINAL_ORDER_STATUSES = frozenset({
 
 #  Helpers 
 
+def spot_order_has_nonterminal_status(order: dict) -> bool:
+    status = normalize_spot_order_status(order.get("status"))
+    return bool(status and status not in _SPOT_TERMINAL_ORDER_STATUSES)
+
 def _finite_float(value, default: float = 0.0) -> float:
     if isinstance(value, bool):
         return default
@@ -66,8 +70,405 @@ def _positive_finite(value, default: float = 0.0) -> float:
     return parsed if parsed > 0 else default
 
 
+def spot_buy_basis(order: dict, *, quote_first: bool = False, exchange=None):
+    """Actual base quantity, execution price and quote cost; never request guesses."""
+    if not isinstance(order, dict):
+        return None
+    filled = _positive_finite(order.get("filled"))
+    average = _positive_finite(order.get("average"))
+    if average <= 0 and _positive_finite(order.get("price")) > 0:
+        # CCXT can synthesize cost from requested price even on typeless ACKs.
+        return None
+    if spot_order_has_nonterminal_status(order):
+        return None
+    price = average
+    cost = _positive_finite(order.get("cost"))
+    if quote_first and cost > 0 and price > 0:
+        filled = cost / price
+    elif filled > 0 and price > 0:
+        if cost > 0:
+            implied = filled * price
+            tolerance = max(1e-10, abs(implied) * 1e-8)
+            # Only cached SDK precision can widen arithmetic roundoff; no I/O.
+            markets = getattr(exchange, "markets", None)
+            market = (markets.get(order.get("symbol"))
+                      if isinstance(markets, dict) and isinstance(order.get("symbol"), str) else None)
+            currencies = getattr(exchange, "currencies", None)
+            quote = market.get("quote") if isinstance(market, dict) else None
+            currency = currencies.get(quote) if isinstance(currencies, dict) else None
+            market_precision = market.get("precision") if isinstance(market, dict) else None
+            precisions = (market_precision.get("price")
+                          if isinstance(market_precision, dict) else None,
+                          currency.get("precision") if isinstance(currency, dict) else None)
+            mode = getattr(exchange, "precisionMode", None)
+            for index, precision in enumerate(precisions):
+                if isinstance(precision, bool):
+                    continue
+                quantum = None
+                if mode == 2 and isinstance(precision, int) and 0 <= precision <= 18:
+                    quantum = 10.0 ** -precision
+                elif mode == 4:
+                    quantum = _positive_finite(precision) or None
+                if quantum is not None:
+                    tolerance += quantum * (filled if index == 0 else 1.0)
+            if not math.isfinite(implied) or abs(cost - implied) > tolerance:
+                return None
+        cost = cost or filled * price
+    elif filled > 0 and cost > 0:
+        price = cost / filled
+    else:
+        return None
+    if not all(math.isfinite(v) and v > 0 for v in (filled, price, cost)):
+        return None
+    return filled, price, cost
+
+
+def spot_entry_close_amount(row: dict) -> float:
+    """Requested BUY quantity is not an authorization to sell inventory."""
+    amount = _positive_finite(row.get("amount"))
+    if not row.get("entry_price_unverified"):
+        return amount
+    observed = _positive_finite(row.get("spot_entry_observed_amount"))
+    fragments = row.get("entry_basis_pending_closes") or []
+    if not isinstance(fragments, list) or any(not isinstance(f, dict) for f in fragments):
+        return 0.0
+    sold = sum(_positive_finite(f.get("filled")) for f in fragments)
+    return min(amount, max(0.0, observed - sold))
+
+
+def defer_spot_close_for_entry_basis(state, sym: str, row: dict, *, leg: str,
+                                    order: dict, filled: float, price: float,
+                                    fee: float, reason: str) -> bool:
+    """Checkpoint real terminal SELL evidence without inventing entry PnL."""
+    from bot_utils.trade_state import update_many_if_current
+    from core.logger import _date
+
+    cid = order_id_text_or_none(row.get(f"{leg}_exit_client_order_id"))
+    oid = order_id_text_or_none(order.get("id")) or order_id_text_or_none(order.get("orderId"))
+    qty, sell_price, close_fee = _positive_finite(filled), _positive_finite(price), _finite_float(fee, float("nan"))
+    if not (cid or oid) or qty <= 0 or sell_price <= 0 or not math.isfinite(close_fee):
+        return False
+    if not math.isfinite(qty * sell_price):
+        return False
+    raw = row.get("entry_basis_pending_closes") or []
+    if not isinstance(raw, list) or any(not isinstance(f, dict) for f in raw):
+        return False
+    fragments = [dict(f) for f in raw]
+    previous = None
+    for fragment in fragments:
+        if (cid and fragment.get("client_order_id") == cid) or (oid and fragment.get("exchange_order_id") == oid):
+            previous = fragment
+            break
+    old_qty = _positive_finite(previous.get("filled")) if previous else 0.0
+    tolerance = max(1e-10, qty * 1e-8)
+    if qty + tolerance < old_qty or (previous and previous.get("staged")):
+        return False
+    if previous and (abs(_positive_finite(previous.get("sell_price")) - sell_price) > sell_price * 1e-8
+                     or abs(_finite_float(previous.get("fee"), float("nan")) - close_fee) > 1e-8):
+        return False
+    delta = max(0.0, qty - old_qty)
+    current_amount = spot_entry_close_amount(row)
+    if delta > current_amount + tolerance:
+        return False
+    receipt = {"client_order_id": cid, "exchange_order_id": oid,
+               "filled": qty, "sell_price": sell_price, "exit_notional": qty * sell_price,
+               "fee": close_fee, "sell_time": _date(),
+               "reason": reason, "leg": leg, "terminal": True,
+               "entry_id": row.get("entry_id"), "staged": False}
+    if previous is None:
+        fragments.append(receipt)
+    else:
+        receipt["sell_time"] = previous["sell_time"]
+        previous.update(receipt)
+    residual = max(0.0, current_amount - delta)
+    updates = {"entry_basis_pending_closes": fragments,
+               "entry_basis_remaining_amount": residual,
+               f"{leg}_exit_client_order_id": None,
+               f"{leg}_exit_outcome_uncertain": False,
+               f"{leg}_exit_requested_amount": None}
+    if residual > tolerance:
+        updates["amount"] = residual
+        updates["partial_sold"] = True
+    else:
+        # TradeState keeps a positive unbooked slice; physical flatness is separate.
+        updates.update({"verified_flat_pending_accounting": True,
+                        "verified_flat_reason": reason, "verified_flat_at": receipt["sell_time"]})
+    try:
+        persisted = update_many_if_current(state, sym, updates, row)
+    except Exception:
+        return False
+    if persisted is not True:
+        return False
+    row.update(updates)
+    return True
+
+
+def recover_spot_entry_basis(bot, sym: str, row: dict, *, already_locked=False) -> bool:
+    from core.symbol_locks import close_lock
+    from bot_utils.trade_state import same_position_generation
+
+    def recover():
+        fresh = bot.state.get(sym)
+        if not isinstance(fresh, dict) or not same_position_generation(fresh, row):
+            return False
+        row.update(fresh)
+        return _recover_spot_entry_basis_locked(bot, sym, row)
+
+    if not row.get("entry_price_unverified"):
+        return True
+    if already_locked:
+        return recover()
+    with close_lock(sym, timeout=0.1, bot_name=bot.BOT_NAME) as acquired:
+        return recover() if acquired else False
+
+
+def _recover_spot_entry_basis_locked(bot, sym: str, row: dict) -> bool:
+    """Heal one durable BUY generation, preserving every already-sold unit."""
+    if not row.get("entry_price_unverified"):
+        return True
+    from types import SimpleNamespace
+    from core.spot_bot_scan import ScanMixin
+    from bot_utils.trade_state import update_many_if_current
+
+    cid = order_id_text_or_none(row.get("spot_entry_client_order_id"))
+    if not cid:
+        return False
+    adapter = SimpleNamespace(ex=bot.ex, _log_error=getattr(bot, "_log_error", lambda *a: None))
+    try:
+        recovered = ScanMixin._find_order_by_cid(
+            adapter, f"{sym}/USDT", cid,
+            expected_amount=(None if row.get("spot_entry_quote_first") else row.get("spot_entry_requested_amount")),
+            max_quote_cost=row.get("spot_entry_quote_budget"), require_basis=True,
+            quote_first_buy=row.get("spot_entry_quote_first") is True,
+        )
+        if not isinstance(recovered, dict) or spot_order_has_nonterminal_status(recovered):
+            return False
+        durable_oid = order_id_text_or_none(row.get("spot_entry_order_id"))
+        recovered_oid = order_id_text_or_none(recovered.get("id"))
+        if durable_oid and recovered_oid and durable_oid != recovered_oid:
+            return False
+        basis = spot_buy_basis(recovered, quote_first=row.get("spot_entry_quote_first") is True,
+                               exchange=bot.ex)
+        if basis is None:
+            return False
+        gross, price, invested = basis
+        observed = _positive_finite(row.get("spot_entry_observed_amount"))
+        if gross + max(1e-10, gross * 1e-8) < observed:
+            return False
+        from trading.fee_utils import extract_or_estimate_with_refetch
+        from bot_utils.spot_fee_settle import extract_or_estimate_base_fee
+        entry_fee = _finite_float(extract_or_estimate_with_refetch(
+            bot.ex, recovered, f"{sym}/USDT", price, base_override=sym), float("nan"))
+        base_fee = _finite_float(extract_or_estimate_base_fee(
+            bot.ex, recovered, f"{sym}/USDT", sym, fallback_filled=gross,
+            shutdown_event=getattr(bot, "_shutdown_event", None)), float("nan"))
+        if not math.isfinite(entry_fee) or not math.isfinite(base_fee) or not 0 <= base_fee < gross:
+            return False
+        net = gross - base_fee
+        from bot_utils.trade_state import same_position_generation
+        fresh = bot.state.get(sym)
+        if not isinstance(fresh, dict) or not same_position_generation(fresh, row):
+            return False
+        row.update(fresh)
+        raw = row.get("entry_basis_pending_closes") or []
+        if not isinstance(raw, list) or any(not isinstance(f, dict) or f.get("entry_id") != row.get("entry_id") for f in raw):
+            return False
+        sold = sum(_positive_finite(f.get("filled")) for f in raw)
+        exit_fees = sum(_finite_float(f.get("fee"), float("nan")) for f in raw)
+        if not math.isfinite(exit_fees):
+            return False
+        tolerance = max(1e-10, net * 1e-8)
+        if sold > net + tolerance:
+            return False
+        remaining = max(0.0, net - sold)
+        if raw and remaining > _positive_finite(row.get("amount")) + tolerance:
+            return False
+        updates = {"buy": price, "highest": price, "lowest": price,
+                   "amount": remaining if remaining > tolerance else net,
+                   "original_amount": net, "invested_usdt": invested * remaining / net,
+                   "initial_entry_fee": entry_fee, "fees_paid": entry_fee + exit_fees,
+                   "spot_entry_initial_invested_usdt": invested,
+                   "entry_price_unverified": False, "provisional": False,
+                   "spot_entry_observed_amount": gross,
+                   "spot_entry_order_id": order_id_text_or_none(recovered.get("id")),
+                   "entry_basis_remaining_amount": remaining}
+        if remaining <= tolerance:
+            updates["verified_flat_pending_accounting"] = True
+        if update_many_if_current(bot.state, sym, updates, row) is not True:
+            return False
+        row.update(updates)
+        return True
+    except Exception:
+        return False
+
+
+def stage_spot_entry_basis_closes(state, sym: str, row: dict, bot_name: str) -> bool:
+    from core.symbol_locks import close_lock
+    from bot_utils.trade_state import same_position_generation
+    with close_lock(sym, timeout=0.1, bot_name=bot_name) as acquired:
+        if not acquired:
+            return False
+        fresh = state.get(sym)
+        if not isinstance(fresh, dict) or not same_position_generation(fresh, row):
+            return False
+        row.update(fresh)
+        return _stage_spot_entry_basis_closes_locked(state, sym, row, bot_name)
+
+
+def _stage_spot_entry_basis_closes_locked(state, sym: str, row: dict, bot_name: str) -> bool:
+    """Atomically move raw receipts into the existing idempotent accounting WAL."""
+    if row.get("entry_price_unverified"):
+        return False
+    from bot_utils.trade_state import normalize_pending_accounting_items, update_many_if_current
+    raw = row.get("entry_basis_pending_closes") or []
+    if not isinstance(raw, list) or any(not isinstance(f, dict) for f in raw):
+        return False
+    price, original = _positive_finite(row.get("buy")), _positive_finite(row.get("original_amount"))
+    if price <= 0 or original <= 0:
+        return False
+    pending = normalize_pending_accounting_items(row.get("accounting_pending_partials"))
+    fragments = [dict(f) for f in raw]
+    initial_cost = _positive_finite(row.get("spot_entry_initial_invested_usdt"))
+    if initial_cost <= 0:
+        return False
+    full_updates = {}
+    cumulative_sold = 0.0
+    changed = False
+    for fragment in fragments:
+        cumulative_sold += _positive_finite(fragment.get("filled"))
+        receipt_id = fragment.get("exchange_order_id") or fragment.get("client_order_id")
+        if fragment.get("accounted") is True:
+            continue
+        if fragment.get("staged") and (
+            any(item.get("exchange_order_id") == receipt_id for item in pending)
+            or row.get("accounting_pending_exchange_order_id") == receipt_id
+            and row.get("accounting_pending") is True
+        ):
+            continue
+        qty, sell = _positive_finite(fragment.get("filled")), _positive_finite(fragment.get("sell_price"))
+        fee = _finite_float(fragment.get("fee"), float("nan"))
+        if qty <= 0 or sell <= 0 or not math.isfinite(fee) or fragment.get("entry_id") != row.get("entry_id"):
+            return False
+        entry_fee = _finite_float(row.get("initial_entry_fee")) * qty / original
+        is_partial = (fragment["leg"] == "partial"
+                      or cumulative_sold + max(1e-10, original * 1e-8) < original)
+        trade = {"bot_name": bot_name, "mode_is_sim": False, "symbol": sym,
+                        "buy_price": price, "sell_price": sell, "buy_time": row.get("buy_time", ""),
+                        "sell_time": fragment["sell_time"], "profit_pct": (sell / price - 1) * 100,
+                        "profit_usdt": round(qty * (sell - price) - entry_fee - fee, 4),
+                        "invested_usdt": initial_cost * qty / original, "reason": fragment["reason"],
+                        "fees_usdt": entry_fee + fee, "is_partial": is_partial, "is_futures": False,
+                        "exchange_order_id": fragment.get("exchange_order_id") or fragment["client_order_id"],
+                        "entry_id": row.get("entry_id")}
+        if is_partial:
+            pending.append(trade)
+        else:
+            full_updates = {"accounting_pending": True,
+                            "accounting_pending_mode_is_sim": False,
+                            "accounting_pending_sell_price": sell,
+                            "accounting_pending_sell_time": fragment["sell_time"],
+                            "accounting_pending_exchange_order_id": trade["exchange_order_id"],
+                            "accounting_pending_profit_pct": trade["profit_pct"],
+                            "accounting_pending_profit_usdt": trade["profit_usdt"],
+                            "accounting_pending_invested_usdt": trade["invested_usdt"],
+                            "accounting_pending_fees_usdt": trade["fees_usdt"],
+                            "accounting_pending_reason": fragment["reason"]}
+        fragment["staged"] = True
+        changed = True
+    if not changed:
+        return True
+    updates = {"accounting_pending_partials": pending, "entry_basis_pending_closes": fragments,
+               **full_updates}
+    try:
+        if update_many_if_current(state, sym, updates, row) is not True:
+            return False
+    except Exception:
+        return False
+    row.update(updates)
+    return True
+
+
 def _valid_emergency_base_symbol(sym) -> bool:
     return type(sym) is str and is_canonical_position_symbol(sym)
+
+
+def service_spot_entry_basis(bot, sym: str, row: dict) -> bool:
+    """Recover/flush BUY-basis receipts before ordinary accounting or triggers."""
+    if not row.get("entry_price_unverified") and not row.get("entry_basis_pending_closes"):
+        return True
+    if not recover_spot_entry_basis(bot, sym, row):
+        return False
+    if not stage_spot_entry_basis_closes(bot.state, sym, row, bot.BOT_NAME):
+        return False
+    from core.spot_bot_exits import ExitsMixin
+    from core.symbol_locks import close_lock
+    from bot_utils.trade_state import same_position_generation, update_many_if_current
+    if row.get("accounting_pending_partials"):
+        ExitsMixin._retry_pending_partial_accounting(bot, sym, row)
+    live = bot.state.get(sym)
+    if (not isinstance(live, dict) or not same_position_generation(live, row)
+            or live.get("accounting_pending_partials")):
+        return False
+    fresh_snapshot = dict(live)
+    row.clear()
+    row.update(fresh_snapshot)
+    with close_lock(sym, timeout=0.1, bot_name=bot.BOT_NAME) as acquired:
+        if not acquired:
+            return False
+        fresh = bot.state.get(sym)
+        if (not isinstance(fresh, dict) or not same_position_generation(fresh, row)
+                or fresh.get("accounting_pending_partials")):
+            return False
+        fresh_snapshot = dict(fresh)
+        row.clear()
+        row.update(fresh_snapshot)
+        fragments = row.get("entry_basis_pending_closes") or []
+        cumulative = 0.0
+        accounted_fragments = []
+        for fragment in fragments:
+            fragment = dict(fragment)
+            cumulative += _positive_finite(fragment.get("filled"))
+            if (fragment.get("staged") and (fragment.get("leg") == "partial"
+                    or cumulative + max(1e-10, _positive_finite(row.get("original_amount")) * 1e-8)
+                    < _positive_finite(row.get("original_amount")))):
+                fragment["accounted"] = True
+            accounted_fragments.append(fragment)
+        if accounted_fragments != fragments:
+            if update_many_if_current(bot.state, sym, {"entry_basis_pending_closes": accounted_fragments}, row) is not True:
+                return False
+            row["entry_basis_pending_closes"] = accounted_fragments
+    if (row.get("entry_basis_pending_closes")
+            and _finite_float(row.get("entry_basis_remaining_amount"), -1.0) == 0.0):
+        if row.get("accounting_pending"):
+            from core.symbol_locks import close_lock
+            from core.spot_bot_reconcile import (
+                _record_spot_offline_close, _spot_accounting_retry_due, _defer_spot_accounting_retry,
+            )
+            with close_lock(sym, timeout=0.1, bot_name=bot.BOT_NAME) as acquired:
+                if not acquired:
+                    return False
+                fresh = bot.state.get(sym)
+                if (not isinstance(fresh, dict) or not same_position_generation(fresh, row)
+                        or fresh.get("entry_price_unverified")):
+                    return False
+                if not _spot_accounting_retry_due(fresh):
+                    return False
+                final = fresh["entry_basis_pending_closes"][-1]
+                close_row = {**fresh, "amount": final["filled"]}
+                if not _record_spot_offline_close(bot, sym, close_row, _basis_replay=True):
+                    _defer_spot_accounting_retry(bot, sym, fresh)
+                    return False
+                after_book = bot.state.get(sym)
+                if not isinstance(after_book, dict) or not same_position_generation(after_book, fresh):
+                    return False
+                fresh_snapshot = dict(after_book)
+                row.clear()
+                row.update(fresh_snapshot)
+        if update_many_if_current(bot.state, sym, {"accounting_already_booked": True}, row):
+            row["accounting_already_booked"] = True
+            ExitsMixin._cleanup_accounted_close_state(bot, sym, row)
+        return False
+    return True
 
 
 def has_pending_spot_partial_exit(row: dict) -> bool:
@@ -78,6 +479,22 @@ def has_pending_spot_partial_exit(row: dict) -> bool:
         row.get("partial_exit_outcome_uncertain")
         or order_id_text_or_none(row.get("partial_exit_client_order_id"))
     )
+
+
+def has_pending_spot_exit_for_other_leg(row: dict, leg: str) -> bool:
+    """A durable sell intent must not be bypassed by a different exit path."""
+    if not isinstance(row, dict):
+        return True
+    for other in ("partial", "full", "emergency", "launcher"):
+        if other == leg:
+            continue
+        if other == "partial":
+            if has_pending_spot_partial_exit(row):
+                return True
+        elif (row.get(f"{other}_exit_outcome_uncertain")
+              or order_id_text_or_none(row.get(f"{other}_exit_client_order_id"))):
+            return True
+    return False
 
 
 def _validated_expected_spot_amount(value) -> Optional[float]:
@@ -248,10 +665,10 @@ def _round_to_step(amount: Decimal, step: Decimal) -> Decimal:
 
 class InsufficientSellBalance(Exception):
     """Raised by ``spot_market_sell_safe`` when the free BASE balance is below
-    the minimum sellable amount  i.e. there is effectively nothing left to sell
-    (coins already gone, or only dust remains). Callers should treat the
-    position as closed/orphaned and remove it from state instead of retrying
-    forever  otherwise MEXC ``30005 'Oversold'`` loops every monitor tick.
+    the minimum sellable amount. This proves only that the requested sell is
+    unavailable: held coins may be locked in another order (``used > 0``).
+    Callers must keep tracking until independent total-balance and fill
+    reconciliation proves an external close; free balance is not flatness.
 
     The message contains 'insufficient balance' on purpose so the
     network-retry layer classifies it as permanent (no wasted retries).
@@ -262,7 +679,7 @@ class InsufficientSellBalance(Exception):
         self.free = free
         super().__init__(
             f"{symbol_pair}: insufficient balance to sell  free base "
-            f"{free:.10g}, requested {requested:.10g} (nothing left to sell)")
+            f"{free:.10g}, requested {requested:.10g} (flatness unverified)")
 
 
 class _SpotSellBudgetUnavailable(RuntimeError):
@@ -969,6 +1386,8 @@ def _find_spot_exit_order_by_client_id(
     symbol_pair: str,
     client_order_id: str,
     expected_amount: Optional[float] = None,
+    *,
+    require_price: bool = False,
 ):
     """Recover a SPOT sell whose create response may have been lost.
 
@@ -1087,7 +1506,10 @@ def _find_spot_exit_order_by_client_id(
     if selected_order is not None:
         if terminal_rejected:
             raise RuntimeError("spot rejected order has fill evidence")
-        return selected_order
+        if not require_price or extract_fill_price(selected_order, 0.0) > 0:
+            return selected_order
+        if spot_recovery_terminal_disposition(selected_order) == "filled":
+            deferred_terminal = selected_order
 
     fetch_trades = getattr(ex, "fetch_my_trades", None)
     if has.get("fetchMyTrades") and callable(fetch_trades):
@@ -1134,8 +1556,23 @@ def _find_spot_exit_order_by_client_id(
                 raise RuntimeError(
                     "spot trade-only recovery lacks terminal/full-fill proof"
                 )
+            if require_price and extract_fill_price(recovered, 0.0) <= 0:
+                raise RuntimeError("spot sell execution price unavailable")
+            if require_price and selected_order is not None:
+                selected_fill = selected_order.get("filled")
+                if selected_fill is not None and abs(
+                    _positive_finite(selected_fill) - recovered_fill
+                ) > max(1e-12, (expected_amount or recovered_fill) * 1e-9):
+                    raise RuntimeError("spot sell recovery fill amount conflict")
+                # Bound execution rows supply the price, not a new lifecycle:
+                # retain the selected order's terminal or still-open status.
+                status = selected_order.get("status")
+                if status not in (None, ""):
+                    recovered["status"] = status
             return recovered
 
+    if selected_order is not None:
+        raise RuntimeError("spot sell execution price unavailable")
     if not attempted or uncertain:
         raise RuntimeError("spot sell reconciliation unavailable")
     if terminal_fill_unresolved:
@@ -1145,10 +1582,12 @@ def _find_spot_exit_order_by_client_id(
 
 def recover_spot_sell_by_client_id(ex, symbol_pair: str,
                                    client_order_id: str,
-                                   expected_amount: Optional[float] = None):
+                                   expected_amount: Optional[float] = None,
+                                   *, require_price: bool = False):
     """Public recovery boundary for persisted SPOT sell intents."""
     return _find_spot_exit_order_by_client_id(
-        ex, symbol_pair, client_order_id, expected_amount=expected_amount
+        ex, symbol_pair, client_order_id, expected_amount=expected_amount,
+        require_price=require_price,
     )
 
 
@@ -1326,19 +1765,6 @@ def _remove_accounted_state(
     return ok
 
 
-def _order_has_open_remainder(order) -> bool:
-    if not isinstance(order, dict):
-        return False
-    status = normalize_spot_order_status(order.get("status"))
-    if status in ("closed", "canceled", "cancelled", "expired", "rejected"):
-        return False
-    if status in ("open", "new", "partially_filled", "partiallyfilled"):
-        return True
-    if status:
-        return False
-    return _positive_finite(order.get("remaining")) > 0
-
-
 def _emergency_residual_amount(ex, symbol_pair: str, requested_amount: float,
                                sold_amount: float, fill_price: float,
                                order=None) -> float:
@@ -1347,20 +1773,12 @@ def _emergency_residual_amount(ex, symbol_pair: str, requested_amount: float,
     by_fill = max(0.0, requested - sold)
     if by_fill <= 0 or fill_price <= 0:
         return 0.0
-    if _order_has_open_remainder(order):
-        if by_fill * fill_price <= _EMERGENCY_RESIDUAL_DUST_USDT:
-            return 0.0
-        return min(by_fill, requested)
-    try:
-        free = _free_base_balance(ex, symbol_pair)
-    except Exception:
-        free = None
-    residual = by_fill
-    if free is not None and free >= 0:
-        residual = min(residual, _positive_finite(free))
-    if residual * fill_price <= _EMERGENCY_RESIDUAL_DUST_USDT:
+    # A fill proves only the sold slice. Free balance can be zero
+    # while the remaining coins are locked at the venue; it cannot shrink the
+    # unsold restart-visible remainder. External closes belong to reconcile.
+    if by_fill * fill_price <= _EMERGENCY_RESIDUAL_DUST_USDT:
         return 0.0
-    return min(residual, requested)
+    return min(by_fill, requested)
 
 
 def _emergency_residual_updates(amount: float, residual_amount: float,
@@ -1505,7 +1923,8 @@ def spot_market_sell_safe(ex, symbol_pair: str, raw_amount: float,
             #    order amount) or a prior partial that already reduced it. Re-read
             #    the REAL free balance ONCE and retry with that (rounded down). If
             #    nothing sellable remains, raise a typed error so the caller
-            #    removes the orphan from state instead of looping 30005 forever.
+            #    keeps ownership until total-balance/fill reconciliation rather
+            #    than treating unavailable free coins as a proven flat wallet.
             if (not _balance_capped
                     and any(m in es for m in ("oversold", "30005",
                                                "insufficient", "not enough"))):
@@ -1762,6 +2181,14 @@ def emergency_close_all_spot(*,
                     )
                     continue
 
+                if not simulation and has_pending_spot_exit_for_other_leg(d, "emergency"):
+                    failed.append(f"{sym}: another sell intent needs reconciliation")
+                    log_event(
+                        f"Emergency: {sym} deferred while another sell intent is pending",
+                        "WARN",
+                    )
+                    continue
+
                 if has_pending_spot_partial_exit(d):
                     failed.append(f"{sym}: partial exit reconciliation pending")
                     log_event(
@@ -1787,6 +2214,15 @@ def emergency_close_all_spot(*,
 
                 buy_price = _positive_finite(d.get("buy"))
                 amount = _positive_finite(d.get("amount"))
+                if not simulation and d.get("entry_price_unverified"):
+                    from types import SimpleNamespace
+                    owner = SimpleNamespace(ex=ex, state=state, BOT_NAME=bot_name)
+                    recover_spot_entry_basis(owner, sym, d, already_locked=True)
+                    buy_price = _positive_finite(d.get("buy"))
+                    amount = spot_entry_close_amount(d)
+                    if d.get("entry_basis_remaining_amount") == 0:
+                        failed.append(f"{sym}: closed; entry-basis accounting pending")
+                        continue
                 margin = _positive_finite(d.get("invested_usdt"))
                 symbol_pair = f"{sym}/USDT"
                 if amount <= 0:
@@ -1911,7 +2347,12 @@ def emergency_close_all_spot(*,
                                     symbol_pair,
                                     client_order_id,
                                     expected_amount=amount,
+                                    require_price=True,
                                 )
+                                if order is None:
+                                    failed.append(f"{sym}: emergency sell outcome still unknown")
+                                    log_event(f"Emergency: {sym} durable sell intent not found; retry blocked", "WARN")
+                                    continue
                             except Exception as recovery_error:
                                 failed.append(
                                     f"{sym}: emergency sell outcome still unknown"
@@ -1982,6 +2423,7 @@ def emergency_close_all_spot(*,
                                     or has_pending_spot_partial_exit(
                                         ownership_live
                                     )
+                                    or has_pending_spot_exit_for_other_leg(ownership_live, "emergency")
                                     or normalize_pending_accounting_items(
                                         ownership_live.get(
                                             "accounting_pending_partials"
@@ -2086,7 +2528,8 @@ def emergency_close_all_spot(*,
                                     curr,
                                     order=order,
                                 )
-                                if explicit_unknown_status
+                                if (explicit_unknown_status
+                                    and extract_fill_price(order, 0.0) > 0)
                                 else amount
                             )
                             if observed_residual < amount:
@@ -2184,8 +2627,13 @@ def emergency_close_all_spot(*,
                             or order_id_text_or_none(client_order_id)
                         )
                         sold_amount = _filled_base_amount(order, _sold, amount)
-                        fill_price = _positive_finite(
-                            extract_fill_price(order, curr), curr)
+                        fill_price = _positive_finite(extract_fill_price(order, 0.0))
+                        if fill_price <= 0:
+                            _persist_spot_exit_fields(
+                                state, sym, d, {"emergency_exit_outcome_uncertain": True})
+                            failed.append(f"{sym}: sell execution price unknown")
+                            log_event(f"Emergency: {sym} sell price unproven; accounting and retry deferred", "WARN")
+                            continue
                         proportional_entry_fee = safe_proportional_fee(
                             initial_entry_fee, sold_amount, original_amount,
                             partial_sold=partial_sold
@@ -2200,6 +2648,13 @@ def emergency_close_all_spot(*,
                             )
                         except Exception:
                             close_fee = extract_order_fee(order)
+                        if d.get("entry_price_unverified"):
+                            defer_spot_close_for_entry_basis(
+                                state, sym, d, leg="emergency", order=order,
+                                filled=sold_amount, price=fill_price, fee=close_fee,
+                                reason=f"Emergency Close ({reason})")
+                            failed.append(f"{sym}: real sell captured; entry-basis accounting pending")
+                            continue
                         real_pct = ((fill_price - buy_price) / buy_price * 100) if buy_price > 0 else 0.0
                         profit_pct = real_pct
                         profit_usdt = round(

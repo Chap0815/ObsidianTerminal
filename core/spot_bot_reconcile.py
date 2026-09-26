@@ -180,12 +180,48 @@ def _spot_effective_balance(bal_data: dict | None, sym: str) -> float:
 
 
 def _spot_effective_balance_or_none(bal_data: dict | None, sym: str) -> float | None:
-    if not isinstance(bal_data, dict):
+    if not _spot_balance_snapshot_rows_valid(bal_data):
         return None
-    info = bal_data.get(sym) if sym in bal_data else {}
-    if not isinstance(info, dict):
+    coin_present = sym in bal_data
+    coin = bal_data.get(sym) if coin_present else {}
+    if not isinstance(coin, dict) or _spot_balance_payload_unclear(coin):
         return None
-    if _spot_balance_payload_unclear(info):
+
+    maps = {}
+    for field in ("free", "used", "total"):
+        if field not in bal_data:
+            continue
+        mapping = bal_data[field]
+        if not isinstance(mapping, dict):
+            return None
+        for asset, raw in mapping.items():
+            value = _finite_float_or_none(raw)
+            if (
+                not isinstance(asset, str) or not asset.strip()
+                or value is None or value < 0
+            ):
+                return None
+        maps[field] = mapping
+
+    # An omitted asset proves zero only in a complete, valid wallet view.
+    # Empty/partial responses and present-but-incomplete rows remain unknown.
+    if not coin_present and all(sym not in mapping for mapping in maps.values()):
+        return 0.0 if len(maps) == 3 else None
+
+    info = {}
+    for field in ("free", "used", "total"):
+        raw_coin = coin.get(field)
+        raw_global = maps.get(field, {}).get(sym)
+        coin_value = _finite_float_or_none(raw_coin) if raw_coin is not None else None
+        global_value = _finite_float_or_none(raw_global) if raw_global is not None else None
+        if coin_value is not None and global_value is not None and not math.isclose(
+            coin_value, global_value, rel_tol=1e-9, abs_tol=1e-12,
+        ):
+            return None
+        value = coin_value if coin_value is not None else global_value
+        if value is not None:
+            info[field] = value
+    if "total" not in info and not {"free", "used"}.issubset(info):
         return None
     return effective_balance(info)
 
@@ -492,7 +528,7 @@ def _aggregate_spot_sell_trades(
     return vwap, fee_usdt, source
 
 
-def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
+def _record_spot_offline_close(bot, sym: str, state_row: dict, *, _basis_replay=False) -> bool:
     """Spot equivalent of FuturesReconcileMixin._record_offline_close.
 
     Called when reconciliation finds a coin in trades.json but no
@@ -511,6 +547,11 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict) -> bool:
     from core.logger import log_event, send_telegram
     from core.database import save_trade_db
     from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+
+    if not _basis_replay and (state_row.get("entry_price_unverified") or state_row.get("entry_basis_pending_closes")):
+        from bot_utils.spot_exits import service_spot_entry_basis
+        if not service_spot_entry_basis(bot, sym, state_row):
+            return state_row.get("accounting_already_booked") is True
 
     try:
         from bot_utils.trade_state import (
@@ -895,13 +936,30 @@ def _state_from_spot_db_position(pos: dict, exch_amt: float) -> dict | None:
     extra = _strict_claim_extra_object(pos.get("extra_json"))
     if extra is None:
         return None
+    from bot_utils.state_persist import _valid_entry_basis_close_fragments
+    if ("entry_basis_pending_closes" in extra
+            and not _valid_entry_basis_close_fragments(extra["entry_basis_pending_closes"])):
+        return None
+    if "entry_price_unverified" in extra and type(extra["entry_price_unverified"]) is not bool:
+        return None
     if extra.get("claim_release_pending") is True:
         return None
 
     db_amount = _positive_float_or_none(pos.get("amount"))
+    basis_pending = (extra.get("entry_price_unverified") is True
+                     or bool(extra.get("entry_basis_pending_closes")))
+    if "entry_price_unverified" in extra or "entry_basis_pending_closes" in extra:
+        from trading.runtime_observability import claim_recovery_metadata
+        metadata = next(iter(claim_recovery_metadata([pos]).values()), {})
+        if metadata.get("claim_recovery_invalid") is True:
+            return None
     exch_amount = _positive_float_or_none(exch_amt)
+    if basis_pending and exch_amount is None:
+        # This is an owned recovery generation, not orphan/flatness adoption.
+        exch_amount = db_amount
     buy_price = _positive_float_or_none(pos.get("buy_price"))
-    invested_total = _positive_float_or_none(pos.get("invested_usdt"))
+    invested_total = (_nonnegative_float_or_none(pos.get("invested_usdt"))
+                      if basis_pending else _positive_float_or_none(pos.get("invested_usdt")))
     if (
         db_amount is None
         or exch_amount is None
@@ -914,7 +972,7 @@ def _state_from_spot_db_position(pos: dict, exch_amt: float) -> dict | None:
     if adopted_amount <= 0:
         return None
     invested_usdt = invested_total * (adopted_amount / db_amount)
-    if not math.isfinite(invested_usdt) or invested_usdt <= 0:
+    if not math.isfinite(invested_usdt) or invested_usdt < 0 or (invested_usdt == 0 and not basis_pending):
         return None
 
     original_amount = _positive_float_or_none(extra.get("original_amount"))
@@ -956,11 +1014,26 @@ def _state_from_spot_db_position(pos: dict, exch_amt: float) -> dict | None:
         "entry_id", "entry_quality_score", "entry_quality_label",
         "entry_quality_reasons", "provisional", "adopted",
         "accounting_pending_partials", "unpriced_external_partials",
+        "entry_price_unverified", "entry_basis_pending_closes", "entry_basis_remaining_amount",
+        "spot_entry_client_order_id", "spot_entry_order_id", "spot_entry_observed_amount",
+        "spot_entry_requested_amount", "spot_entry_quote_budget", "spot_entry_quote_first",
+        "spot_entry_initial_invested_usdt",
+        "verified_flat_pending_accounting", "verified_flat_reason", "verified_flat_time", "verified_flat_at",
+        "accounting_pending", "accounting_already_booked", "accounting_pending_mode_is_sim",
+        "accounting_pending_sell_price", "accounting_pending_sell_time",
+        "accounting_pending_exchange_order_id", "accounting_pending_profit_pct",
+        "accounting_pending_profit_usdt", "accounting_pending_invested_usdt",
+        "accounting_pending_fees_usdt", "accounting_pending_reason",
+        "full_exit_client_order_id", "full_exit_requested_amount", "full_exit_outcome_uncertain",
+        "partial_exit_client_order_id", "partial_exit_requested_amount", "partial_exit_outcome_uncertain",
+        "emergency_exit_client_order_id", "emergency_exit_requested_amount", "emergency_exit_outcome_uncertain",
+        "launcher_exit_client_order_id", "launcher_exit_requested_amount", "launcher_exit_outcome_uncertain",
     ):
         if key in extra:
             if key in (
                 "accounting_pending_partials",
                 "unpriced_external_partials",
+                "entry_basis_pending_closes",
             ):
                 from bot_utils.trade_state import (
                     normalize_pending_accounting_items,
@@ -1825,6 +1898,8 @@ def _emit_spot_position_integrity(
         lock = getattr(bot, "_position_integrity_health_lock", None)
 
         def _complete() -> None:
+            if any(row.get("entry_price_unverified") for row in bot.state.get_all().values()):
+                return
             if int(getattr(bot, "_spot_entry_recovery_generation", 0)) == int(
                 entry_recovery_generation
             ):
@@ -1901,6 +1976,11 @@ def startup_reconciliation(bot) -> None:
         removed = []
         adjusted = []
         for sym, d in list(trades.items()):
+            if d.get("entry_price_unverified") or d.get("entry_basis_pending_closes"):
+                from bot_utils.spot_exits import service_spot_entry_basis
+                if not service_spot_entry_basis(bot, sym, d):
+                    strikes.pop(sym, None)
+                    continue
             local_amt = _spot_state_amount_or_none(d)
             if local_amt is None:
                 strikes.pop(sym, None)
@@ -1967,7 +2047,11 @@ def startup_reconciliation(bot) -> None:
                 if base_amt is not None:
                     exch_amt = base_amt
             if exch_amt is None or exch_amt <= 1e-8:
-                continue
+                from core.database import _strict_claim_extra_object
+                recovery_extra = _strict_claim_extra_object(pos.get("extra_json")) or {}
+                if not (recovery_extra.get("entry_price_unverified") is True
+                        or recovery_extra.get("entry_basis_pending_closes")):
+                    continue
             restored = _state_from_spot_db_position(pos, exch_amt)
             if restored is None:
                 corrupt_ghost_syms.add(base)
@@ -2176,6 +2260,11 @@ class ReconcileMixin:
                 if strikes is None:
                     strikes = self._recon_missing_strikes = {}
                 for sym, d in list(trades.items()):
+                    if d.get("entry_price_unverified") or d.get("entry_basis_pending_closes"):
+                        from bot_utils.spot_exits import service_spot_entry_basis
+                        if not service_spot_entry_basis(self, sym, d):
+                            strikes.pop(sym, None)
+                            continue
                     local_amt = _spot_state_amount_or_none(d)
                     if local_amt is None:
                         strikes.pop(sym, None)

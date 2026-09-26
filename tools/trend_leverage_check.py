@@ -41,6 +41,7 @@ guard_tool_entrypoint(__file__, __name__)
 
 import numpy as np
 
+from core.clock import backtest_asof_ms
 from config.exchange_config import get_exchange_connection, get_active_exchange_name
 from tools.trend_check import (
     _sig_price_ma,
@@ -301,6 +302,29 @@ def _run_sweep(
         print("   [warn] invalid exchange clock")
         return 1
     now_ms = int(numeric_now_ms)
+    try:
+        raw_asof = backtest_asof_ms()
+    except Exception as exc:
+        print(f"   [warn] invalid backtest cutoff: {_safe_exc(exc)}")
+        return 1
+    if raw_asof is not None:
+        if isinstance(raw_asof, bool):
+            print("   [warn] invalid backtest cutoff")
+            return 1
+        try:
+            numeric_asof = float(raw_asof)
+        except (TypeError, ValueError, OverflowError):
+            print("   [warn] invalid backtest cutoff")
+            return 1
+        if (
+            not math.isfinite(numeric_asof)
+            or numeric_asof <= 0.0
+            or not numeric_asof.is_integer()
+        ):
+            print("   [warn] invalid backtest cutoff")
+            return 1
+        now_ms = min(now_ms, int(numeric_asof))
+    closed_until_ms = (now_ms // 86_400_000) * 86_400_000 - 1
     since_ms = now_ms - (days + 10) * 86_400_000
     min_bars = max(150, days)  # requested window plus model warmup floor
     weeks = days / 7.0
@@ -322,14 +346,14 @@ def _run_sweep(
             for c in custom_coins
             if f"{c}/USDT" in market_catalog
         ]
-        data = _load_data(ex, syms, since_ms, min_bars, now_ms)
+        data = _load_data(ex, syms, since_ms, min_bars, closed_until_ms)
         universe_sets["custom"] = data
         sweep_sizes = ["custom"]
     else:
         for n in UNIVERSE_SIZES:
             print(f"\n  Fetching top-{n} universe ...")
             syms = _get_symbols_for_size(ex, n, days, UNIVERSE_30)
-            data = _load_data(ex, syms, since_ms, min_bars, now_ms)
+            data = _load_data(ex, syms, since_ms, min_bars, closed_until_ms)
             universe_sets[n] = data
             print(
                 f"   {len(data)}/{len(syms)} coins qualified with >={min_bars} daily bars"

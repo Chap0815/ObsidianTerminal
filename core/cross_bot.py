@@ -668,6 +668,7 @@ class CrossBot(FuturesBot):
     def _is_active_leg(d: dict) -> bool:
         return not (
             d.get("provisional")
+            or d.get("entry_price_unverified") is True
             or d.get("claim_conflict")
             or d.get("verified_flat_pending_accounting")
             or d.get("accounting_pending")
@@ -841,13 +842,15 @@ class CrossBot(FuturesBot):
     ) -> tuple[float, float, bool, str]:
         amount = self._safe_float((order or {}).get("filled"), 0.0)
         fill = fallback_fill
-        for key in ("average", "price"):
+        price_verified = False
+        for key in ("average",):
             fv = self._safe_float((order or {}).get(key), 0.0)
             if fv > 0:
                 fill = fv
+                price_verified = True
                 break
         if amount > 0:
-            return amount, fill, False, "order"
+            return amount, fill, False, "order" if price_verified else "order_unpriced"
 
         oid = (
             order_id_text_or_none((order or {}).get("id"))
@@ -920,12 +923,16 @@ class CrossBot(FuturesBot):
                     latest_order = refreshed
                 rf = self._safe_float(refreshed.get("filled"), 0.0)
                 if rf > 0:
-                    for key in ("average", "price"):
+                    price_verified = False
+                    for key in ("average",):
                         fv = self._safe_float(refreshed.get(key), 0.0)
                         if fv > 0:
                             fill = fv
+                            price_verified = True
                             break
-                    return rf, fill, False, "order_refresh"
+                    return rf, fill, False, (
+                        "order_refresh" if price_verified else "order_refresh_unpriced"
+                    )
         if refresh_conflict:
             try:
                 from core.logger import log_event
@@ -948,12 +955,14 @@ class CrossBot(FuturesBot):
             contracts = _position_contracts_abs(pos)
             if contracts is None:
                 return 0.0, fill, True, "position_quantity_unverified"
+            price_verified = False
             for key in ("entryPrice", "entry_price"):
                 fv = self._safe_float(pos.get(key), 0.0)
                 if fv > 0:
-                        fill = fv
-                        break
-            return contracts, fill, False, "position"
+                    fill = fv
+                    price_verified = True
+                    break
+            return contracts, fill, False, "position" if price_verified else "position_unpriced"
         if refresh_conflict:
             return 0.0, fill, True, "order_refresh_conflict"
         if oid and not _order_confirmed_terminal_zero_fill(latest_order):
@@ -1076,6 +1085,9 @@ class CrossBot(FuturesBot):
             return False
 
     def _heal_provisional_leg(self, base: str, d: dict) -> bool:
+        if d.get("entry_price_unverified") is True:
+            from core.futures_bot_reconcile import _heal_futures_entry_price_basis
+            return _heal_futures_entry_price_basis(self, base, d)
         from core.logger import log_event
 
         full = f"{base}/USDT:USDT"
@@ -1135,8 +1147,6 @@ class CrossBot(FuturesBot):
             entry = self._safe_float(pos.get(key), 0.0)
             if entry > 0:
                 break
-        if entry <= 0:
-            entry = self._safe_float(d.get("buy"), 0.0)
         if contracts is None or contracts <= 0 or entry <= 0:
             return False
         try:
@@ -1155,6 +1165,12 @@ class CrossBot(FuturesBot):
             )
             return False
 
+        from bot_utils import filled_margin_usdt
+
+        margin, margin_verified = filled_margin_usdt(contracts, cs, entry, leverage)
+        if margin_verified is not True or self._safe_float(margin, 0.0) <= 0.0:
+            return False
+
         from bot_utils.trade_state import (
             _same_position_generation,
             update_many_if_current,
@@ -1170,10 +1186,7 @@ class CrossBot(FuturesBot):
                 "amount": contracts,
                 "original_amount": contracts,
                 "contract_size": cs,
-                "invested_usdt": (
-                    contracts * cs * entry
-                    / leverage
-                ),
+                "invested_usdt": margin,
                 "provisional": False,
             },
             d,
@@ -3568,6 +3581,10 @@ class CrossBot(FuturesBot):
                 "entry_id": entry_id,
                 "provisional": True,
                 "entry_inflight_until": now_ms() / 1000.0 + 120.0,
+                "entry_price_unverified": True,
+                "futures_entry_client_order_id": _cid,
+                "futures_entry_requested_amount": contracts,
+                "futures_entry_observed_amount": 0.0,
             }
             from bot_utils.trade_state import promote_position_generation
 
@@ -3639,6 +3656,11 @@ class CrossBot(FuturesBot):
                     config=MakerFirstConfig(mode="disabled"),
                 )
             except Exception as e:
+                from trading.entry_executor import _OrderSnapshotConflict
+
+                if isinstance(e, _OrderSnapshotConflict):
+                    self._mark_futures_entry_recovery_pending()
+                    return
                 _not_submitted = isinstance(
                     e, FuturesOrderNotSubmitted)
                 _outcome_unknown = isinstance(
@@ -3754,6 +3776,11 @@ class CrossBot(FuturesBot):
                             "entry_quality_reasons": ",".join(quality.reasons),
                             "entry_id": entry_id,
                             "provisional": True,
+                            "entry_price_unverified": True,
+                            "futures_entry_client_order_id": _cid,
+                            "futures_entry_order_id": landed.get("id") or landed.get("orderId"),
+                            "futures_entry_requested_amount": contracts,
+                            "futures_entry_observed_amount": _amt,
                         }
                         from bot_utils.trade_state import (
                             promote_position_generation,
@@ -3828,7 +3855,9 @@ class CrossBot(FuturesBot):
                     expected_client_id=_cid,
                 )
             )
-            provisional = False
+            provisional = verified_source in {
+                "order_unpriced", "order_refresh_unpriced", "position_unpriced",
+            }
             if amount <= 0 and not positions_unavailable:
                 emit_entry_lifecycle(
                     entry_id, bot=self.BOT_NAME, symbol=base,
@@ -3895,7 +3924,15 @@ class CrossBot(FuturesBot):
             "entry_quality_reasons": ",".join(quality.reasons),
             "entry_id": entry_id,
             "provisional": provisional,
+            "entry_price_unverified": bool(provisional and not self.simulation),
         }
+        if not self.simulation:
+            state_row.update({
+                "futures_entry_client_order_id": _cid,
+                "futures_entry_order_id": order.get("id") or order.get("orderId"),
+                "futures_entry_requested_amount": contracts,
+                "futures_entry_observed_amount": self._safe_float(order.get("filled"), 0.0),
+            })
         if sim_tca_pending is not None:
             state_row[self._SIM_TCA_PENDING_FIELD] = sim_tca_pending
         from bot_utils.trade_state import promote_position_generation
@@ -4523,7 +4560,8 @@ class CrossBot(FuturesBot):
                 _amount, close_price, close_fee, exch_oid = evidence
                 close_fee_is_total = False
 
-        if not self.simulation and d.get("unpriced_external_partials"):
+        if not self.simulation and (d.get("unpriced_external_partials")
+                                    or d.get("entry_price_unverified") is True):
             from core.futures_bot_exits import _defer_verified_flat_close
 
             _defer_verified_flat_close(self, base, d, reason, log_event)
@@ -5192,11 +5230,14 @@ class CrossBot(FuturesBot):
             self._cross_risk_snapshot_ok = True
             return
         for base, d in list(raw_trades.items()):
-            if d.get("provisional"):
+            if d.get("provisional") or d.get("entry_price_unverified") is True:
                 if self._heal_provisional_leg(base, d):
                     healed = self.state.get(base)
                     if healed:
                         raw_trades[base] = healed
+                elif d.get("entry_price_unverified") is True:
+                    from core.futures_bot_exits import _protect_unpriced_futures_position
+                    _protect_unpriced_futures_position(self, base, d)
         from core.symbol_locks import close_lock
         for base, d in list(raw_trades.items()):
             if d.get("accounting_already_booked"):
@@ -5364,6 +5405,10 @@ class CrossBot(FuturesBot):
             d = live
             full = f"{base}/USDT:USDT"
             curr = monitor_prices.get(base, 0.0)
+            if d.get("entry_price_unverified") is True:
+                # No profit/BE/trailing decision may use the displayed estimate.
+                # Explicit/emergency closes still use their durable close intent.
+                continue
             if curr <= 0:
                 try:
                     self._note_price_unavailable(base)

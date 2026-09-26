@@ -493,7 +493,7 @@ def get_series(exchange, symbol: str, timeframe: str, since_ms: int) -> list:
         changed = bool(got)
     else:
         c_first, c_last = cached[0][0], cached[-1][0]
-        if since_ms < c_first - tf_ms:                  # need older history
+        if since_ms <= c_first - tf_ms:                 # need older history
             got = _paginate(exchange, symbol, timeframe, since_ms, c_first)
             if not got:
                 return []

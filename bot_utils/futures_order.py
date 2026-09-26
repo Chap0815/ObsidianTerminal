@@ -1976,7 +1976,7 @@ def _upper_currency_text(value) -> str:
 
 def _order_with_fee_context(order, ex=None, symbol_full: str = "",
                             contract_size: Optional[float] = None) -> dict:
-    payload = dict(order) if type(order) is dict else {}
+    payload = dict(order) if type(order) in (dict, _TradeRecoveryOrder) else {}
     if not payload:
         return payload
     if contract_size is not None:

@@ -93,7 +93,8 @@ def _fee_to_usdt_known(fee_dict: dict, order_dict: dict,
     if currency == base:
         fill_price = _safe_fill_price(order_dict)
         if fill_price > 0:
-            return cost * fill_price, True
+            converted = cost * fill_price
+            return (converted, True) if math.isfinite(converted) else (0.0, False)
 
     if cost < 0:
         return 0.0, False
@@ -186,7 +187,8 @@ def estimate_fee_usdt(amount_coins: float, fill_price: float,
     rate = _safe_positive_float(taker_rate)
     if amt <= 0 or px <= 0 or rate <= 0:
         return 0.0
-    return round(amt * px * rate, 6)
+    estimated = amt * px * rate
+    return round(estimated, 6) if math.isfinite(estimated) else 0.0
 
 
 def extract_or_estimate(order: dict, fill_price: float,
@@ -354,7 +356,7 @@ def base_currency_fee_amount(order: dict, base_currency: str) -> float:
         except Exception:
             continue
 
-    return total
+    return total if math.isfinite(total) else 0.0
 
 
 def _safe_fill_price(order_dict: dict) -> float:
@@ -369,7 +371,8 @@ def _safe_fill_price(order_dict: dict) -> float:
     cost = _safe_positive_float(order_dict.get("cost"))
     filled = _safe_positive_float(order_dict.get("filled"))
     if cost > 0 and filled > 0:
-        return cost / filled
+        price = cost / filled
+        return price if math.isfinite(price) else 0.0
     return 0.0
 
 
@@ -390,5 +393,5 @@ def _discount_fallback(order_dict: dict) -> float:
     filled = _first_positive_order_value(order_dict, "filled", "amount")
     price  = _safe_fill_price(order_dict)
     if filled > 0 and price > 0:
-        return round(filled * price * DISCOUNT_TOKEN_FALLBACK_RATE, 6)
+        return estimate_fee_usdt(filled, price, DISCOUNT_TOKEN_FALLBACK_RATE)
     return 0.0

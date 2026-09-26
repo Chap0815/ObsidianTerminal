@@ -1552,7 +1552,10 @@ class ObsidianApp(ctk.CTk):
             delay_ms=400
         )
 
-        action_frame = ctk.CTkFrame(head, fg_color="transparent")
+        # Keep the shared scaled action-row footprint even for the mechanical
+        # Trend card. Default empty CTk frames request 200px; 30 matches the
+        # real buttons without a dummy control or a large empty header.
+        action_frame = ctk.CTkFrame(head, fg_color="transparent", width=1, height=30)
         action_frame.grid(row=1, column=1, sticky="ne", padx=(12, 0), pady=(8, 0))
 
         prompt_btn = None
@@ -1630,8 +1633,6 @@ class ObsidianApp(ctk.CTk):
             command=lambda n=name: self._toggle_simulation(n)
         )
         sim_btn.grid(row=0, column=1, sticky="ne", padx=(12, 0))
-        if not meta.get("uses_llm", True) and not is_futures:
-            action_frame.grid_forget()
         attach_tooltip(
             sim_btn,
             "Toggle SIMULATION  LIVE mode.\n"
@@ -4907,7 +4908,10 @@ class ObsidianApp(ctk.CTk):
             # Unrealized PnL  live aus DataPoller-Cache
             unr_val = _ui_finite_float(cache.get("unrealized", {}).get(bot))
             open_count = _ui_nonnegative_int(cache.get("open", {}).get(bot))
-            if open_count == 0:
+            if metrics_error:
+                card["unr_var"].set("--")
+                card["unr_lbl"].configure(text_color=COLORS["warning"])
+            elif open_count == 0:
                 card["unr_var"].set("")
                 card["unr_lbl"].configure(text_color=COLORS["text_muted"])
             else:
@@ -5124,7 +5128,10 @@ class ObsidianApp(ctk.CTk):
             for b in BOT_ORDER
             if _cache_sim(b) != money_scope_live
         )
-        if total_open > 0:
+        if metrics_error:
+            self.sb_unr_total.set("--")
+            self.sb_unr_total._lbl.configure(text_color=COLORS["warning"])
+        elif total_open > 0:
             total_unr = sum(
                 _ui_finite_float(unr_cache.get(b))
                 for b in BOT_ORDER

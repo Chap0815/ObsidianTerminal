@@ -78,6 +78,8 @@ _POSITION_BOOLEAN_FIELDS = frozenset((
     "partial_tp_blocked_min_notional",
     "closing_retry_pending",
     "funding_booked_on_partials_known",
+    "entry_price_unverified",
+    "spot_entry_quote_first",
 ))
 
 _POSITION_SYMBOL_MAX_LENGTH = 64
@@ -87,6 +89,7 @@ _POSITION_SYMBOL_CHARS = frozenset(
 _PENDING_ACCOUNTING_FIELDS = frozenset((
     "accounting_pending_partials",
     "unpriced_external_partials",
+    "entry_basis_pending_closes",
 ))
 
 
@@ -112,6 +115,70 @@ def _valid_pending_accounting_items(value) -> bool:
     return isinstance(value, list) and all(
         isinstance(item, dict) for item in value
     )
+
+
+def _valid_entry_basis_close_fragments(value) -> bool:
+    if not isinstance(value, list) or len(value) > 1000:
+        return False
+    seen_ids = set()
+    allowed = {"client_order_id", "exchange_order_id", "order_id", "filled", "sell_price",
+               "price", "exit_notional", "fee", "sell_time", "reason", "leg", "terminal",
+               "entry_id", "staged", "accounted", "fee_known", "funding_total",
+               "funding_window_unverified"}
+    for item in value:
+        if not isinstance(item, dict) or any(key not in allowed for key in item):
+            return False
+        for field, raw in (("filled", item.get("filled")),
+                           ("price", item.get("sell_price", item.get("price")))):
+            number = _finite_float_or_none(raw)
+            if number is None or number <= 0:
+                return False
+        if _finite_float_or_none(item.get("fee")) is None:
+            return False
+        identities = []
+        for field in ("client_order_id", "exchange_order_id", "order_id"):
+            raw_id = item.get(field)
+            if raw_id is None:
+                continue
+            if (not isinstance(raw_id, str) or not raw_id or raw_id != raw_id.strip()
+                    or len(raw_id) > 256 or any(ord(c) < 32 or ord(c) == 127 for c in raw_id)):
+                return False
+            identity = ("client" if field == "client_order_id" else "order", raw_id)
+            if identity in seen_ids and identity not in identities:
+                return False
+            identities.append(identity)
+        if not identities:
+            return False
+        seen_ids.update(identities)
+        try:
+            timestamp = datetime.strptime(item.get("sell_time"), "%Y-%m-%d %H:%M:%S")
+            if timestamp.strftime("%Y-%m-%d %H:%M:%S") != item["sell_time"]:
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+        reason = item.get("reason")
+        if not isinstance(reason, str) or not reason.strip() or len(reason) > 512:
+            return False
+        if any(field in item and type(item[field]) is not bool
+               for field in ("staged", "accounted", "terminal", "fee_known", "funding_window_unverified")):
+            return False
+        if ("funding_total" in item
+                and _finite_float_or_none(item["funding_total"]) is None):
+            return False
+        if "exit_notional" in item:
+            notional = _finite_float_or_none(item["exit_notional"])
+            if notional is None or notional <= 0:
+                return False
+        if "sell_price" in item:
+            try:
+                valid_generation = _normalized_entry_id_or_none(item.get("entry_id")) is not None
+            except (TypeError, ValueError):
+                valid_generation = False
+            if (not valid_generation or not isinstance(item.get("leg"), str)
+                    or item.get("leg") not in {"partial", "full", "emergency", "launcher"}
+                    or item.get("terminal") is not True):
+                return False
+    return True
 
 
 def is_canonical_position_symbol(value) -> bool:
@@ -659,7 +726,11 @@ def _validate_state(trades: dict,
             (
                 field
                 for field in _PENDING_ACCOUNTING_FIELDS
-                if field in d and not _valid_pending_accounting_items(d[field])
+                if field in d and not (
+                    _valid_entry_basis_close_fragments(d[field])
+                    if field == "entry_basis_pending_closes"
+                    else _valid_pending_accounting_items(d[field])
+                )
             ),
             None,
         )
