@@ -243,7 +243,7 @@ def _owned_trade_update(trades) -> tuple[tuple | None, str | None]:
         return None, "EmptyTradeUpdate"
     if count > _TRADE_UPDATE_MAX_ROWS:
         return None, "OversizedTradeUpdate"
-    fields = ("id", "timestamp", "price", "amount", "side")
+    fields = ("id", "timestamp", "price", "amount", "side", "symbol")
     try:
         projected = tuple(
             {
@@ -1803,6 +1803,21 @@ class L2ShadowCollector:
             received_ms = _capture_now_ms()
             observed_at_monotonic = time.monotonic()
             try:
+                raw_book_symbol = (
+                    dict.get(observed_book, "symbol")
+                    if isinstance(observed_book, dict)
+                    else None
+                )
+                if raw_book_symbol is not None and (
+                    type(raw_book_symbol) is not str
+                    or raw_book_symbol != str.strip(raw_book_symbol)
+                    or not explicit_trade_symbol_matches(
+                        {"symbol": raw_book_symbol}, symbol
+                    )
+                ):
+                    raise OrderBookValidationError(
+                        "order book identity is invalid"
+                    )
                 book = normalize_order_book(
                     observed_book,
                     depth_levels=self.depth_levels,

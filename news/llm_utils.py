@@ -376,6 +376,17 @@ def _close_ollama_client(client) -> bool:
         return False
 
 
+def _plain_generate_response(response) -> dict:
+    """Accept legacy dicts and the known SDK model, never duck-typed objects."""
+    if type(response) is dict:
+        return response
+    if type(response) is ollama.GenerateResponse:
+        plain = response.model_dump()
+        if type(plain) is dict:
+            return plain
+    raise ValueError("LLM generation response type is invalid")
+
+
 def generate_with_timeout(model: str, prompt: str,
                            use_json_format: bool = True) -> dict:
     """Call Ollama via ollama.Client (connection pooling, no TCP overhead).
@@ -462,7 +473,7 @@ def generate_with_timeout(model: str, prompt: str,
         import os as _os
         if use_json_format and _os.getenv("OLLAMA_FORCE_JSON", "0") == "1":
             kwargs["format"] = "json"
-        result  = client.generate(**kwargs)
+        result = _plain_generate_response(client.generate(**kwargs))
         _LAST_USED_MODEL[0] = model
         elapsed = time.perf_counter() - t0
         level   = "INFO"

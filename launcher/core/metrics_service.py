@@ -715,6 +715,10 @@ def get_futures_state_count(bot_name: str = None,
         )
     else:
         rows = query_db_dict("SELECT * FROM futures_state")
+    _require_verified_entry_basis(
+        keys if bot_name else [row.get("bot_name") for row in rows if row.get("bot_name")],
+        check_price=False,
+    )
     return sum(1 for row in rows if is_futures_state_fresh(row))
 
 
@@ -733,6 +737,7 @@ def get_futures_state_counts(
         for key in keys:
             owners.setdefault(key, []).append(bot)
     all_keys = tuple(owners)
+    _require_verified_entry_basis(all_keys, check_price=False)
     placeholders = ",".join("?" for _ in all_keys)
     rows = query_db_dict(
         f"SELECT * FROM futures_state WHERE bot_name IN ({placeholders})",
@@ -1037,6 +1042,34 @@ def get_market_dashboard_snapshot() -> tuple[dict | None, dict]:
 
 #  Unrealized PnL 
 
+def _require_verified_entry_basis(bot_keys, *, check_price=True) -> None:
+    keys = tuple(dict.fromkeys(bot_keys))
+    if not keys:
+        return
+    rows = query_db_dict(
+        "SELECT extra_json FROM bot_open_positions WHERE state='OPEN' "
+        "AND bot_name IN ({})".format(",".join("?" for _ in keys)), keys,
+    )
+    for row in rows:
+        raw = row.get("extra_json")
+        if raw in (None, ""):
+            continue
+        try:
+            extra = json.loads(raw, object_pairs_hook=_unique_metrics_json_object) if isinstance(raw, str) else raw
+        except (TypeError, ValueError) as exc:
+            raise MetricsMarketDataError("entry basis claim metadata is invalid") from exc
+        if not isinstance(extra, dict):
+            raise MetricsMarketDataError("entry basis claim metadata is invalid")
+        if extra.get("verified_flat_pending_accounting") is True:
+            raise MetricsMarketDataError("verified flat position has pending accounting")
+        if "entry_price_unverified" in extra:
+            if type(extra["entry_price_unverified"]) is not bool:
+                raise MetricsMarketDataError("entry execution basis is unverified")
+            if extra["entry_price_unverified"]:
+                observed = _finite_float_or_none(extra.get("futures_entry_observed_amount"))
+                if check_price or observed is None or observed <= 0:
+                    raise MetricsMarketDataError("entry execution basis is unverified")
+
 def get_unrealized_pnl_futures(bot_name: str = None,
                                mode_is_sim: bool | None = None) -> float:
     """Sum of unrealized PnL from ``futures_state``. Pass ``bot_name`` to scope
@@ -1057,6 +1090,7 @@ def get_unrealized_pnl_futures(bot_name: str = None,
         params = _metrics_bot_keys(bot_name, mode_is_sim)
         where = "WHERE bot_name IN ({})".format(",".join("?" for _ in params))
     rows = query_db_dict(f"SELECT * FROM futures_state {where}", params)
+    _require_verified_entry_basis(params or [row.get("bot_name") for row in rows if row.get("bot_name")])
     total = 0.0
     for row in rows:
         if not is_futures_state_fresh(row):
@@ -1081,6 +1115,7 @@ def get_unrealized_pnl_futures_batch(
         for key in keys:
             owners.setdefault(key, []).append(bot)
     all_keys = tuple(owners)
+    _require_verified_entry_basis(all_keys)
     placeholders = ",".join("?" for _ in all_keys)
     rows = query_db_dict(
         f"SELECT * FROM futures_state WHERE bot_name IN ({placeholders})",
@@ -1131,6 +1166,19 @@ def get_unrealized_pnl_spots(
                 f"{bot_name or 'SPOT'} state read failed: {exc}"
             ) from exc
         trades_by_bot[bot_name] = trades
+        if any(isinstance(row, dict) and "entry_price_unverified" in row
+               and (type(row["entry_price_unverified"]) is not bool or row["entry_price_unverified"])
+               for row in trades.values()):
+            raise MetricsMarketDataError(f"{bot_name or 'SPOT'} entry execution basis is unverified")
+        if any(isinstance(row, dict) and row.get("verified_flat_pending_accounting") is True
+               for row in trades.values()):
+            raise MetricsMarketDataError(f"{bot_name or 'SPOT'} verified flat accounting is pending")
+
+    _require_verified_entry_basis(
+        key for bot_name, request in requests.items()
+        if isinstance(request, (tuple, list)) and len(request) == 2
+        for key in _metrics_bot_keys(bot_name or "SPOT", request[1])
+    )
 
     result = {bot_name: 0.0 for bot_name in requests}
     symbols = sorted({

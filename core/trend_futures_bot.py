@@ -1567,6 +1567,11 @@ class TrendFuturesBot(FuturesBot):
                 entry_shadow=shadow,
                 entry_id=entry_id,
                 contract_size=cs,
+                entry_basis_fields={
+                    "futures_entry_client_order_id": _cid,
+                    "futures_entry_requested_amount": contracts,
+                    "futures_entry_observed_amount": 0.0,
+                },
             ):
                 emit_entry_lifecycle(
                     entry_id, bot=self.BOT_NAME, symbol=base,
@@ -1618,6 +1623,11 @@ class TrendFuturesBot(FuturesBot):
                     config=MakerFirstConfig(mode="disabled"),
                 )
             except Exception as e:
+                from trading.entry_executor import _OrderSnapshotConflict
+
+                if isinstance(e, _OrderSnapshotConflict):
+                    self._mark_futures_entry_recovery_pending()
+                    return
                 _not_submitted = isinstance(
                     e, FuturesOrderNotSubmitted)
                 _outcome_unknown = isinstance(
@@ -1700,22 +1710,30 @@ class TrendFuturesBot(FuturesBot):
                     ):
                         amount = landed_amount
                         landed_fill = price
-                        for _k in ("average", "price"):
+                        landed_price_verified = False
+                        for _k in ("average",):
                             _fv = self._safe_float(landed.get(_k), 0.0)
                             if _fv > 0:
                                 landed_fill = _fv
+                                landed_price_verified = True
                                 break
                         actual_margin, _ = filled_margin_usdt(
                             amount, cs, landed_fill, eff_lev, margin)
                         tracked = self._record_open(
                             base, landed_fill, actual_margin,
                             eff_lev, amount,
-                            0.0, provisional=False,
+                            0.0, provisional=not landed_price_verified,
                             lev_cap=lev_cap, mm_rate=mm,
                             entry_shadow=shadow,
                             entry_id=entry_id,
                             contract_size=cs,
                             margin_mode=margin_mode,
+                            entry_basis_fields={
+                                "futures_entry_client_order_id": _cid,
+                                "futures_entry_order_id": landed.get("id") or landed.get("orderId"),
+                                "futures_entry_requested_amount": contracts,
+                                "futures_entry_observed_amount": amount,
+                            },
                         )
                         if tracked is None:
                             log_event(
@@ -1805,7 +1823,9 @@ class TrendFuturesBot(FuturesBot):
                         "ERROR",
                     )
                 return
-            provisional = False
+            provisional = verified_source in {
+                "order_unpriced", "order_refresh_unpriced", "position_unpriced",
+            }
             if amount <= 0:
                 amount = contracts
                 provisional = True
@@ -1856,6 +1876,12 @@ class TrendFuturesBot(FuturesBot):
             entry_id=entry_id,
             sim_tca_pending=sim_tca_pending,
             contract_size=cs,
+            entry_basis_fields=({
+                "futures_entry_client_order_id": _cid,
+                "futures_entry_order_id": order.get("id") or order.get("orderId"),
+                "futures_entry_requested_amount": contracts,
+                "futures_entry_observed_amount": self._safe_float(order.get("filled"), 0.0),
+            } if not self.simulation else None),
         )
         if tracked is None:
             log_event(
@@ -1912,14 +1938,16 @@ class TrendFuturesBot(FuturesBot):
         """
         amount = self._safe_float((order or {}).get("filled"), 0.0)
         fill = fallback_fill
-        for key in ("average", "price"):
+        priced = False
+        for key in ("average",):
             value = (order or {}).get(key)
-            fv = self._safe_float(value, 0.0)
+            fv = 0.0 if isinstance(value, bool) else self._safe_float(value, 0.0)
             if fv > 0:
                 fill = fv
+                priced = True
                 break
         if amount > 0:
-            return amount, fill, False, "order"
+            return amount, fill, False, "order" if priced else "order_unpriced"
 
         oid = (
             order_id_text_or_none((order or {}).get("id"))
@@ -1984,12 +2012,15 @@ class TrendFuturesBot(FuturesBot):
                     latest_order = refreshed
                 rf = self._safe_float(refreshed.get("filled"), 0.0)
                 if rf > 0:
-                    for key in ("average", "price"):
-                        fv = self._safe_float(refreshed.get(key), 0.0)
+                    priced = False
+                    for key in ("average",):
+                        value = refreshed.get(key)
+                        fv = 0.0 if isinstance(value, bool) else self._safe_float(value, 0.0)
                         if fv > 0:
                             fill = fv
+                            priced = True
                             break
-                    return rf, fill, False, "order_refresh"
+                    return rf, fill, False, "order_refresh" if priced else "order_refresh_unpriced"
         if refresh_conflict:
             try:
                 from core.logger import log_event
@@ -2009,12 +2040,14 @@ class TrendFuturesBot(FuturesBot):
             contracts = _position_contracts_abs(pos)
             if contracts is None:
                 return 0.0, fill, True, "position_quantity_unverified"
+            priced = False
             for key in ("entryPrice", "entry_price"):
                 fv = self._safe_float(pos.get(key), 0.0)
                 if fv > 0:
                         fill = fv
+                        priced = True
                         break
-            return contracts, fill, False, "position"
+            return contracts, fill, False, "position" if priced else "position_unpriced"
         if refresh_conflict:
             return 0.0, fill, True, "order_refresh_conflict"
         if oid and not _order_confirmed_terminal_zero_fill(latest_order):
@@ -2116,7 +2149,8 @@ class TrendFuturesBot(FuturesBot):
                       margin_mode: str = "isolated",
                       entry_inflight: bool = False,
                       sim_tca_pending: Optional[dict] = None,
-                      contract_size: Optional[float] = None) -> Optional[bool]:
+                      contract_size: Optional[float] = None,
+                      entry_basis_fields: Optional[dict] = None) -> Optional[bool]:
         from core.logger import _date as _utc
         from bot_utils import calc_liquidation_price, distance_to_liquidation_pct
         # Liquidation uses the INTEGER leverage the exchange runs (ceil) + real
@@ -2133,7 +2167,10 @@ class TrendFuturesBot(FuturesBot):
             "amount": amount, "original_amount": amount, "funding_paid": 0.0,
             "initial_entry_fee": fees, "fees_paid": fees,
             "strategy": "trend", "provisional": provisional,
+            "entry_price_unverified": bool(provisional and not self.simulation),
         }
+        if entry_basis_fields:
+            row.update(entry_basis_fields)
         if provisional and entry_inflight:
             from core.clock import now_ms
 
@@ -2719,7 +2756,8 @@ class TrendFuturesBot(FuturesBot):
                     return
                 _amount, close_price, close_fee, exch_oid = evidence
 
-        if not self.simulation and d.get("unpriced_external_partials"):
+        if not self.simulation and (d.get("unpriced_external_partials")
+                                    or d.get("entry_price_unverified") is True):
             from core.futures_bot_exits import _defer_verified_flat_close
 
             _defer_verified_flat_close(self, base, d, reason, log_event)
@@ -2980,8 +3018,11 @@ class TrendFuturesBot(FuturesBot):
                     for base, d in trades.items():
                         if self._shutdown_event.is_set():
                             break
-                        if d.get("provisional"):
+                        if d.get("provisional") or d.get("entry_price_unverified") is True:
                             if not self._heal_provisional_position(base, d):
+                                if d.get("entry_price_unverified") is True:
+                                    from core.futures_bot_exits import _protect_unpriced_futures_position
+                                    _protect_unpriced_futures_position(self, base, d)
                                 continue
                             d = self.state.get(base) or d
                         try:
@@ -2996,6 +3037,9 @@ class TrendFuturesBot(FuturesBot):
 
     def _heal_provisional_position(self, base: str, d: dict) -> bool:
         """Resolve a provisional entry state after restart/API uncertainty."""
+        if d.get("entry_price_unverified") is True:
+            from core.futures_bot_reconcile import _heal_futures_entry_price_basis
+            return _heal_futures_entry_price_basis(self, base, d)
         from core.logger import log_event
         from bot_utils import calc_liquidation_price, distance_to_liquidation_pct
 
@@ -3035,12 +3079,26 @@ class TrendFuturesBot(FuturesBot):
             entry = self._safe_float(pos.get(key), 0.0)
             if entry > 0:
                 break
-        if entry <= 0:
-            entry = self._safe_float(d.get("buy"), 0.0)
         if contracts is None or contracts <= 0 or entry <= 0:
             return False
 
-        lev = self._safe_float(d.get("leverage"), 1.0) or 1.0
+        lev = self._safe_float(d.get("leverage"), 0.0)
+        if lev <= 0:
+            return False
+        try:
+            cs = TrendFuturesBot._position_contract_size(
+                self, full, d,
+                # Intended provisional margin is not evidence of contract size.
+                # Allow only durable entry or explicit venue metadata here.
+                lambda _ex, _symbol: 0.0,
+            )
+        except Exception:
+            return False
+        from bot_utils import filled_margin_usdt
+
+        margin, margin_verified = filled_margin_usdt(contracts, cs, entry, lev)
+        if not margin_verified:
+            return False
         mm = self._safe_float(d.get("maintenance_margin_rate"), 0.01) or 0.01
         try:
             liq = self._safe_float(pos.get("liquidationPrice"), 0.0)
@@ -3054,6 +3112,8 @@ class TrendFuturesBot(FuturesBot):
             "last_price": entry,
             "amount": contracts,
             "original_amount": contracts,
+            "invested_usdt": margin,
+            "entry_contract_size": cs,
             "provisional": False,
             "liquidation_price": liq,
             "initial_liq_distance": distance_to_liquidation_pct(entry, liq, "LONG"),
@@ -3156,7 +3216,7 @@ class TrendFuturesBot(FuturesBot):
                                calc_liquidation_price, distance_to_liquidation_pct,
                                liq_buffer_consumed_pct, get_exchange_liq_price,
                                get_maintenance_margin_rate)
-        if d.get("provisional"):
+        if d.get("provisional") or d.get("entry_price_unverified") is True:
             return
         if self._handle_exit_recovery_gate(base, d):
             return

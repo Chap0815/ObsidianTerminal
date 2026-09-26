@@ -51,6 +51,323 @@ def _positive_float_or_none(value) -> float | None:
     return parsed if parsed is not None and parsed > 0 else None
 
 
+def _actual_futures_entry_price(order: dict) -> float | None:
+    average = _positive_float_or_none(order.get("average"))
+    if average is not None:
+        return average
+    # CCXT derives cost from price and filled, even when a minimal ACK has no
+    # type. Neither its limit/quoted price nor this synthetic cost proves VWAP.
+    return None
+
+
+def _restore_futures_basis_claims(bot, claim_rows, metadata, exchange_open, foreign_bases, *, snapshot_complete=True):
+    """Restore only an existing owned generation, never adopt an unpriced orphan."""
+    from bot_utils.trade_state import add_position_if_absent
+    from core.database import _base_symbol, get_open_positions_db
+    from core.symbol_locks import close_lock
+    grouped = {}
+    for claim in claim_rows:
+        if isinstance(claim, dict):
+            grouped.setdefault(_base_symbol(claim.get("symbol")), []).append(claim)
+    for sym, records in grouped.items():
+        info = metadata.get(sym, {})
+        if (len(records) != 1 or sym in foreign_bases or not isinstance(info, dict)
+                or info.get("entry_price_unverified") is not True
+                or any(info.get(key) is True for key in (
+                    "claim_release_pending", "claim_recovery_invalid", "partial_claim_recovery_invalid",
+                ))
+                or not _safe_identifier(info.get("entry_id"), max_length=64)
+                or not order_id_text_or_none(info.get("futures_entry_client_order_id"))):
+            continue
+        claim = records[0]
+        raw_side = claim.get("position_type")
+        side = raw_side.strip().upper() if isinstance(raw_side, str) else None
+        if side not in {"LONG", "SHORT"}:
+            continue
+        buy = _positive_float_or_none(claim.get("buy_price"))
+        amount = _positive_float_or_none(claim.get("amount"))
+        margin = _positive_float_or_none(claim.get("invested_usdt"))
+        lev = _positive_float_or_none(claim.get("leverage"))
+        _has_cs, cs = _durable_contract_size_evidence(info)
+        opened = _safe_identifier(claim.get("buy_time"), max_length=64)
+        if (None in (buy, amount, margin, lev, cs) or opened is None
+                or _utc_datetime_or_none(opened) is None):
+            continue
+        position = exchange_open.get(sym)
+        flat = info.get("verified_flat_pending_accounting") is True
+        if flat:
+            if position is not None or not snapshot_complete:
+                continue
+            remaining = 0.0
+        else:
+            if not isinstance(position, dict) or _position_side_or_none(position) != side:
+                continue
+            remaining = _position_contracts_abs(position)
+            if remaining is None or remaining <= 0:
+                continue
+            # Raw/WAL quantities are accounting bases; do not overwrite them
+            # with a residual position or erase their sold slices on restart.
+            has_raw = bool(info.get("entry_basis_pending_closes") or info.get("accounting_pending_partials")
+                           or info.get("pending_close_filled_amount"))
+            if has_raw:
+                full_sold = _finite_float_or_none(info.get("pending_close_filled_amount", 0.0))
+                if full_sold is None or not math.isclose(amount - full_sold, remaining, rel_tol=1e-9, abs_tol=1e-12):
+                    continue
+            else:
+                amount = remaining
+        restored = {
+            "buy": buy, "highest": buy, "buy_time": opened,
+            "amount": amount, "original_amount": info.get("original_amount", amount),
+            "invested_usdt": margin, "leverage": lev, "position_type": side,
+            "entry_contract_size": cs, "provisional": True,
+            **info, "entry_basis_remaining_amount": remaining,
+        }
+        try:
+            with close_lock(sym, timeout=2.0, bot_name=bot.BOT_NAME) as acquired:
+                if not acquired or bot.state.has(sym):
+                    continue
+                # The snapshot predates the symbol lock. A released, replaced,
+                # or economically changed claim must not resurrect old state.
+                current_claims = [
+                    row for row in get_open_positions_db(bot.BOT_NAME)
+                    if _base_symbol(row.get("symbol")) == sym
+                ]
+                if len(current_claims) != 1 or current_claims[0] != claim:
+                    continue
+                add_position_if_absent(bot.state, sym, restored)
+        except Exception:
+            continue
+
+
+def _heal_futures_entry_price_basis(bot, sym: str, row: dict, *, already_locked: bool = False) -> bool:
+    """Heal a generation's BUY basis from venue evidence, never its estimate.
+
+    Flat positions still require the original entry receipt. Physical residual
+    quantity is not enlarged, and unbooked close fragments remain durable.
+    """
+    if row.get("entry_price_unverified") is not True:
+        return True
+    from bot_utils.futures_order import (
+        _exchange_id, _find_order_by_client_id, _order_request_conflicts,
+        _order_client_id_matches, _order_from_recovery_trades,
+        fetch_open_position,
+    )
+    from bot_utils.trade_state import update_many_if_current
+
+    full = f"{sym}/USDT:USDT"
+    side = str(row.get("position_type", "")).upper()
+    if side not in {"LONG", "SHORT"}:
+        return False
+    _has_cs, cs = _durable_contract_size_evidence(row)
+    lev = _positive_float_or_none(row.get("leverage"))
+    amount = _finite_float_or_none(row.get("amount"))
+    if cs is None or lev is None or amount is None or amount < 0:
+        return False
+    raw_closes = row.get("entry_basis_pending_closes", [])
+    if type(raw_closes) is not list or len(raw_closes) > 1000:
+        return False
+    sold = 0.0
+    close_ids = set()
+    close_cids = set()
+    for fragment in raw_closes:
+        if type(fragment) is not dict:
+            return False
+        filled = _positive_float_or_none(fragment.get("filled"))
+        if filled is None:
+            return False
+        close_id = order_id_text_or_none(fragment.get("order_id"))
+        close_cid = order_id_text_or_none(fragment.get("client_order_id"))
+        if not close_id or not close_cid or close_id in close_ids or close_cid in close_cids:
+            return False
+        close_ids.add(close_id)
+        close_cids.add(close_cid)
+        sold += filled
+        if not math.isfinite(sold):
+            return False
+    cid = order_id_text_or_none(row.get("futures_entry_client_order_id"))
+    oid = order_id_text_or_none(row.get("futures_entry_order_id"))
+    order = None
+    try:
+        if oid and try_consume_api_call("entry_basis_fetch_order", critical=True):
+            order = bot.ex.fetch_order(oid, full)
+        if isinstance(order, dict) and str(order.get("status", "")).lower() in {"open", "new", "pending", "partially_filled"}:
+            return False
+        if (not isinstance(order, dict) or not (
+            _actual_futures_entry_price(order)
+        )) and cid:
+            order = _find_order_by_client_id(
+                bot.ex, full, cid, expected_side="buy" if side == "LONG" else "sell",
+                expected_position_side=side.lower(),
+                expected_reduce_only=False,
+                exchange_id=_exchange_id(bot.ex),
+            )
+    except Exception:
+        order = None
+    if isinstance(order, dict) and str(order.get("status", "")).lower() in {"open", "new", "pending", "partially_filled"}:
+        return False
+    if not isinstance(order, dict) or not (
+        _actual_futures_entry_price(order)
+    ):
+        try:
+            if not (oid or cid) or not try_consume_api_call("entry_basis_fetch_trades", critical=True):
+                raise ValueError("entry trade lookup lacks identity or budget")
+            trades = bot.ex.fetch_my_trades(full, limit=200)
+            if type(trades) is not list or len(trades) > 200:
+                raise ValueError("invalid entry trade lookup")
+            matching = []
+            for trade in trades:
+                if not isinstance(trade, dict):
+                    continue
+                info = trade.get("info") if isinstance(trade.get("info"), dict) else {}
+                trade_oid = order_id_text_or_none(trade.get("order") or trade.get("orderId") or info.get("orderId"))
+                if (oid and trade_oid == oid) or (cid and _order_client_id_matches(trade, cid)):
+                    matching.append(trade)
+            if matching:
+                order = _order_from_recovery_trades(matching, cid or "", full, exchange_id=_exchange_id(bot.ex))
+        except Exception:
+            pass
+    entry = None
+    original = None
+    full_sold = _finite_float_or_none(row.get("pending_close_filled_amount", 0.0))
+    if full_sold is None or full_sold < 0:
+        return False
+    quantity_unknown = (
+        _finite_float_or_none(row.get("futures_entry_observed_amount")) == 0.0
+    )
+    if isinstance(order, dict) and not _order_request_conflicts(
+        order, full, "buy" if side == "LONG" else "sell", side.lower(),
+        _exchange_id(bot.ex), expected_reduce_only=False,
+        allow_one_way_position_side=True, expected_client_id=cid,
+    ):
+        actual_oid = order_id_text_or_none(order.get("id") or order.get("orderId"))
+        if not oid or actual_oid == oid:
+            original = _positive_float_or_none(order.get("filled"))
+            entry = _actual_futures_entry_price(order)
+    if entry is None or original is None:
+        if quantity_unknown and (raw_closes or full_sold > 0):
+            # A residual venue position cannot prove the original BUY quantity.
+            return False
+        try:
+            position, unavailable = fetch_open_position(
+                bot.ex, full, expected_position_side=side,
+                _api_endpoint_prefix="entry_basis_positions_", _api_critical=True,
+            )
+        except Exception:
+            return False
+        if unavailable or not isinstance(position, dict):
+            return False
+        contracts = _position_contracts_abs(position)
+        if contracts is None or (not quantity_unknown and abs(contracts - amount) > max(1e-12, amount * 1e-9)):
+            return False
+        if quantity_unknown:
+            amount = contracts
+        entry = _positive_float_or_none(position.get("entryPrice")) or _positive_float_or_none(position.get("entry_price"))
+        original = amount + sold
+    if quantity_unknown and original is not None:
+        requested = _positive_float_or_none(row.get("futures_entry_requested_amount"))
+        if requested is None or original > requested + max(1e-12, requested * 1e-9):
+            return False
+        amount = original - sold
+        if amount < 0 or full_sold > amount + max(1e-12, original * 1e-9):
+            return False
+    if entry is None or original is None or abs(original - amount - sold) > max(1e-12, original * 1e-9):
+        return False
+    margin = amount * cs * entry / lev
+    if not math.isfinite(margin):
+        return False
+    try:
+        from bot_utils import extract_or_estimate_futures_fee
+        healed_fee = _finite_float_or_none(extract_or_estimate_futures_fee(
+            bot.ex, order or {}, full, entry, amount=original, contract_size=cs,
+        ))
+    except Exception:
+        return False
+    old_entry_fee = _finite_float_or_none(row.get("initial_entry_fee", 0.0))
+    all_fees = _finite_float_or_none(row.get("fees_paid", 0.0))
+    if healed_fee is None or old_entry_fee is None or all_fees is None:
+        return False
+    fields = {
+        "buy": entry, "highest": entry, "last_price": entry,
+        "invested_usdt": margin,
+        "original_amount": original, "entry_contract_size": cs,
+        "amount": amount,
+        "futures_entry_observed_amount": original,
+        "entry_price_unverified": False, "provisional": False,
+        "initial_entry_fee": healed_fee,
+        "fees_paid": all_fees - old_entry_fee + healed_fee,
+    }
+    if row.get("accounting_pending") is True:
+        # Preserve the real SELL receipt, but invalidate calculations made with
+        # the explicitly unverified BUY. Offline accounting rebuilds them.
+        fields.update({
+            "accounting_pending_profit_usdt": None,
+            "accounting_pending_profit_pct": None,
+            "accounting_pending_fees_usdt": None,
+            "accounting_pending_mfe_pct": None,
+            "accounting_pending_mae_pct": None,
+            "accounting_pending_giveback_pct": None,
+        })
+    # Raw slices move atomically into the existing idempotent accounting WAL.
+    # They never disappear merely because a price has become available.
+    if raw_closes:
+        from bot_utils.trade_state import normalize_pending_accounting_items
+        pending = normalize_pending_accounting_items(row.get("accounting_pending_partials"))
+        realized = _finite_float_or_none(row.get("partial_profit_realized", 0.0))
+        entry_fee = healed_fee
+        booked_funding = _finite_float_or_none(row.get("funding_booked_on_partials", 0.0))
+        if None in (realized, entry_fee, booked_funding):
+            return False
+        for fragment in raw_closes:
+            filled = _positive_float_or_none(fragment.get("filled"))
+            price = _positive_float_or_none(fragment.get("price"))
+            fee = _finite_float_or_none(fragment.get("fee"))
+            funding = _finite_float_or_none(fragment.get("funding_total"))
+            if (price is None or fee is None or funding is None
+                    or fragment.get("funding_window_unverified") is True
+                    or not order_id_text_or_none(fragment.get("order_id"))):
+                return False
+            portion = filled / original
+            gross = filled * cs * (price - entry) * (1 if side == "LONG" else -1)
+            funding_slice = funding * portion
+            fees = entry_fee * portion + fee
+            profit = round(gross - fees - funding_slice, 2)
+            if not all(math.isfinite(v) for v in (profit, fees, funding_slice)):
+                return False
+            pending.append({
+                "bot_name": bot.BOT_NAME, "mode_is_sim": False, "symbol": sym,
+                "buy_price": entry, "sell_price": price,
+                "buy_time": row.get("buy_time", ""), "sell_time": fragment.get("sell_time"),
+                "profit_pct": (price / entry - 1) * 100 * (1 if side == "LONG" else -1),
+                "profit_usdt": profit, "invested_usdt": filled * cs * entry / lev,
+                "reason": fragment.get("reason", "Partial Take-Profit"),
+                "is_futures": True, "position_type": side, "leverage": lev,
+                "funding_paid": funding_slice, "is_partial": True, "fees_usdt": fees,
+                "exchange_order_id": fragment["order_id"], "entry_id": row.get("entry_id"),
+            })
+            realized += profit
+            booked_funding += funding_slice
+            fields["fees_paid"] += fee
+        fields.update({
+            "entry_basis_pending_closes": [], "accounting_pending_partials": pending,
+            "partial_profit_realized": realized,
+            "funding_booked_on_partials": booked_funding,
+            "funding_booked_on_partials_known": True,
+        })
+    try:
+        from core.symbol_locks import close_lock
+        from contextlib import nullcontext
+        lock = nullcontext(True) if already_locked else close_lock(sym, timeout=0.0, bot_name=bot.BOT_NAME)
+        with lock as acquired:
+            if not acquired:
+                return False
+            current = bot.state.get(sym)
+            if not strict_order_snapshot_equal(current, row):
+                return False
+            return update_many_if_current(bot.state, sym, fields, current) is True
+    except Exception:
+        return False
+
+
 def _durable_contract_size_evidence(
     row: dict,
 ) -> tuple[bool, float | None]:
@@ -951,9 +1268,12 @@ def _find_futures_external_close_price(bot, symbol_full: str,
 
 def _futures_close_fee_is_known(source: str) -> bool:
     return (
+        source == "durable_full_receipt"
+        or (
         isinstance(source, str)
         and source.startswith("fetch_my_trades")
         and not source.endswith("_fee_unknown")
+        )
     )
 
 
@@ -1112,6 +1432,8 @@ def _record_futures_external_partial(bot, sym: str, state_row: dict,
     before DB booking. A DB failure leaves the event under
     ``accounting_pending_partials`` for retry without another close order.
     """
+    if state_row.get("entry_price_unverified") is True:
+        return False, {}
     from core.database import save_trade_db
     from core.logger import log_event
     from bot_utils import (
@@ -2263,12 +2585,13 @@ class FuturesReconcileMixin:
             foreign_claimed_bases = set()
             claim_registry_verified = True
             own_claim_metadata = {}
+            own_claim_rows = []
             try:
                 from core.database import get_open_positions_db
                 from trading.runtime_observability import (
                     claim_recovery_metadata)
-                own_claim_metadata = claim_recovery_metadata(
-                    get_open_positions_db(self.BOT_NAME))
+                own_claim_rows = get_open_positions_db(self.BOT_NAME)
+                own_claim_metadata = claim_recovery_metadata(own_claim_rows)
             except Exception as claim_metadata_exc:
                 self._log_error(
                     "read futures orphan claim metadata",
@@ -2276,7 +2599,7 @@ class FuturesReconcileMixin:
                 )
                 claim_registry_verified = False
                 orphan_syms = set()
-            if orphan_syms:
+            if orphan_syms or own_claim_metadata:
                 try:
                     from core.database import get_all_claimed_bases, _base_symbol
                     _other = get_all_claimed_bases(exclude_bot=self.BOT_NAME,
@@ -2308,6 +2631,15 @@ class FuturesReconcileMixin:
                     claim_registry_verified = False
                     orphan_syms = set()
 
+            if claim_registry_verified:
+                _restore_futures_basis_claims(
+                    self, own_claim_rows, own_claim_metadata,
+                    exchange_open, foreign_claimed_bases | ambiguous_exchange_bases,
+                    snapshot_complete=exchange_snapshot_complete,
+                )
+                # Restored own generations are not new orphan adoptions.
+                orphan_syms -= set(self.state.get_all())
+
             # ADOPT: a LIVE trading bot must NEVER leave a leveraged exchange
             # position unmanaged. On ANY stateexchange desync (SIM/LIVE toggle,
             # crash, lost state file) pull the REAL entry/size/side/leverage from
@@ -2336,14 +2668,6 @@ class FuturesReconcileMixin:
                     )
 
             for base in sorted(orphan_syms):
-                # ATOMIC claim: SQLite serialises INSERTWHERE NOT EXISTS, so when
-                # BOTH bots' reconciles race to adopt the same orphan, exactly ONE
-                # wins. The loser skips  never a double-adopt / double-manage.
-                # (Whichever bot wins manages it safely; ownership info is lost
-                # once the state desynced, so first-come is the best we can do 
-                # the alternative, leaving it unmanaged, is worse.)
-                if try_claim_orphan(self.BOT_NAME, base) is not True:
-                    continue
                 p = exchange_open.get(base) or {}
                 info = p.get("info") if isinstance(p.get("info"), dict) else {}
                 try:
@@ -2385,10 +2709,13 @@ class FuturesReconcileMixin:
                     side = None
                     mm_mode = ""
                 if entry <= 0 or contracts <= 0 or side not in ("LONG", "SHORT"):
-                    # Won the claim but can't adopt safely  RELEASE it so the
-                    # coin isn't blocked-but-unmanaged.
-                    release_orphan_claim(base, "invalid")
+                    # Validate before claiming: the claim API also accepts an
+                    # existing own claim whose recovery evidence must survive.
                     unadoptable.append(base)
+                    continue
+                # SQLite serializes competing adoptions. A losing bot must
+                # not manage the position owned by the winner.
+                if try_claim_orphan(self.BOT_NAME, base) is not True:
                     continue
                 full = f"{base}/USDT:USDT"
                 try:
@@ -2924,9 +3251,21 @@ class FuturesReconcileMixin:
                 except Exception as e:
                     log_event(f"Telegram failed: {e}", "WARN")
             if not orphan_syms:
-                log_event(
-                    f" Reconciliation: {len(local_state)} position(s) "
-                    f"in sync with exchange", "INFO")
+                retained = self.state.get_all()
+                missing = set(retained) - set(exchange_open)
+                if missing:
+                    log_event(
+                        f" Reconciliation: {len(missing)} local record(s) "
+                        "awaiting reconciliation/accounting; state retained",
+                        "WARN",
+                    )
+                else:
+                    # No orphans alone is not proof of matching sides,
+                    # quantities, claims or completed accounting.
+                    log_event(
+                        " Reconciliation: exchange snapshot checked; "
+                        f"{len(retained)} local record(s) retained", "INFO",
+                    )
             try:
                 from trading.runtime_observability import emit_startup_integrity
                 exchange_layer = {}
@@ -3025,6 +3364,16 @@ class FuturesReconcileMixin:
           A Telegram heads-up is sent so the user notices the close
             (especially important for liquidations during long downtime).
         """
+        if state_row.get("entry_price_unverified") is True:
+            # All production offline-close callers already own close_lock:
+            # reconcile, monitor recovery, FUTREND recovery, and launcher.
+            if not _heal_futures_entry_price_basis(self, sym, state_row, already_locked=True):
+                return False
+            state_row = self.state.get(sym)
+            if not isinstance(state_row, dict):
+                return False
+            if state_row.get("accounting_pending_partials"):
+                return False
         from core.logger import log_event, send_telegram
         from core.database import save_trade_db
         from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
@@ -3056,6 +3405,29 @@ class FuturesReconcileMixin:
             lev = _positive_float_or_none(state_row.get("leverage", 1))
             margin = _nonnegative_float_or_none(state_row.get("invested_usdt"))
             buy_time = state_row.get("buy_time", "")
+            receipt_sell_time = None
+            receipt_order_id = None
+            raw_amount = 0.0
+            if state_row.get("verified_flat_pending_accounting") is True:
+                from bot_utils.close_fragments import pending_close_values
+
+                raw_amount, raw_price, raw_fee, raw_oid = pending_close_values(state_row)
+                if raw_amount > 0:
+                    raw_time = _safe_identifier(
+                        state_row.get("verified_flat_at") or state_row.get("verified_flat_time"),
+                        max_length=64,
+                    )
+                    parsed_time = _utc_datetime_or_none(raw_time)
+                    opened_time = _utc_datetime_or_none(buy_time)
+                    ceiling_ms = _offline_trade_future_ceiling_ms()
+                    if (amount is None or not math.isclose(raw_amount, amount, rel_tol=1e-9, abs_tol=1e-12)
+                            or raw_price <= 0 or raw_oid is None
+                            or parsed_time is None or opened_time is None
+                            or parsed_time < opened_time or ceiling_ms is None
+                            or parsed_time.timestamp() * 1000 > ceiling_ms):
+                        return False
+                    receipt_order_id = raw_oid
+                    receipt_sell_time = parsed_time.strftime("%Y-%m-%d %H:%M:%S")
             initial_entry_fee = _finite_float_or_none(state_row.get(
                 "initial_entry_fee", state_row.get("fees_paid", 0))) or 0.0
             funding_total = _finite_float_or_none(
@@ -3102,7 +3474,7 @@ class FuturesReconcileMixin:
                     buy_time,
                     until_time_str=state_row.get(
                         "accounting_pending_sell_time"
-                    ),
+                    ) or receipt_sell_time,
                     notional_usdt=funding_notional,
                 )
                 if exact_funding is None:
@@ -3154,6 +3526,11 @@ class FuturesReconcileMixin:
                 if pending_price is not None:
                     close_price = pending_price
                     close_source = "accounting_pending"
+            if close_price <= 0 and raw_amount > 0:
+                # Preserve the stored fee (including estimates/rebates), not
+                # a newly inferred venue fee, and the exact durable identity.
+                close_price, close_fee_actual = raw_price, raw_fee
+                close_source = "durable_full_receipt"
             if close_price <= 0:
                 close_price, close_fee_actual, close_source = (
                     _find_futures_external_close_price(
@@ -3290,6 +3667,7 @@ class FuturesReconcileMixin:
 
             sell_time = str(
                 state_row.get("accounting_pending_sell_time")
+                or receipt_sell_time
                 or now_utc().strftime("%Y-%m-%d %H:%M:%S"))
             reason = str(
                 state_row.get("accounting_pending_reason")
@@ -3307,7 +3685,7 @@ class FuturesReconcileMixin:
 
             accounting_exchange_order_id = state_row.get(
                 "accounting_pending_exchange_order_id"
-            )
+            ) or receipt_order_id
             entry_quality_score = state_row.get(
                 "accounting_pending_entry_quality_score",
                 state_row.get("entry_quality_score"),

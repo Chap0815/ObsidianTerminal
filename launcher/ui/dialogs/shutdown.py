@@ -23,6 +23,7 @@ from launcher.core.positions import (
     refresh_spot_positions_with_live_prices,
 )
 from launcher.ui.components.widgets import safe_geometry
+from launcher.ui.concurrency import CriticalWorkerRegistry
 from launcher.ui.logging_panel import log_to_card
 from launcher.ui.theme import force_dark_titlebar
 
@@ -66,13 +67,39 @@ def _post_ui_lifecycle(app, callback, *, delay_ms: int = 0) -> bool:
     return _post_ui(app, callback, delay_ms=delay_ms)
 
 
-def _start_critical_worker(app, target, *, name: str):
+def _start_critical_worker(
+    app, target, *, name: str, on_definite_prelaunch_failure=None,
+):
+    def notify_prelaunch_failure():
+        if callable(on_definite_prelaunch_failure):
+            try:
+                on_definite_prelaunch_failure()
+            except BaseException:
+                pass
+
     registry = getattr(app, "critical_workers", None)
     start = getattr(registry, "start", None)
     if callable(start):
-        return start(target, name=name, daemon=True)
-    thread = threading.Thread(target=target, name=name, daemon=True)
-    thread.start()
+        try:
+            return start(target, name=name, daemon=True)
+        except BaseException:
+            # Custom registries cannot prove that a launch never happened.
+            if type(registry) is CriticalWorkerRegistry:
+                worker_name = str(name or "critical-worker")[:120]
+                if worker_name not in registry.active_names():
+                    notify_prelaunch_failure()
+            raise
+    try:
+        thread = threading.Thread(target=target, name=name, daemon=True)
+    except BaseException:
+        notify_prelaunch_failure()
+        raise
+    try:
+        thread.start()
+    except BaseException as exc:
+        if isinstance(exc, Exception) and thread_definitely_never_started(thread):
+            notify_prelaunch_failure()
+        raise
     return thread
 
 
@@ -261,7 +288,10 @@ def show_state_read_error_dialog(app, title: str, detail: str) -> None:
 
 #  Generic busy dialog 
 
-def show_busy_dialog(app, title: str, intro: str, worker, **worker_kwargs) -> None:
+def show_busy_dialog(
+    app, title: str, intro: str, worker, *,
+    on_definite_prelaunch_failure=None, **worker_kwargs,
+) -> None:
     """Modal busy-dialog with progress text.
 
     Runs ``worker(update_fn)`` in a background thread so the UI doesn't
@@ -335,6 +365,7 @@ def show_busy_dialog(app, title: str, intro: str, worker, **worker_kwargs) -> No
             app,
             _run,
             name=f"busy-{title}",
+            on_definite_prelaunch_failure=on_definite_prelaunch_failure,
         )
     except Exception as exc:
         try:
@@ -1159,6 +1190,7 @@ def emergency_close_futures_and_stop(app, name: str) -> None:
             f"Stopping {name}",
             "Closing positions and shutting down",
             _worker,
+            on_definite_prelaunch_failure=lambda: in_flight.discard(name),
         )
     except Exception:
         in_flight.discard(name)

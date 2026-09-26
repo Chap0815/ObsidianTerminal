@@ -264,21 +264,6 @@ class Sparkline(tk.Frame):
             outline="",
         )
 
-    @staticmethod
-    def _tint(hex_color: str) -> str:
-        """Darken a hex color for subtle sparkline fill variants."""
-        try:
-            hc = hex_color.lstrip("#")
-            r, g, b = int(hc[0:2], 16), int(hc[2:4], 16), int(hc[4:6], 16)
-            f = 0.22
-            r = int(r * f)
-            g = int(g * f)
-            b = int(b * f)
-            return f"#{r:02x}{g:02x}{b:02x}"
-        except Exception:
-            return COLORS["panel"]
-
-
 #  Tooltip
 
 
@@ -748,10 +733,15 @@ class ParamRow(ctk.CTkFrame):
         err_lbl.pack(pady=(4, 0))
 
         def _apply(*args):
+            from math import isfinite
+
             txt = entry.get().strip().replace(",", ".")
             try:
                 val = float(txt)
             except ValueError:
+                err_lbl.configure(text="Not a valid number")
+                return
+            if not isfinite(val):
                 err_lbl.configure(text="Not a valid number")
                 return
             if val < self.vmin or val > self.vmax:
@@ -950,6 +940,11 @@ class BadHoursRow(ctk.CTkFrame):
 
     def refresh(self) -> None:
         """Pull the latest value from the DB (called by the UI poll cycle)."""
+        focused = self.focus_get()
+        while focused is not None:
+            if focused is self._entry:
+                return
+            focused = getattr(focused, "master", None)
         self._var.set(self._read_from_db())
         self._err_lbl.configure(text="")
 

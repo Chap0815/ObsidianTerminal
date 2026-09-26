@@ -700,7 +700,6 @@ class ObsidianApp(ctk.CTk):
         self.param_rows     = {bot: {} for bot in BOT_ORDER}
         self._dirty_param_keys = {bot: set() for bot in BOT_ORDER}
         self.bad_hours_rows = {}  # bot_name  BadHoursRow widget
-        self._collapsed = {bot: False for bot in BOT_ORDER}
         self._pending_update_data = None
         self._inflight_update_process = None
         self._update_status_override = ""
@@ -710,7 +709,6 @@ class ObsidianApp(ctk.CTk):
         ui_cfg = self.config.get("UI", {})
         self._visible = {bot: (bot in ui_cfg.get("VISIBLE_BOTS", list(BOT_ORDER)))
                           for bot in BOT_ORDER}
-        # Collapse support was removed; old COLLAPSED_BOTS config is ignored.
 
         if HAS_PSUTIL:
             with suppress(Exception):
@@ -1490,7 +1488,8 @@ class ObsidianApp(ctk.CTk):
         # all cards exist and persisted visibility is known.
         grid_col = col % self.MAX_CARD_COLUMNS
         grid_row = col // self.MAX_CARD_COLUMNS
-        card.grid(row=grid_row, column=grid_col, sticky="new", padx=8, pady=(0, 14))
+        # Fill the grid row; the log absorbs differences in header height.
+        card.grid(row=grid_row, column=grid_col, sticky="nsew", padx=8, pady=(0, 14))
         card.grid_columnconfigure(0, weight=1)
         # Row 3 (params) and row 9 (log) share vertical space. The cards area
         # scrolls, so five expanded bot cards keep their natural height instead
@@ -1553,7 +1552,10 @@ class ObsidianApp(ctk.CTk):
             delay_ms=400
         )
 
-        action_frame = ctk.CTkFrame(head, fg_color="transparent")
+        # Keep the shared scaled action-row footprint even for the mechanical
+        # Trend card. Default empty CTk frames request 200px; 30 matches the
+        # real buttons without a dummy control or a large empty header.
+        action_frame = ctk.CTkFrame(head, fg_color="transparent", width=1, height=30)
         action_frame.grid(row=1, column=1, sticky="ne", padx=(12, 0), pady=(8, 0))
 
         prompt_btn = None
@@ -1631,8 +1633,6 @@ class ObsidianApp(ctk.CTk):
             command=lambda n=name: self._toggle_simulation(n)
         )
         sim_btn.grid(row=0, column=1, sticky="ne", padx=(12, 0))
-        if not meta.get("uses_llm", True) and not is_futures:
-            action_frame.grid_forget()
         attach_tooltip(
             sim_btn,
             "Toggle SIMULATION  LIVE mode.\n"
@@ -1641,11 +1641,6 @@ class ObsidianApp(ctk.CTk):
             "Switching to LIVE requires explicit confirmation.",
             delay_ms=400
         )
-
-        # Collapse-Toggle entfernt: Karten lassen sich nicht mehr zu einem
-        # schmalen Streifen einklappen. Die _collapsed-Struktur bleibt als
-        # immer-False bestehen, damit _persist_ui_prefs() und der Start-Restore
-        # weiterhin sauber laufen.
 
         #  ROW 1: PnL Hero in tinted Container-Box 
         hero_wrap = ctk.CTkFrame(card, fg_color=COLORS["bg"], corner_radius=10,
@@ -1898,20 +1893,8 @@ class ObsidianApp(ctk.CTk):
         bhr.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 4))
         self.bad_hours_rows[name] = bhr
 
-        # COLLAPSIBLE: bind the chevron click to fold/unfold the body.
-        #
-        # KEY INSIGHT: hiding ``params_box`` with ``pack_forget()`` shrinks
-        # only the box itself  but ``params_wrap`` still sits in row=3 of
-        # the card grid, which was configured with ``minsize=390``. Tk's
-        # grid manager honours that minsize regardless of what's inside,
-        # so the log (row=9) couldn't grow.
-        #
-        # The fix has TWO parts:
-        #  1) Hide the body (pack_forget)  already worked
-        #   2) Reset row 3's minsize to 0 AND weight to 0 so the row
-        #      shrinks to just the header (~36px). The log row already
-        #      has weight=1, so it expands to fill the freed space.
-        # When expanding, restore the original minsize=390, weight=2.
+        # Collapsing must also release the parameter row's minimum height
+        # and weight, allowing the activity log to use the remaining space.
         _PARAMS_ROW_EXPANDED  = {"weight": 2, "minsize": 390}
         _PARAMS_ROW_COLLAPSED = {"weight": 0, "minsize": 0}
 
@@ -2244,7 +2227,6 @@ class ObsidianApp(ctk.CTk):
             self._update_pill_appearance(bot)
         # Re-apply all together for consistent layout.
         self._refresh_visibility_layout()
-        # Collapse support was removed; old COLLAPSED_BOTS entries are ignored.
 
     def _apply_params_collapse_state(self, body, cv, card, collapsed: bool,
                                      collapsed_layout: dict,
@@ -2335,7 +2317,7 @@ class ObsidianApp(ctk.CTk):
             padx, pady = self._compute_card_pad(idx, visible_count)
             card["row"] = row
             card["col"] = col
-            card["frame"].grid(row=row, column=col, sticky="new",
+            card["frame"].grid(row=row, column=col, sticky="nsew",
                                  padx=padx, pady=pady)
 
         for bot in BOT_ORDER:
@@ -2355,18 +2337,10 @@ class ObsidianApp(ctk.CTk):
         except Exception:
             pass
 
-    #  COLLAPSE (innerhalb sichtbar) 
-
-    def _toggle_collapse(self, name: str):
-        # Collapse-Funktion entfernt. Methode bleibt als No-Op erhalten, falls
-        # noch eine Referenz darauf zeigt  so kann nichts zur Laufzeit crashen.
-        return
-
     def _persist_ui_prefs(self):
         ui_cfg = dict(self.config.get("UI", {}))
         ui_cfg.update({
             "VISIBLE_BOTS":   [b for b in BOT_ORDER if self._visible[b]],
-            "COLLAPSED_BOTS": [b for b in BOT_ORDER if self._collapsed[b]],
         })
         self.config = save_config_merge({"UI": ui_cfg})
 
@@ -4934,7 +4908,10 @@ class ObsidianApp(ctk.CTk):
             # Unrealized PnL  live aus DataPoller-Cache
             unr_val = _ui_finite_float(cache.get("unrealized", {}).get(bot))
             open_count = _ui_nonnegative_int(cache.get("open", {}).get(bot))
-            if open_count == 0:
+            if metrics_error:
+                card["unr_var"].set("--")
+                card["unr_lbl"].configure(text_color=COLORS["warning"])
+            elif open_count == 0:
                 card["unr_var"].set("")
                 card["unr_lbl"].configure(text_color=COLORS["text_muted"])
             else:
@@ -5151,7 +5128,10 @@ class ObsidianApp(ctk.CTk):
             for b in BOT_ORDER
             if _cache_sim(b) != money_scope_live
         )
-        if total_open > 0:
+        if metrics_error:
+            self.sb_unr_total.set("--")
+            self.sb_unr_total._lbl.configure(text_color=COLORS["warning"])
+        elif total_open > 0:
             total_unr = sum(
                 _ui_finite_float(unr_cache.get(b))
                 for b in BOT_ORDER

@@ -191,6 +191,23 @@ class TrendBot(SpotBot):
 
     def _handle_exit_recovery_gate(self, sym: str, d: dict) -> bool:
         """Handle pending accounting/conflict state before TREND exits."""
+        from bot_utils.spot_exits import (
+            service_spot_entry_basis, spot_entry_close_amount, has_pending_spot_exit_for_other_leg,
+        )
+        if not service_spot_entry_basis(self, sym, d):
+            from bot_utils.trade_state import same_position_generation
+            fresh = self.state.get(sym)
+            if (not isinstance(fresh, dict) or not same_position_generation(fresh, d)
+                    or fresh.get("entry_price_unverified") is not True
+                    or fresh.get("verified_flat_pending_accounting")
+                    or fresh.get("accounting_pending") or fresh.get("accounting_pending_partials")
+                    or fresh.get("entry_basis_pending_closes")
+                    or has_pending_spot_exit_for_other_leg(fresh, "entry")
+                    or spot_entry_close_amount(fresh) <= 0):
+                return True
+            snapshot = dict(fresh)
+            d.clear()
+            d.update(snapshot)
         if d.get("accounting_already_booked"):
             from core.spot_bot_exits import ExitsMixin
             ExitsMixin._cleanup_accounted_close_state(self, sym, d)
@@ -639,6 +656,7 @@ class TrendBot(SpotBot):
                 sym, fill_price, amount, gross_amount, invested_usdt,
                 entry_fee, votes, entry_id,
                 sim_tca_pending=sim_tca_pending,
+                basis_verified=getattr(entry, "basis_verified", True),
             )
             if state_ok is None:
                 log_event(
@@ -647,6 +665,12 @@ class TrendBot(SpotBot):
                     "ERROR",
                 )
                 continue
+            if state_ok is True and not getattr(entry, "basis_verified", True):
+                self._mark_spot_entry_recovery_pending("unverified-buy-basis")
+                emit_entry_lifecycle(entry_id, bot=self.BOT_NAME, symbol=sym,
+                                     stage="order_unknown", mode=entry_mode,
+                                     reason="entry_basis_unverified")
+                raise SpotBuyOutcomeUnknown("unverified-buy-basis")
             if state_ok is False:
                 emit_entry_lifecycle(
                     entry_id,
@@ -656,6 +680,9 @@ class TrendBot(SpotBot):
                     mode=entry_mode,
                     reason="post_fill_state_write",
                 )
+            if state_ok is False and not getattr(entry, "basis_verified", True):
+                self._mark_spot_entry_recovery_pending("unverified-buy-basis")
+                raise RuntimeError("unverified BUY basis state promotion failed")
             if state_ok is False and not self.simulation:
                 log_event(
                     f"Trend BUY {sym}: state write failed after LIVE fill - "
@@ -764,7 +791,7 @@ class TrendBot(SpotBot):
 
     def _add_trend_state(self, sym, fill_price, amount, gross_amount,
                          invested_usdt, entry_fee, votes, entry_id,
-                         *, sim_tca_pending=None):
+                         *, sim_tca_pending=None, basis_verified=True):
         # _place_buy_order already wrote a PROVISIONAL row (zombie protection);
         # patch it in place with the corrected NET amount + fees instead of a
         # second full add. Fall back to add() if the provisional didn't land.
@@ -783,7 +810,8 @@ class TrendBot(SpotBot):
             "strategy": "trend",
             "entry_votes": votes,
             "entry_id": entry_id,
-            "provisional": False,
+            "provisional": not basis_verified,
+            "entry_price_unverified": not basis_verified,
         }
         if sim_tca_pending is not None:
             fields[self._SIM_TCA_PENDING_FIELD] = sim_tca_pending
@@ -847,7 +875,8 @@ class TrendBot(SpotBot):
         # Disaster brake: hard stop far below entry (flash-crash / gap
         # protection). The trend exit normally fires well before this; pure
         # last-resort safety so an overnight gap can't run unbounded.
-        if curr > 0 and buy > 0 and (curr / buy - 1.0) * 100.0 <= disaster:
+        if (not d.get("entry_price_unverified") and curr > 0 and buy > 0
+                and (curr / buy - 1.0) * 100.0 <= disaster):
             log_event(f" Trend disaster-stop {sym}: "
                       f"{(curr/buy-1)*100:.1f}% <= {disaster:.0f}%", "WARN")
             self._execute_full_exit(sym, d, curr, "Disaster stop")

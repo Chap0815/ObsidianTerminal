@@ -167,7 +167,7 @@ def fetch_or_estimate_funding(ex,
 
     Strategy:
       1. Try fetch_funding_history (definitive)
-      2. If returns 0 but settlements were crossed  estimate
+      2. If history has no matching events but settlements were crossed  estimate
       3. If unsupported (None)  use state value, else estimate
 
     Sign convention: positive = funding paid OUT (cost to bot).
@@ -189,15 +189,17 @@ def fetch_or_estimate_funding(ex,
         until_ms = _utc_ms_or_none(until_time_str)
         if until_ms is None or until_ms < since_ms:
             return None
+    history_evidence = {}
     realized = fetch_realized_funding(
         ex,
         symbol_full,
         since_time_str,
         until_time_str=until_time_str,
         notional_usdt=normalized_notional,
+        _history_evidence=history_evidence,
     )
     if realized is not None:
-        if realized != 0.0:
+        if realized != 0.0 or history_evidence.get("has_matching_events") is True:
             return realized
         estimated = estimate_funding_paid(
             ex,
@@ -242,13 +244,17 @@ def fetch_realized_funding(ex,
                              symbol_full: str,
                              since_time_str: str,
                              until_time_str: str | None = None,
-                             notional_usdt: float | None = None) -> Optional[float]:
+                             notional_usdt: float | None = None,
+                             *,
+                             _history_evidence: dict | None = None) -> Optional[float]:
     """Fetch sum of funding payments from exchange API.
 
     Returns:
       float  total in USDT (bot POV: positive = paid out)
       None  API unsupported or call failed (caller should fall back)
     """
+    if isinstance(_history_evidence, dict):
+        _history_evidence.clear()
     if (
         not isinstance(symbol_full, str)
         or not symbol_full.strip()
@@ -397,6 +403,11 @@ def fetch_realized_funding(ex,
         and not funding_amount_is_plausible(total, notional_usdt)
     ):
         return None
+    if isinstance(_history_evidence, dict):
+        # Publish evidence only after the entire exact-window history was
+        # validated. A real zero (including offsetting credits/debits) must not
+        # be replaced by an estimate intended for an empty adapter response.
+        _history_evidence["has_matching_events"] = bool(history)
     return total
 
 

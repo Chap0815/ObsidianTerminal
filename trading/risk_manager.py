@@ -967,8 +967,12 @@ def _adapt_position_size(bot_name: str, trades: list):
     if avg_loss < 0.01:
         return
 
-    payoff_ratio = avg_win / avg_loss
-    kelly_full   = (win_rate * payoff_ratio - (1 - win_rate)) / payoff_ratio
+    # Breakeven trades are classified as wins by the accounting contract.
+    # A nonpositive winning return cannot support a positive Kelly allocation.
+    kelly_full = 0.0
+    if avg_win > 0.0:
+        payoff_ratio = avg_win / avg_loss
+        kelly_full = (win_rate * payoff_ratio - (1 - win_rate)) / payoff_ratio
 
     n = len(trades)
     span     = max(1, MIN_TRADES_FOR_LEARNING)

@@ -42,6 +42,15 @@ class _SpotBuyBudgetUnavailable(RuntimeError):
     """A SPOT buy was not sent because its atomic budget gate failed."""
 
 
+class _SpotBuyResult(tuple):
+    """Keep the five-value contract while carrying actual BUY-basis evidence."""
+
+    def __new__(cls, values, *, basis_verified):
+        result = super().__new__(cls, values)
+        result.basis_verified = basis_verified
+        return result
+
+
 class SpotBuyOutcomeUnknown(RetryForbiddenError):
     """A SPOT buy may exist, so its claim must remain reserved."""
 
@@ -54,7 +63,7 @@ class SpotBuyOutcomeUnknown(RetryForbiddenError):
 
 
 def _create_market_buy_budgeted(ex, symbol_pair: str, amount: float,
-                                *, params=None):
+                                *, params=None, before_submit=None):
     valid_symbol = (
         isinstance(symbol_pair, str)
         and symbol_pair.count("/") == 1
@@ -85,6 +94,8 @@ def _create_market_buy_budgeted(ex, symbol_pair: str, amount: float,
         raise _SpotBuyBudgetUnavailable(
             "API budget exhausted before SPOT market buy"
         )
+    if before_submit is not None:
+        before_submit()
     try:
         if params is None:
             return ex.create_market_buy_order(symbol_pair, amount)
@@ -1206,7 +1217,8 @@ class ScanMixin:
             "entry_quality_label": quality.label,
             "entry_quality_reasons": ",".join(quality.reasons),
             "entry_id": entry_id,
-            "provisional": False,
+            "provisional": not getattr(entry, "basis_verified", True),
+            "entry_price_unverified": not getattr(entry, "basis_verified", True),
         }
         if sim_tca_pending is not None:
             position_fields[self._SIM_TCA_PENDING_FIELD] = sim_tca_pending
@@ -1227,6 +1239,15 @@ class ScanMixin:
                 "entry generation; no rollback was sent",
                 "ERROR",
             )
+            return
+        if state_ok is True and not getattr(entry, "basis_verified", True):
+            self._mark_spot_entry_recovery_pending("unverified-buy-basis")
+            emit_entry_lifecycle(
+                entry_id, bot=self.BOT_NAME, symbol=sym, stage="order_unknown",
+                mode=entry_mode, reason="entry_basis_unverified")
+            return
+        if state_ok is False and not getattr(entry, "basis_verified", True):
+            self._mark_spot_entry_recovery_pending("unverified-buy-basis")
             return
         if state_ok is False and not self.simulation:
             emit_entry_lifecycle(
@@ -1458,6 +1479,8 @@ class ScanMixin:
         cid: str,
         expected_amount=None,
         max_quote_cost=None,
+        require_basis=False,
+        quote_first_buy=False,
     ):
         """Locate an order by OUR clientOrderId (open orders first, then recent
         history). Used to recover from a lost-response timeout so a retry doesn't
@@ -1485,6 +1508,15 @@ class ScanMixin:
         deferred_terminal = None
         terminal_fill_unresolved = False
         bound_order_id = None
+        selected_basis_order = None
+
+        def _basis_ready(candidate):
+            nonlocal selected_basis_order
+            if not require_basis:
+                return True
+            from bot_utils.spot_exits import spot_buy_basis
+            selected_basis_order = candidate
+            return spot_buy_basis(candidate, quote_first=quote_first_buy, exchange=self.ex) is not None
 
         def _query(endpoint, fetch):
             nonlocal attempted, uncertain
@@ -1588,7 +1620,7 @@ class ScanMixin:
                 ),
                 source_open=True,
             )
-            if selected is not None:
+            if selected is not None and _basis_ready(selected):
                 return selected
 
         fetch_orders = getattr(self.ex, "fetch_orders", None)
@@ -1597,7 +1629,7 @@ class ScanMixin:
                 "spot_reconcile_fetch_orders",
                 lambda: fetch_orders(symbol_pair, limit=20),
             ))
-            if selected is not None:
+            if selected is not None and _basis_ready(selected):
                 return selected
         # A just-filled MARKET buy isn't "open", and several venues (bitget  the
         # default  okx, bybit, kucoin, gate) lack unified fetchOrders; the fill
@@ -1609,7 +1641,7 @@ class ScanMixin:
                 "spot_reconcile_fetch_closed_orders",
                 lambda: fetch_closed(symbol_pair, limit=20),
             ))
-            if selected is not None:
+            if selected is not None and _basis_ready(selected):
                 return selected
 
         fetch_trades = getattr(self.ex, "fetch_my_trades", None)
@@ -1640,12 +1672,19 @@ class ScanMixin:
                     expected_amount=expected_amount,
                     max_quote_cost=max_quote_cost,
                 )
+                if require_basis and selected_basis_order is not None:
+                    selected_qty = ScanMixin._positive_float(selected_basis_order.get("filled"))
+                    trade_qty = ScanMixin._positive_float(recovered.get("filled"))
+                    if selected_qty > 0 and abs(selected_qty - trade_qty) > max(1e-10, selected_qty * 1e-8):
+                        raise RuntimeError("spot BUY order/trade quantity conflict")
+                    if "status" in selected_basis_order:
+                        recovered["status"] = selected_basis_order["status"]
                 return recovered
         if not attempted or uncertain:
             raise RuntimeError("order reconciliation unavailable")
         if terminal_fill_unresolved:
             raise RuntimeError("spot terminal fill amount unavailable")
-        return deferred_terminal
+        return selected_basis_order if require_basis else deferred_terminal
 
     def _execution_quality_gate(self, sym: str, pair: str) -> bool:
         """Pre-trade spread gate for SPOT entries.
@@ -2020,6 +2059,37 @@ class ScanMixin:
             ex_id = (getattr(self.ex, "id", "") or "").lower()
             quote_first_buy = ex_id in ("mexc", "binance", "binanceusdm",
                                           "binancecoinm")
+            entry_checkpoint_written = False
+
+            def _checkpoint_entry_before_submit():
+                nonlocal entry_checkpoint_written
+                if entry_checkpoint_written:
+                    return
+                from bot_utils.trade_state import promote_position_generation
+                from core.logger import _date
+                getter = getattr(self.state, "get", None)
+                current = getter(sym) if callable(getter) else None
+                if isinstance(current, dict) and current.get("spot_entry_client_order_id"):
+                    raise SpotBuyOutcomeUnknown(cid)
+                fields = {
+                    "entry_id": entry_id, "buy_time": _date(),
+                    "buy": price, "highest": price, "lowest": price,
+                    "amount": amount_coins, "original_amount": amount_coins,
+                    "invested_usdt": trade_usdt, "provisional": True,
+                    "entry_price_unverified": True,
+                    "spot_entry_client_order_id": cid,
+                    "spot_entry_requested_amount": amount_coins,
+                    "spot_entry_quote_budget": trade_usdt,
+                    "spot_entry_quote_first": quote_first_buy,
+                    "spot_entry_observed_amount": 0.0,
+                    "initial_entry_fee": 0.0, "fees_paid": 0.0,
+                }
+                if promote_position_generation(
+                    self.state, sym, fields, {"entry_id": entry_id}
+                ) is not True:
+                    raise _SpotBuyBudgetUnavailable("entry checkpoint not durable; buy not submitted")
+                entry_checkpoint_written = True
+
             direct_submit_ack = False
             direct_ack_client_order_id = cid
             try:
@@ -2044,14 +2114,16 @@ class ScanMixin:
                     order = _create_market_buy_budgeted(
                         self.ex,
                         f"{sym}/USDT", trade_usdt,
-                        params={"clientOrderId": cid, "cost": trade_usdt}
+                        params={"clientOrderId": cid, "cost": trade_usdt},
+                        before_submit=_checkpoint_entry_before_submit,
                     )
                 else:
                     # Bitget/Kraken/etc: standard coin-amount semantics
                     order = _create_market_buy_budgeted(
                         self.ex,
                         f"{sym}/USDT", amount_coins,
-                        params={"clientOrderId": cid}
+                        params={"clientOrderId": cid},
+                        before_submit=_checkpoint_entry_before_submit,
                     )
                 direct_submit_ack = True
             except _SpotBuyBudgetUnavailable as _budget_err:
@@ -2100,12 +2172,14 @@ class ScanMixin:
                                 f"{sym}/USDT",
                                 trade_usdt,
                                 params={"cost": trade_usdt},
+                                before_submit=_checkpoint_entry_before_submit,
                             )
                         else:
                             order = _create_market_buy_budgeted(
                                 self.ex,
                                 f"{sym}/USDT",
                                 amount_coins,
+                                before_submit=_checkpoint_entry_before_submit,
                             )
                         direct_submit_ack = True
                         direct_ack_client_order_id = None
@@ -2210,6 +2284,11 @@ class ScanMixin:
                 max_quote_cost=trade_usdt,
                 expected_price=price,
             )
+            from bot_utils.spot_exits import spot_buy_basis
+            actual_basis = spot_buy_basis(order, quote_first=quote_first_buy, exchange=self.ex)
+            basis_verified = actual_basis is not None
+            if basis_verified:
+                resolved_gross_amount, resolved_fill_price, resolved_invested_usdt = actual_basis
             provisional_written = False
             provisional_fill_price = resolved_fill_price
             if (not math.isfinite(provisional_fill_price)
@@ -2236,6 +2315,13 @@ class ScanMixin:
                     "fees_paid": 0.0,
                     "entry_id": entry_id,
                     "provisional": True,
+                    "entry_price_unverified": not basis_verified,
+                    "spot_entry_client_order_id": cid,
+                    "spot_entry_order_id": order_id_text_or_none(order.get("id")),
+                    "spot_entry_requested_amount": amount_coins,
+                    "spot_entry_quote_budget": trade_usdt,
+                    "spot_entry_quote_first": quote_first_buy,
+                    "spot_entry_observed_amount": ScanMixin._positive_float(order.get("filled")),
                 }
                 provisional_ok = promote_position_generation(
                     self.state,
@@ -2285,8 +2371,9 @@ class ScanMixin:
             # Record realized entry slippage so repeated bad fills trip
             # SAFE_MODE (no-op when fill_price<=0; handled by the screener-price
             # recovery just below).
-            self._record_entry_slippage(sym, expected_price=price,
-                                        fill_price=fill_price)
+            if basis_verified:
+                self._record_entry_slippage(sym, expected_price=price,
+                                            fill_price=fill_price)
 
             # fill_price validation
             if not math.isfinite(fill_price) or fill_price <= 0:
@@ -2445,7 +2532,10 @@ class ScanMixin:
             if base_fee > 0:
                 amount = max(0.0, amount - base_fee)
 
-            return amount, fill_price, gross_amount, invested_usdt, entry_fee
+            return _SpotBuyResult(
+                (amount, fill_price, gross_amount, invested_usdt, entry_fee),
+                basis_verified=basis_verified,
+            )
 
         except SpotBuyOutcomeUnknown:
             raise

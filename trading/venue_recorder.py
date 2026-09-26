@@ -2248,10 +2248,6 @@ class VenueRecorder:
         self._l2_stopped = self._l2_collector is None
 
     @staticmethod
-    def _iso_now() -> str:
-        return _capture_now_utc().isoformat().replace("+00:00", "Z")
-
-    @staticmethod
     def _market_mapping(exchange) -> dict:
         try:
             markets = getattr(exchange, "markets", None)

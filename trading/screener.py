@@ -1215,15 +1215,6 @@ def _shutdown_clone_pool_at_exit() -> bool:
 atexit.register(_shutdown_clone_pool_at_exit)
 
 
-def _detach_clone_pool() -> list:
-    """Atomically detach the current pool without closing active sessions."""
-    with _CLONE_POOL_LOCK:
-        clones = list(_CLONE_POOL)
-        _CLONE_POOL.clear()
-        _CLONE_POOL_KEY["source"] = None
-        return clones
-
-
 def _detach_clone_pool_generation(clones: list, source) -> list:
     """Detach only the pool generation used by the calling scan."""
     expected = list(clones)

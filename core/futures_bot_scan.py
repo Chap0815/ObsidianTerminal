@@ -56,6 +56,13 @@ from bot_utils.trade_state import state_exposure_count
 from trading.entry_quality import EntryQuality, score_futures_entry
 
 
+def _checkpoint_futures_entry_basis(state, sym: str, row: dict) -> bool:
+    from bot_utils.trade_state import promote_position_generation
+    return promote_position_generation(
+        state, sym, row, {"entry_id": row["entry_id"]},
+    ) is True
+
+
 class FuturesScanMixin:
 
     def _entry_ticker(
@@ -1290,6 +1297,9 @@ class FuturesScanMixin:
         else:
             # mm_rate + liq_price already computed above with the real tier.
             margin_mode = str(self.C("MARGIN_MODE", "isolated") or "isolated").lower()
+            entry_claim_attempted = False
+            entry_submission_attempted = False
+            entry_basis_checkpoint_attempted = False
             try:
                 notional = margin_usdt * leverage
                 amount_coins = notional / entry_price
@@ -1486,6 +1496,7 @@ class FuturesScanMixin:
                     leverage
                 )
                 from core.database import claim_symbol_for_entry
+                entry_claim_attempted = True
                 if not claim_symbol_for_entry(
                     self.BOT_NAME,
                     sym,
@@ -1544,10 +1555,27 @@ class FuturesScanMixin:
                     return
                 safe_set_margin_mode(self.ex, margin_mode, symbol_full,
                                      leverage=leverage, direction=direction)
+                entry_basis_checkpoint_attempted = True
+                if not _checkpoint_futures_entry_basis(
+                    self.state, sym, {
+                        "entry_id": entry_id, "position_type": direction,
+                        "buy": entry_price, "highest": entry_price,
+                        "buy_time": entry_time, "amount": amount_contracts,
+                        "original_amount": amount_contracts,
+                        "invested_usdt": margin_usdt, "leverage": leverage,
+                        "entry_contract_size": contract_size,
+                        "provisional": True, "entry_price_unverified": True,
+                        "futures_entry_client_order_id": _cid,
+                        "futures_entry_requested_amount": amount_contracts,
+                        "futures_entry_observed_amount": 0.0,
+                    },
+                ):
+                    raise RuntimeError("entry basis checkpoint failed before submit")
                 emit_entry_lifecycle(
                     entry_id, bot=self.BOT_NAME, symbol=sym,
                     stage="order_attempt", mode=entry_mode,
                     direction=direction)
+                entry_submission_attempted = True
                 order = execute_entry_order(
                     exchange=self.ex,
                     symbol=symbol_full,
@@ -1571,6 +1599,7 @@ class FuturesScanMixin:
                 filled_raw = order.get("filled")
                 amount = self._positive_float(filled_raw)
                 entry_verified = amount > 0
+                verified_fill_price = False
                 latest_order = order
                 latest_order_identity_conflict = False
                 if amount <= 0:
@@ -1716,6 +1745,7 @@ class FuturesScanMixin:
                                             _fv = float(_v)
                                             if math.isfinite(_fv) and _fv > 0:
                                                 fill_price = _fv
+                                                verified_fill_price = True
                                                 break
                                         except (ValueError, TypeError, OverflowError):
                                             pass
@@ -1766,7 +1796,7 @@ class FuturesScanMixin:
                             f"{sym}: order returned no fill and no exchange "
                             f"position was found  aborting state write",
                             "WARN")
-                        self._release_untracked_futures_entry_claim(
+                        self._cleanup_rolled_back_futures_entry_state(
                             sym,
                             "terminal zero-fill futures entry",
                             entry_id=entry_id,
@@ -1787,16 +1817,21 @@ class FuturesScanMixin:
                 # oversize rollback is a real round trip and therefore needs
                 # the same entry price, margin and fee evidence as a normal
                 # position before a close can be attempted safely.
-                for key in ("average", "price"):
+                quantity_verified = entry_verified
+                order = latest_order
+                entry_price_verified = verified_fill_price
+                for key in ("average",):
                     value = order.get(key)
-                    if value:
+                    if value and not isinstance(value, bool):
                         try:
                             parsed = float(value)
                             if math.isfinite(parsed) and parsed > 0:
                                 fill_price = parsed
+                                entry_price_verified = True
                                 break
                         except (ValueError, TypeError, OverflowError):
                             continue
+                entry_verified = entry_verified and entry_price_verified
                 try:
                     fees_paid = extract_or_estimate_futures_fee(
                         self.ex,
@@ -1880,6 +1915,11 @@ class FuturesScanMixin:
                     "break_even": False,
                     "be_active": False,
                     "provisional": True,
+                    "entry_price_unverified": not entry_price_verified,
+                    "futures_entry_client_order_id": _cid,
+                    "futures_entry_order_id": order.get("id") or order.get("orderId"),
+                    "futures_entry_requested_amount": amount_contracts,
+                    "futures_entry_observed_amount": amount if quantity_verified else 0.0,
                 }
                 if oversized:
                     provisional_data.update({
@@ -2163,6 +2203,8 @@ class FuturesScanMixin:
                             direction=direction)
                     return
             except Exception as e:
+                from trading.entry_executor import _OrderSnapshotConflict
+
                 _not_submitted = isinstance(
                     e, FuturesOrderNotSubmitted)
                 _outcome_unknown = isinstance(
@@ -2176,6 +2218,36 @@ class FuturesScanMixin:
                     self._log_error(f"Open {sym}", e)
                 except Exception:
                     pass
+                if not entry_submission_attempted:
+                    # No order call has occurred. Only an attempted claim for
+                    # this generation can need release; never reconcile a CID
+                    # or remove another generation's state at this phase.
+                    if entry_claim_attempted:
+                        try:
+                            cleanup = (self._cleanup_rolled_back_futures_entry_state
+                                       if entry_basis_checkpoint_attempted
+                                       else self._release_untracked_futures_entry_claim)
+                            released = cleanup(sym, "pre-submit entry failure", entry_id=entry_id)
+                            if released is True:
+                                from core.database import release_portfolio_reservation
+
+                                release_portfolio_reservation(entry_id)
+                            else:
+                                self._mark_futures_entry_recovery_pending()
+                        except Exception:
+                            self._mark_futures_entry_recovery_pending()
+                    return
+                if isinstance(e, _OrderSnapshotConflict):
+                    # A fresh response already contradicted stronger durable
+                    # fill evidence. A CID lookup must not overwrite that
+                    # evidence or release its claim on a stale zero-fill row.
+                    self._mark_futures_entry_recovery_pending()
+                    log_event(
+                        f"{sym}: conflicting entry snapshots; claim kept "
+                        "pending durable intent reconciliation",
+                        "ERROR",
+                    )
+                    return
                 if _not_submitted:
                     cleaned = self._cleanup_rolled_back_futures_entry_state(
                         sym,
@@ -2287,6 +2359,12 @@ class FuturesScanMixin:
                             "fees_paid": 0.0, "partial_sold": False,
                             "break_even": False, "be_active": False,
                             "provisional": True,
+                            "entry_price_unverified": True,
+                            "entry_contract_size": contract_size,
+                            "futures_entry_client_order_id": _recovery_cid,
+                            "futures_entry_order_id": landed.get("id") or landed.get("orderId"),
+                            "futures_entry_requested_amount": amount_contracts,
+                            "futures_entry_observed_amount": _amt,
                         }
                         from bot_utils.trade_state import (
                             promote_position_generation,
@@ -2491,6 +2569,7 @@ class FuturesScanMixin:
             "break_even": False,
             "be_active": False,
             "provisional": not entry_verified,
+            "entry_price_unverified": not entry_verified,
         }
         # Merge instead of replace: update_many keeps monitor-set fields that
         # the Monitor-Thread may have written between the provisional add and

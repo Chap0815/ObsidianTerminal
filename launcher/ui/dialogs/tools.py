@@ -744,7 +744,7 @@ def open_heatmap_dialog(app) -> None:
                   ).pack(side="left", padx=(0, 8))
 
     bot_var = ctk.StringVar(value="ALL")
-    for label in ("ALL", "TREND", "SPOT", "FUTURES"):
+    for label in ("ALL", *BOT_ORDER):
         color = COLORS.get(label.lower(), COLORS["text"]) if label != "ALL" else COLORS["text"]
         # Per-bot color when a specific bot is selected, else the neutral
         # "balanced" emerald as the default checkbox accent. (COLORS has no

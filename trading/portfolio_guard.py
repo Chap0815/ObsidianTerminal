@@ -65,13 +65,6 @@ def _price_or_zero(value, symbol: str) -> float:
     return parsed
 
 
-def _safe_lower_text(value) -> str:
-    try:
-        return str(value).strip().lower()
-    except Exception:
-        return ""
-
-
 def _position_side(raw: dict) -> str | None:
     side, contradictory = position_row_side(raw)
     if contradictory or not side:

@@ -1279,8 +1279,27 @@ def execute_entry_order(
             critical=True,
             response_validator=_validate_maker_status_refresh,
         )
-        _require_positive_partial_fill(latest, "maker status refresh")
         latest_status = _order_status(latest, amount)
+        if (
+            latest_status == "FILLED"
+            or _external_text(latest.get("status", ""))
+            in _TERMINAL_PARTIAL_STATUSES
+        ):
+            current_filled = _number(maker_order.get("filled"))
+            latest_filled = _number(latest.get("filled"))
+            if latest_filled + max(1e-12, amount * 1e-9) < current_filled:
+                raise _OrderSnapshotConflict("terminal maker fill amount decreased")
+            current_notional = _recovered_fill_notional(maker_order, current_filled)
+            latest_notional = _recovered_fill_notional(latest, latest_filled)
+            if current_notional is not None and latest_notional is not None:
+                tolerance = max(
+                    1e-12, max(current_notional, latest_notional) * 1e-9
+                )
+                if latest_notional + tolerance < current_notional:
+                    raise _OrderSnapshotConflict(
+                        "terminal maker fill notional decreased"
+                    )
+        _require_positive_partial_fill(latest, "maker status refresh")
         if latest_status == "FILLED":
             latest = _with_verified_fill_notional(latest, "maker")
             fill_fields = {

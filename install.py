@@ -504,6 +504,11 @@ def _installed_ollama_models() -> set[str] | None:
     }
 
 
+def _canonical_ollama_model(name: str) -> str:
+    """Ollama's absent leaf tag means latest; preserve namespaces and tags."""
+    return name if ":" in name.rsplit("/", 1)[-1] else name + ":latest"
+
+
 def pull_model(ollama_ready: bool) -> bool:
     head("[8/10] LLM-Modell laden")
     if not ollama_ready:
@@ -512,7 +517,10 @@ def pull_model(ollama_ready: bool) -> bool:
     model = _model_from_config()
     info(f"Modell laut bot_config.json: {model}")
     installed = _installed_ollama_models()
-    if installed is not None and model in installed:
+    canonical_model = _canonical_ollama_model(model)
+    if installed is not None and canonical_model in {
+        _canonical_ollama_model(name) for name in installed
+    }:
         ok(f"{model}  -  bereits vorhanden")
         return True
     info(f"{model} wird geladen (mehrere GB, kann dauern) ...\n")
@@ -521,7 +529,9 @@ def pull_model(ollama_ready: bool) -> bool:
         r = subprocess.run(["ollama", "pull", model])
         if r.returncode == 0:
             installed = _installed_ollama_models()
-            if installed is not None and model in installed:
+            if installed is not None and canonical_model in {
+                _canonical_ollama_model(name) for name in installed
+            }:
                 ok(f"{model}  -  geladen und verifiziert")
                 return True
             err(f"{model}  -  Download meldete Erfolg, Modell fehlt aber")

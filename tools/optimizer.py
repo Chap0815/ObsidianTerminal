@@ -3130,7 +3130,7 @@ def _label(p, strategy):
 
 
 def _cmd(p, strategy, days, use_maker):
-    c = f"python backtester.py {strategy} {days}"
+    c = f"python -m tools.backtester {strategy} {days}"
     c += f" --pump {p['min_pump']:.0f}"
     c += f" --activation {p['activation_profit']:.1f}"
     c += f" --trailing {p['trailing_distance']:.1f}"

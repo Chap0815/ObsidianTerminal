@@ -138,13 +138,22 @@ class HistoricalFundingTimeline:
         periods: Iterable[FundingPeriod],
         *,
         observation_times: Mapping[str, Iterable[datetime]] | None = None,
+        announcements: Mapping[str, Iterable[tuple[datetime, datetime]]] | None = None,
         settled_history: bool = False,
     ) -> None:
         grouped: dict[str, dict[datetime, FundingPeriod]] = {}
+        derived_announcements: dict[str, list[tuple[datetime, datetime]]] = {}
         for period in periods:
             symbol = _canonical_symbol(period.symbol)
             if not symbol:
                 continue
+            if (
+                _finite(period.rate) is not None
+                and period.observed_time <= period.settlement_time
+            ):
+                derived_announcements.setdefault(symbol, []).append(
+                    (period.observed_time, period.settlement_time)
+                )
             by_settlement = grouped.setdefault(symbol, {})
             previous = by_settlement.get(period.settlement_time)
             ordering = (period.observed_time, period.event_id)
@@ -163,6 +172,13 @@ class HistoricalFundingTimeline:
             if _canonical_symbol(symbol)
         }
         self._settled_history = settled_history is True
+        self._announcements = {
+            _canonical_symbol(symbol): tuple(sorted(set(rows)))
+            for symbol, rows in (
+                announcements if announcements is not None else derived_announcements
+            ).items()
+            if _canonical_symbol(symbol)
+        }
 
     @classmethod
     def from_snapshots(
@@ -176,17 +192,29 @@ class HistoricalFundingTimeline:
             cutoff = _require_aware(cutoff, "completed_as_of")
         periods = []
         observations: dict[str, list[datetime]] = {}
+        announcements: dict[str, list[tuple[datetime, datetime]]] = {}
         for snapshot in snapshots:
             for market in snapshot.markets.values():
+                settlement = market.next_settlement
+                rate = _finite(market.funding_rate)
+                if (
+                    rate is None
+                    or not isinstance(settlement, datetime)
+                    or settlement.tzinfo is None
+                    or settlement.utcoffset() is None
+                ):
+                    continue
+                settlement = settlement.astimezone(timezone.utc)
+                if snapshot.received_time > settlement:
+                    continue
+                # A valid future announcement proves a settlement-free hold
+                # even when that settlement lies beyond the completed cutoff.
                 observations.setdefault(market.symbol, []).append(
                     snapshot.received_time
                 )
-                settlement = market.next_settlement
-                rate = market.funding_rate
-                if settlement is None or rate is None:
-                    continue
-                if snapshot.received_time > settlement:
-                    continue
+                announcements.setdefault(market.symbol, []).append(
+                    (snapshot.received_time, settlement)
+                )
                 if cutoff is not None and settlement > cutoff:
                     continue
                 periods.append(FundingPeriod(
@@ -196,7 +224,7 @@ class HistoricalFundingTimeline:
                     observed_time=snapshot.received_time,
                     event_id=snapshot.event_id,
                 ))
-        return cls(periods, observation_times=observations)
+        return cls(periods, observation_times=observations, announcements=announcements)
 
     @classmethod
     def from_settled_history(
@@ -275,7 +303,42 @@ class HistoricalFundingTimeline:
         observations = self._observations.get(_canonical_symbol(symbol), ())
         if self._settled_history:
             return _settled_coverage_is_complete(observations, entry, exit_)
-        return _coverage_is_complete(observations, entry, exit_)
+        return self._snapshot_coverage_is_complete(symbol, entry, exit_)
+
+    def _snapshot_coverage_is_complete(self, symbol, entry, exit_) -> bool:
+        """Snapshot coverage under the explicit 300s rollover freshness policy.
+
+        This is not proof of arbitrary sub-300s exchange schedule changes;
+        settled history is the authoritative accounting input. No periods are
+        interpolated, and pauses before an announced settlement remain valid.
+        """
+        canonical = _canonical_symbol(symbol)
+        chain = self._announcements.get(canonical, ())
+        times = tuple(received for received, _ in chain)
+        if not _coverage_is_complete(times, entry, exit_):
+            return False
+        start = bisect_right(times, entry) - 1
+        start = bisect_left(times, times[start])
+        end = bisect_right(times, exit_)
+        relevant = chain[start:end]
+        by_settlement = {row.settlement_time: row for row in self.periods(symbol)}
+        previous_due = None
+        previous_received = None
+        for received, due in relevant:
+            if previous_due is not None:
+                if received == previous_received and due != previous_due:
+                    return False
+                if received < previous_due and due != previous_due:
+                    return False  # Contradictory pre-settlement schedule change.
+                if received > previous_due + timedelta(seconds=MAX_FUNDING_ENDPOINT_AGE_SECONDS):
+                    return False
+            if entry < due <= exit_:
+                row = by_settlement.get(due)
+                if row is None or not 0 <= (due - row.observed_time).total_seconds() <= MAX_FUNDING_RATE_AGE_SECONDS:
+                    return False
+            previous_due = due
+            previous_received = received
+        return bool(relevant and relevant[-1][1] >= exit_)
 
     def summary(self, start_time, end_time) -> dict:
         start = _as_utc_datetime(start_time, "start_time")
@@ -331,14 +394,8 @@ class HistoricalFundingTimeline:
         coverage_complete = (
             _settled_coverage_is_complete(observations, entry, exit_)
             if self._settled_history
-            else _coverage_is_complete(observations, entry, exit_)
+            else self._snapshot_coverage_is_complete(symbol, entry, exit_)
         )
-        if require_complete and not coverage_complete:
-            raise IncompleteFundingEvidence(
-                f"incomplete funding capture coverage for "
-                f"{_canonical_symbol(symbol)} in ({entry.isoformat()}, "
-                f"{exit_.isoformat()}]"
-            )
         rows = [
             row for row in self.periods(symbol)
             if entry < row.settlement_time <= exit_
@@ -352,6 +409,12 @@ class HistoricalFundingTimeline:
             raise IncompleteFundingEvidence(
                 f"stale settlement funding for {_canonical_symbol(symbol)} at "
                 f"{stale[0].settlement_time.isoformat()}"
+            )
+        if require_complete and not coverage_complete:
+            raise IncompleteFundingEvidence(
+                f"incomplete funding capture coverage for "
+                f"{_canonical_symbol(symbol)} in ({entry.isoformat()}, "
+                f"{exit_.isoformat()}]"
             )
         rates = tuple(row.rate for row in rows)
         if not rows:
@@ -389,7 +452,7 @@ def _coverage_is_complete(
 ) -> bool:
     if not observations:
         return False
-    left = bisect_left(observations, entry)
+    left = bisect_right(observations, entry)
     start_index = max(0, left - 1)
     right = bisect_right(observations, exit_)
     relevant = observations[start_index:right]
@@ -404,11 +467,7 @@ def _coverage_is_complete(
         > MAX_FUNDING_ENDPOINT_AGE_SECONDS
     ):
         return False
-    # Interior recorder gaps do not imply missing funding: each upcoming
-    # settlement is announced for hours and is validated independently below
-    # by the age of its newest pre-settlement rate.  Requiring uninterrupted
-    # minute observations here would discard every symbol for a venue-wide
-    # capture pause that occurred far away from a settlement.
+    # Endpoint freshness only; the caller must also validate announced rollovers.
     return True
 
 

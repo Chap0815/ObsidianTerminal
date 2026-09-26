@@ -221,6 +221,11 @@ EXCHANGES = {
 }
 
 
+def _valid_proxy_port(port):
+    return (isinstance(port, str) and port.isascii() and port.isdecimal()
+            and len(port) <= 5 and 1 <= int(port) <= 65535)
+
+
 # -- Wizard App ----------------------------------------------------------------
 
 class SetupWizard(ctk.CTk):
@@ -240,6 +245,9 @@ class SetupWizard(ctk.CTk):
         self.mono_font = _safe_mono_font()
 
         self.current_step = 1
+        self._connection_test_running = False
+        self._connection_test_token = None
+        self._connection_test_generation = 0
         self.total_steps  = 4
         self.data = {
             "exchange":         "bitget",
@@ -355,6 +363,7 @@ class SetupWizard(ctk.CTk):
         self.skip_lbl.pack(side="left", padx=(20, 0))
 
     def _show_step(self, n):
+        self._connection_test_generation = getattr(self, "_connection_test_generation", 0) + 1
         for w in self.content.winfo_children():
             w.destroy()
 
@@ -831,6 +840,9 @@ class SetupWizard(ctk.CTk):
                 if not self.data["proxy_host"] or not self.data["proxy_port"]:
                     self._show_error("Proxy host and port required")
                     return False
+                if not _valid_proxy_port(self.data["proxy_port"]):
+                    self._show_error("Proxy port must be an integer from 1 to 65535")
+                    return False
             return True
 
         if n == 4:
@@ -866,50 +878,73 @@ class SetupWizard(ctk.CTk):
     # -- Connection Test -------------------------------------------------------
 
     def _run_connection_test(self):
-        self.test_result.configure(
+        if getattr(self, "_connection_test_running", False):
+            return
+        data = dict(self.data)
+        result_label = self.test_result
+        generation = getattr(self, "_connection_test_generation", 0)
+        token = object()
+        self._connection_test_token = token
+        self._connection_test_running = True
+        result_label.configure(
             text="...  Testing connection...",
             text_color=COLORS["text_dim"]
         )
-        self.update()
+
+        def _publish(message, color):
+            def _apply():
+                if getattr(self, "_connection_test_token", None) is not token:
+                    return
+                self._connection_test_running = False
+                try:
+                    if (getattr(self, "_connection_test_generation", 0) == generation
+                            and self.current_step == 4
+                            and self.test_result is result_label
+                            and self.winfo_exists() and result_label.winfo_exists()):
+                        result_label.configure(text=message, text_color=color)
+                except Exception:
+                    # A closed/navigated-away Tk widget is not a test failure.
+                    pass
+            try:
+                self.after(0, _apply)
+            except Exception:
+                # Window may have been closed before the worker completed.
+                if getattr(self, "_connection_test_token", None) is token:
+                    self._connection_test_running = False
 
         def _test():
+            ex = None
             try:
-                if not self.data["api_key"] or not self.data["api_secret"]:
-                    self.after(0, lambda: self.test_result.configure(
-                        text="X  API key or secret missing - check Step 2",
-                        text_color=COLORS["danger"]
-                    ))
+                if not data["api_key"] or not data["api_secret"]:
+                    _publish("X  API key or secret missing - check Step 2", COLORS["danger"])
                     return
 
-                ex_info = EXCHANGES[self.data["exchange"]]
-                if ex_info["passphrase"] and not self.data["passphrase"]:
-                    self.after(0, lambda: self.test_result.configure(
-                        text="X  Passphrase missing - check Step 2",
-                        text_color=COLORS["danger"]
-                    ))
+                ex_info = EXCHANGES[data["exchange"]]
+                if ex_info["passphrase"] and not data["passphrase"]:
+                    _publish("X  Passphrase missing - check Step 2", COLORS["danger"])
+                    return
+                if data.get("use_proxy") and not _valid_proxy_port(data.get("proxy_port")):
+                    _publish("X  Proxy port must be an integer from 1 to 65535", COLORS["danger"])
                     return
 
                 try:
                     import ccxt
                 except ImportError:
-                    self.after(0, lambda: self.test_result.configure(
-                        text="WARN  ccxt not installed. Run: pip install -r requirements.txt",
-                        text_color=COLORS["warning"]
-                    ))
+                    _publish("WARN  ccxt not installed. Run install.bat first.", COLORS["warning"])
                     return
 
-                exchange_class = getattr(ccxt, self.data["exchange"])
+                exchange_class = getattr(ccxt, data["exchange"])
                 opts = {
-                    "apiKey":          self.data["api_key"],
-                    "secret":          self.data["api_secret"],
+                    "apiKey":          data["api_key"],
+                    "secret":          data["api_secret"],
                     "enableRateLimit": True,
                     "timeout":         15000,
                 }
                 if ex_info["passphrase"]:
-                    opts["password"] = self.data["passphrase"]
+                    opts["password"] = data["passphrase"]
 
-                if self.data.get("use_proxy"):
-                    proxy_url = f"http://{self.data['proxy_host']}:{self.data['proxy_port']}"
+                if data.get("use_proxy"):
+                    proxy_url = f"http://{data['proxy_host']}:{data['proxy_port']}"
                     opts["proxies"] = {"http": proxy_url, "https": proxy_url}
 
                 ex = exchange_class(opts)
@@ -920,18 +955,24 @@ class SetupWizard(ctk.CTk):
                 msg = (f"OK  Connection successful  -  "
                        f"USDT balance: {usdt:.2f}  -  "
                        f"{len(ex.markets)} markets available")
-                self.after(0, lambda m=msg: self.test_result.configure(
-                    text=m, text_color=COLORS["success"]
-                ))
+                _publish(msg, COLORS["success"])
 
-            except Exception as e:
-                err_msg = str(e)[:200]
-                self.after(0, lambda em=err_msg: self.test_result.configure(
-                    text=f"X  Test failed: {em}",
-                    text_color=COLORS["danger"]
-                ))
+            except Exception:
+                # SDK exceptions may contain API credentials or proxy URLs.
+                _publish("X  Test failed. Check credentials, permissions and proxy; retry.",
+                         COLORS["danger"])
+            finally:
+                close = getattr(ex, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
 
-        threading.Thread(target=_test, daemon=True).start()
+        try:
+            threading.Thread(target=_test, daemon=True).start()
+        except Exception:
+            _publish("X  Test could not start. Please retry.", COLORS["danger"])
 
     # -- Finish ----------------------------------------------------------------
 

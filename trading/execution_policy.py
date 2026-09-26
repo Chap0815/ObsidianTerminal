@@ -174,6 +174,11 @@ def evaluate_shadow_execution_policy(
         action = "TAKER"
         net_edge = parsed["gross_edge_bps"] - taker_cost
         reasons = ["taker_expected_cost_lower_or_equal"]
+    # The savings threshold can select taker even when maker has the lower
+    # modeled cost. Apply the edge gate to the method actually recommended.
+    if action != "ABSTAIN" and net_edge <= edge_buffer:
+        action = "ABSTAIN"
+        reasons = ["net_edge_not_positive_after_execution"]
     return ExecutionPolicyDecision(
         action=action,
         expected_taker_cost_bps=taker_cost,
