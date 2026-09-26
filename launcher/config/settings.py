@@ -410,7 +410,6 @@ DEFAULT_CONFIG = {
     },
     "UI": {
         "VISIBLE_BOTS":   ["TREND", "SPOT", "FUTURES", "CROSS", "FUTREND"],
-        "COLLAPSED_BOTS": [],
         # Secure default for new installations. Existing installations that
         # predate this explicit setting retain LAN access during migration and
         # can later be restricted after their firewall/VPN path is configured.

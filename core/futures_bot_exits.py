@@ -1160,6 +1160,72 @@ def _recover_or_submit_futures_full_exit(
                 log_struct=log_struct,
             )
 
+    # A market-order ACK (notably MEXC) may contain only its exchange id.
+    # Price-only recovery downstream must not discard the matching fill size:
+    # carry one identity-checked snapshot into the causal coverage check.
+    from bot_utils.futures_exits import _order_id_is_fetchable
+    from bot_utils.futures_order import (
+        _explicit_order_ids,
+        _order_refresh_conflicts,
+    )
+
+    raw_filled = order.get("filled") if isinstance(order, dict) else None
+    ack_without_fill = raw_filled is None
+    if not isinstance(raw_filled, bool) and raw_filled is not None:
+        try:
+            ack_without_fill = float(raw_filled) == 0.0
+        except (TypeError, ValueError, OverflowError):
+            pass
+    order_ids = _explicit_order_ids(order)
+    fetch_order = getattr(bot.ex, "fetch_order", None)
+    if (
+        ack_without_fill and len(order_ids) == 1 and callable(fetch_order)
+        and not _order_confirmed_terminal_zero_fill(order)
+    ):
+        order_id = next(iter(order_ids))
+        reservation = None
+        if _order_id_is_fetchable(bot.ex, symbol_full, order_id):
+            try:
+                reservation = try_consume_api_call(
+                    "futures_full_exit_fill_fetch_order", critical=True,
+                    return_reservation=True,
+                )
+                if reservation:
+                    refreshed = fetch_order(order_id, symbol_full)
+                    if not isinstance(refreshed, dict) or not refreshed:
+                        raise ValueError("empty full-close refresh")
+                    if _order_refresh_conflicts(
+                        order, refreshed, symbol_full, close_side,
+                        position_side, _exchange_id(bot.ex),
+                        expected_reduce_only=True,
+                        allow_one_way_position_side=True,
+                        expected_client_id=client_order_id,
+                        expected_amount=close_amount,
+                    ):
+                        raise ValueError("conflicting full-close refresh")
+                    fill = refreshed.get("filled")
+                    if isinstance(fill, bool):
+                        raise ValueError("boolean full-close fill")
+                    fill = float(fill)
+                    if not math.isfinite(fill) or not 0 < fill <= close_amount:
+                        raise ValueError("invalid full-close fill")
+                    order = refreshed
+            except Exception:
+                if isinstance(reservation, ApiCallReservation):
+                    try:
+                        record_api_error(
+                            "futures_full_exit_fill_fetch_order", reservation,
+                        )
+                    except Exception:
+                        pass
+                # Keep the ACK and durable intent. No retry submit and no
+                # guessed fill; existing recovery/coverage gates remain active.
+                log_event(
+                    f"{action_label}: full-close fill refresh unavailable "
+                    "or invalid; accounting still requires verified fills",
+                    "WARN",
+                )
+
     terminal = is_terminal_order_state(classify_order_state(order))
     return order, close_amount, terminal
 

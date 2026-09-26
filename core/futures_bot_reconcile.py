@@ -2924,9 +2924,21 @@ class FuturesReconcileMixin:
                 except Exception as e:
                     log_event(f"Telegram failed: {e}", "WARN")
             if not orphan_syms:
-                log_event(
-                    f" Reconciliation: {len(local_state)} position(s) "
-                    f"in sync with exchange", "INFO")
+                retained = self.state.get_all()
+                missing = set(retained) - set(exchange_open)
+                if missing:
+                    log_event(
+                        f" Reconciliation: {len(missing)} local record(s) "
+                        "awaiting reconciliation/accounting; state retained",
+                        "WARN",
+                    )
+                else:
+                    # No orphans alone is not proof of matching sides,
+                    # quantities, claims or completed accounting.
+                    log_event(
+                        " Reconciliation: exchange snapshot checked; "
+                        f"{len(retained)} local record(s) retained", "INFO",
+                    )
             try:
                 from trading.runtime_observability import emit_startup_integrity
                 exchange_layer = {}
