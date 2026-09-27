@@ -1640,7 +1640,7 @@ def _direct_close_remaining_futures(
 
     def _submit_launcher_close(exchange, full, side, quantity, *, params, **_kwargs):
         nonlocal _last_close_at
-        from bot_utils.network_retry import is_rate_limited, is_transient_network
+        from bot_utils.network_retry import is_unambiguous_rate_limit_rejection
 
         since = _close_time.monotonic() - _last_close_at
         if _last_close_at > 0 and since < _MIN_CLOSE_SPACING_SEC:
@@ -1655,7 +1655,7 @@ def _direct_close_remaining_futures(
             except Exception as exc:
                 # Only explicit rate-limit rejection is safe to retry. A lost
                 # response keeps this exact CID for the next recovery lookup.
-                if not is_rate_limited(exc) or is_transient_network(exc) or attempt == 2:
+                if not is_unambiguous_rate_limit_rejection(exc) or attempt == 2:
                     raise
                 _close_time.sleep(2 ** attempt)
 

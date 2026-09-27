@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -2518,6 +2519,7 @@ class VenueRecorder:
         market_id: str | None = None,
         health_symbol: str | None = None,
         health_stream: str | None = None,
+        health_details: dict | None = None,
         event_universe: list[str] | None = None,
     ) -> Path:
         market_id = market_id or self._market_id(self.exchange, symbol)
@@ -2619,6 +2621,7 @@ class VenueRecorder:
                 health_symbol or market_id,
                 health_stream,
                 flags,
+                details=health_details,
             )
         return path
 
@@ -2687,6 +2690,60 @@ class VenueRecorder:
         quote_volumes: dict[str, float | None] = {}
         quote_volume_sources: dict[str, str] = {}
         markets = self._market_mapping(self.exchange)
+        markets_by_id = getattr(self.exchange, "markets_by_id", None)
+        known_market_ids = set()
+        metadata_index_valid = type(markets_by_id) is dict and bool(markets)
+        for row in markets.values():
+            if type(row) is not dict or not SQLitePartitionWriter._valid_text(
+                row.get("id"), max_chars=256
+            ):
+                metadata_index_valid = False
+                break
+            known_market_ids.add(row["id"])
+        unknown_ids = []
+        unknown_count = 0
+
+        def _strict_unknown_raw(symbol, ticker):
+            exchange_id = getattr(self.exchange, "id", None)
+            if (type(exchange_id) is not str or exchange_id != "mexc"
+                    or not metadata_index_valid
+                    or re.fullmatch(r"[A-Z0-9]+_USDT", symbol) is None
+                    or symbol in markets or symbol in markets_by_id
+                    or symbol in known_market_ids or type(ticker) is not dict
+                    or ticker.get("symbol") != symbol):
+                return False
+            info = ticker.get("info")
+            if (type(info) is not dict or type(info.get("symbol")) is not str
+                    or info.get("symbol") != symbol):
+                return False
+            # Quarantine only well-formed foreign rows, never malformed data.
+            for source, key, positive in (
+                (ticker, "last", True), (ticker, "bid", True),
+                (ticker, "ask", True), (ticker, "quoteVolume", False),
+                (ticker, "baseVolume", False), (info, "holdVol", False),
+                (info, "indexPrice", True), (info, "fairPrice", True),
+            ):
+                raw = source.get(key)
+                if raw is not None:
+                    number = self._finite_number_or_none(raw)
+                    if number is None or number < 0 or (positive and number == 0):
+                        return False
+            bid = self._finite_number_or_none(ticker.get("bid"))
+            ask = self._finite_number_or_none(ticker.get("ask"))
+            if bid is not None and ask is not None and bid >= ask:
+                return False
+            for source, key in ((ticker, "timestamp"), (info, "nextSettleTime")):
+                raw = source.get(key)
+                if raw is not None:
+                    number = self._finite_number_or_none(raw)
+                    if number is None or number <= 0 or not number.is_integer():
+                        return False
+            funding = info.get("fundingRate")
+            if funding is not None:
+                number = self._finite_number_or_none(funding)
+                if number is None or abs(number) > 1:
+                    return False
+            return True
 
         for symbol, ticker in ticker_rows:
             if not SQLitePartitionWriter._valid_text(symbol, max_chars=256):
@@ -2714,6 +2771,11 @@ class VenueRecorder:
             except Exception:
                 raw_market = None
             if not isinstance(raw_market, dict):
+                if _strict_unknown_raw(symbol, ticker):
+                    unknown_count += 1
+                    if len(unknown_ids) < 16:
+                        unknown_ids.append(symbol)
+                    continue
                 invalid_ticker_identity = True
                 continue
             market = self._market_row(markets, symbol)
@@ -2877,10 +2939,20 @@ class VenueRecorder:
             overview_flags.append("stale_exchange_timestamp")
         if overview_flags:
             self._record_api_failure(endpoint, reservation)
+        coverage = {
+            "scope": "registered_usdt_swaps",
+            "metadata_coverage_complete": (
+                False if unknown_count else
+                None if invalid_ticker_identity or invalid_tickers_payload else True
+            ),
+            "unknown_market_count": unknown_count,
+            "unknown_market_ids": unknown_ids,
+            "coverage_flags": ["unknown_market_metadata"] if unknown_count else [],
+        }
         self._write_event(
             "overview",
             "",
-            {"markets": markets_payload},
+            {"markets": markets_payload, **coverage},
             exchange_ms=latest_timestamp,
             started_ms=started,
             ended_ms=ended,
@@ -2888,6 +2960,7 @@ class VenueRecorder:
             market_id="ALL_USDT_SWAPS",
             health_symbol="ALL_USDT_SWAPS",
             health_stream="overview",
+            health_details=coverage,
             event_universe=next_universe,
         )
         self._last_priority_symbols = list(priority_universe)
@@ -3177,6 +3250,8 @@ class VenueRecorder:
         symbol: str,
         stream: str,
         flags,
+        *,
+        details: dict | None = None,
     ) -> None:
         now = time.monotonic()
         normalized_flags = tuple(sorted({str(flag) for flag in flags if flag}))
@@ -3185,6 +3260,7 @@ class VenueRecorder:
                 "last_attempt_monotonic": now,
                 "last_valid_monotonic": None if normalized_flags else now,
                 "flags": normalized_flags,
+                "details": dict(details or {}),
             }
 
     def _rest_data_health(self) -> dict:
@@ -3217,6 +3293,7 @@ class VenueRecorder:
                 ),
                 "age_seconds": overview_age,
                 "flags": list((overview_item or {}).get("flags") or ()),
+                **((overview_item or {}).get("details") or {}),
             }
             for symbol in desired:
                 streams = {}
@@ -3240,6 +3317,9 @@ class VenueRecorder:
         )
         if overview["valid"] is not True:
             missing.append("ALL_USDT_SWAPS:overview")
+            missing.sort()
+        if overview.get("metadata_coverage_complete") is False:
+            missing.append("ALL_USDT_SWAPS:metadata_coverage")
             missing.sort()
         trade_audit_warnings = sorted(
             f"{symbol}:trades"
