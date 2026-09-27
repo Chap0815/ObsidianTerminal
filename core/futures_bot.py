@@ -1623,6 +1623,30 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             report.get("last_poll_monotonic")
         )
         last_poll_wall_ts = bounded_float(report.get("last_poll_wall_ts"))
+        raw_overview = raw_rest.get("overview")
+        raw_overview = raw_overview if isinstance(raw_overview, dict) else {}
+        raw_coverage = raw_overview.get("metadata_coverage_complete")
+        if raw_coverage is not None and type(raw_coverage) is not bool:
+            invalidate_payload_contract()
+            raw_coverage = None
+        if raw_coverage is False and (
+            raw_rest.get("ok") is True or report.get("rest_ok") is True
+        ):
+            invalidate_payload_contract()
+        overview_projection = {
+            "valid": raw_overview.get("valid") is True,
+            "age_seconds": bounded_float(raw_overview.get("age_seconds")),
+            "flags": bounded_strings(raw_overview.get("flags")),
+            "scope": bounded_text(raw_overview.get("scope"), max_chars=64),
+            "metadata_coverage_complete": raw_coverage,
+            "unknown_market_count": bounded_nonnegative(
+                raw_overview.get("unknown_market_count")
+            ),
+            "unknown_market_ids": bounded_strings(
+                raw_overview.get("unknown_market_ids"), limit=16
+            ),
+            "coverage_flags": bounded_strings(raw_overview.get("coverage_flags")),
+        }
         rest_ok = report.get("rest_ok") is True
         l2_enabled = report.get("l2_enabled") is True
         l2_ok = report.get("l2_ok") is True
@@ -1706,6 +1730,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     "trade_audit_warnings": bounded_strings(
                         raw_rest.get("trade_audit_warnings")
                     ),
+                    "overview": overview_projection,
                 },
                 "stream_health": {
                     "connection_epoch": connection_epoch,

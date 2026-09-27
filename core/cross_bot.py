@@ -51,6 +51,7 @@ from trading.xsec_signal import (
     XSecParams,
     advance_crash_history,
     compute_target_book,
+    lookback_return,
 )
 
 
@@ -482,7 +483,8 @@ class CrossBot(FuturesBot):
 
     def _cross_entry_quality_context(self, base: str, side: str, book,
                                      prices: Dict[str, List[float]],
-                                     target_side_count: int) -> dict:
+                                     target_side_count: int,
+                                     lookback_hours: int | None = None) -> dict:
         ranked = list(book.longs if side == "LONG" else book.shorts)
         try:
             rank_position = ranked.index(base) + 1
@@ -491,10 +493,16 @@ class CrossBot(FuturesBot):
         series = prices.get(base) or []
         return_pct = None
         try:
-            first = CrossBot._safe_float(self, series[0], 0.0)
-            last = CrossBot._safe_float(self, series[-1], 0.0)
-            if first > 0 and last > 0:
-                return_pct = (last / first - 1.0) * 100.0
+            if lookback_hours is None:
+                lookback_hours = CrossBot._xsec_params(self).lookback_hours
+            if (isinstance(lookback_hours, int)
+                    and not isinstance(lookback_hours, bool)
+                    and lookback_hours > 0):
+                value = lookback_return(series, lookback_hours)
+                if value is not None:
+                    percent = value * 100.0
+                    if math.isfinite(percent):
+                        return_pct = percent
         except Exception:
             pass
         funding_cache = getattr(self, "_cross_funding_pct", {})
@@ -525,7 +533,8 @@ class CrossBot(FuturesBot):
     def _open_leg_with_quality(self, base: str, full: str, side: str,
                                notional: float, price: float, lev: float,
                                book, prices: Dict[str, List[float]],
-                               target_side_count: int) -> None:
+                               target_side_count: int,
+                               lookback_hours: int | None = None) -> None:
         if not CrossBot._entry_recovery_allows_live_open(self):
             from core.logger import log_event
 
@@ -536,7 +545,7 @@ class CrossBot(FuturesBot):
             )
             return
         context = CrossBot._cross_entry_quality_context(
-            self, base, side, book, prices, target_side_count)
+            self, base, side, book, prices, target_side_count, lookback_hours)
         try:
             import inspect
             sig = inspect.signature(self._open_leg)
@@ -580,7 +589,7 @@ class CrossBot(FuturesBot):
         return quality
 
     def _quality_openable_candidates(self, bases, side, book, prices,
-                                     target_side_count):
+                                     target_side_count, lookback_hours: int | None = None):
         """Exclude known quality failures before planning balanced LIVE pairs.
 
         Zero spread gives this scorer its maximum spread component. Passing is
@@ -594,7 +603,7 @@ class CrossBot(FuturesBot):
         eligible = []
         for base in bases:
             context = CrossBot._cross_entry_quality_context(
-                self, base, side, book, prices, target_side_count)
+                self, base, side, book, prices, target_side_count, lookback_hours)
             quality = CrossBot._calculate_cross_entry_quality(
                 self, side, context, 0.0, max_spread)
             if "score_error" not in quality.reasons and quality.score >= minimum:
@@ -1945,9 +1954,9 @@ class CrossBot(FuturesBot):
         cand_l = _cand(book.longs)
         cand_s = _cand(book.shorts)
         cand_l = CrossBot._quality_openable_candidates(
-            self, cand_l, "LONG", book, prices, k)
+            self, cand_l, "LONG", book, prices, k, params.lookback_hours)
         cand_s = CrossBot._quality_openable_candidates(
-            self, cand_s, "SHORT", book, prices, k)
+            self, cand_s, "SHORT", book, prices, k, params.lookback_hours)
         add_l, add_s = self._topup_counts(held_l, held_s, k,
                                           len(cand_l), len(cand_s))
         if add_l <= 0 and add_s <= 0:
@@ -1984,7 +1993,7 @@ class CrossBot(FuturesBot):
                     attempt_started = True
                 CrossBot._open_leg_with_quality(
                     self, b, sym_map[b], "LONG", notional, prices[b][-1],
-                    lev, book, prices, k)
+                    lev, book, prices, k, params.lookback_hours)
                 if not CrossBot._entry_recovery_allows_live_open(self):
                     return False
             for b in cand_s[:add_s]:
@@ -1995,7 +2004,7 @@ class CrossBot(FuturesBot):
                     attempt_started = True
                 CrossBot._open_leg_with_quality(
                     self, b, sym_map[b], "SHORT", notional, prices[b][-1],
-                    lev, book, prices, k)
+                    lev, book, prices, k, params.lookback_hours)
                 if not CrossBot._entry_recovery_allows_live_open(self):
                     return False
         except BaseException:
@@ -2923,9 +2932,9 @@ class CrossBot(FuturesBot):
         final = min(len(held_l) + len(new_l), len(held_s) + len(new_s))
         claimable_final = final
         new_l = CrossBot._quality_openable_candidates(
-            self, new_l, "LONG", book, prices, final)
+            self, new_l, "LONG", book, prices, final, params.lookback_hours)
         new_s = CrossBot._quality_openable_candidates(
-            self, new_s, "SHORT", book, prices, final)
+            self, new_s, "SHORT", book, prices, final, params.lookback_hours)
         final = min(len(held_l) + len(new_l), len(held_s) + len(new_s))
         if final < claimable_final and final < max(len(held_l), len(held_s)):
             # A planning veto is not an instruction to close retained legs.
@@ -3037,7 +3046,7 @@ class CrossBot(FuturesBot):
                 return False
             CrossBot._open_leg_with_quality(
                 self, base, sym_map[base], side, notional, prices[base][-1],
-                lev, book, prices, final)
+                lev, book, prices, final, params.lookback_hours)
             if not CrossBot._entry_recovery_allows_live_open(self):
                 log_event(
                     f"[{self.BOT_NAME}] rebalance interrupted - entry "

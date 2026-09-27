@@ -1,6 +1,6 @@
 {
-  "build_id": "c4224b4d4c3e8dc3",
-  "created_at": "2026-09-26 17:34:13",
+  "build_id": "1d7908d93277a0ae",
+  "created_at": "2026-09-27 08:51:36",
   "source": "update_deploy_manifest.py",
   "file_count": 223,
   "files": [
@@ -116,8 +116,8 @@
     },
     {
       "path": "bot_utils/network_retry.py",
-      "sha256": "fae240df9514d05fdadc38f3587135b1bc5575ed812b7d8ffe537fd1fe6b577d",
-      "bytes": 11842
+      "sha256": "caa4acf0ae479fa4abc9d782aaefb50c3349f0b840198cb4eaa83dccd5a5ce22",
+      "bytes": 17691
     },
     {
       "path": "bot_utils/order_utils.py",
@@ -291,8 +291,8 @@
     },
     {
       "path": "core/cross_bot.py",
-      "sha256": "06cff50956cb0eeffc4691a4f5e3d58d8d2db22ecc02c4289d5539ec3d783345",
-      "bytes": 249834
+      "sha256": "9bdd9f50717824282f1d70fa78fe3c2b7c9e8a379df8432cd0ddeff11023ec6e",
+      "bytes": 250505
     },
     {
       "path": "core/database.py",
@@ -306,8 +306,8 @@
     },
     {
       "path": "core/futures_bot.py",
-      "sha256": "3689016ea4e068fbfe5b56d8ca86e65809aa39cf299aa22cfb87448d24ce2e17",
-      "bytes": 143432
+      "sha256": "1cb67566262b00dd5bd4940b606853488c855a3ad97870c42f53cf0bbb7fc102",
+      "bytes": 144704
     },
     {
       "path": "core/futures_bot_exits.py",
@@ -451,8 +451,8 @@
     },
     {
       "path": "launcher/core/positions.py",
-      "sha256": "93e0ac261ddee4751543e072b87984d666a834adb2b887c3ebb6644f74872d41",
-      "bytes": 161099
+      "sha256": "7daa1a609e2b51ad8cab5218a4c41e8a956ccaa005033a834b87c1b3c3f5231f",
+      "bytes": 161088
     },
     {
       "path": "launcher/core/process_manager.py",
@@ -1086,8 +1086,8 @@
     },
     {
       "path": "trading/venue_recorder.py",
-      "sha256": "f937a55df2c2950139261cf694e54bb6c6ffb581d2a0708877be7cd703ad089f",
-      "bytes": 198030
+      "sha256": "befd479d7f50e04be1a230dba7221fb7e13545987c638d89aed85dfade969b72",
+      "bytes": 201890
     },
     {
       "path": "trading/vol_target.py",

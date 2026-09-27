@@ -10,8 +10,11 @@ progress") aren't mistaken for permanent ones.
 """
 from __future__ import annotations
 
+import errno
 import math
 import re
+import socket
+import ssl
 import threading
 import time
 from typing import Any, Callable, Optional
@@ -103,6 +106,59 @@ try:
 except Exception:
     _RATE_LIMIT_EXC = ()
 
+try:
+    from requests.exceptions import ConnectionError as _RequestsConnectionError
+    from requests.exceptions import Timeout as _RequestsTimeout
+    from urllib3.exceptions import MaxRetryError, NewConnectionError, ProtocolError
+    from urllib3.exceptions import TimeoutError as _UrllibTimeout
+    _TRANSPORT_WRAPPERS = (
+        _RequestsConnectionError, _RequestsTimeout, MaxRetryError,
+        NewConnectionError, ProtocolError, _UrllibTimeout,
+    )
+except ImportError:
+    _TRANSPORT_WRAPPERS = ()
+
+_NETWORK_ERRNOS = frozenset((
+    errno.ECONNRESET, errno.ECONNABORTED, errno.ECONNREFUSED, errno.ETIMEDOUT,
+    10054, 10053, 10061, 10060, 11001, 11002,
+))
+_NETWORK_CHAIN_LIMIT = 16
+
+
+def _network_exception_chain(exc: BaseException) -> list[BaseException] | None:
+    """Inspect a bounded graph; an incomplete inspection cannot hide errors."""
+    pending = [exc]
+    seen = set()
+    result = []
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        if len(result) >= _NETWORK_CHAIN_LIMIT:
+            return None
+        seen.add(id(current))
+        result.append(current)
+        for linked in (current.__cause__, current.__context__):
+            if isinstance(linked, BaseException):
+                pending.append(linked)
+    return result
+
+
+def _typed_connectivity_error(exc: BaseException) -> bool:
+    # CCXT's NetworkError also parents nonce/rate-limit/server failures.
+    # Only the plain transport type and explicit timeout family are admitted.
+    if _RATE_LIMIT_EXC and (
+        type(exc) is _ccxt.NetworkError or isinstance(exc, _ccxt.RequestTimeout)
+    ):
+        return True
+    if isinstance(exc, (TimeoutError, ConnectionError, socket.gaierror,
+                        ssl.SSLEOFError, ssl.SSLZeroReturnError)):
+        return True
+    return isinstance(exc, OSError) and (
+        exc.errno in _NETWORK_ERRNOS
+        or getattr(exc, "winerror", None) in _NETWORK_ERRNOS
+    )
+
 _MEXC_RATE_LIMIT_CODE_RE = re.compile(
     r'(?:["\']?code["\']?\s*[:=]\s*510\b|\bcode\s+510\b)',
     re.IGNORECASE,
@@ -155,6 +211,65 @@ def is_server_error(exc: BaseException) -> bool:
             or "gateway timed out" in s)
 
 
+def is_unambiguous_rate_limit_rejection(exc: BaseException) -> bool:
+    """Allow resubmission only after complete, explicit rejection evidence.
+
+    Logging classification is deliberately independent: any transport or
+    unrelated failure in either exception link leaves the order outcome unknown.
+    """
+    seen = set()
+    active = set()
+    transport_phrases = (
+        "getaddrinfo", "failed to resolve", "name resolution", "nameresolutionerror",
+        "ssl eof", "tls/ssl connection has been closed", "eof occurred",
+        "read timed out", "read timeout", "connection timed out", "connect timeout",
+        "max retries exceeded", "connection reset", "connection aborted",
+        "connection refused", "remote end closed", "requesttimeout", "networkerror",
+        "certificate_verify_failed", "certificate verify failed", "winerror",
+        "timeout", "timed out", "connectionerror", "sslerror", "socket",
+        "reset by peer", "remote disconnected", "network failure", "transport",
+        "authentication", "unauthorized", "invalid signature", "certificate",
+        "forbidden",
+    )
+
+    def visit(current):
+        identity = id(current)
+        if identity in active:
+            return False
+        if identity in seen:
+            return True
+        if len(seen) >= _NETWORK_CHAIN_LIMIT:
+            return False
+        seen.add(identity)
+        active.add(identity)
+        text = _exception_text(current, 4097).lower()
+        if (len(text) > 4096
+                or isinstance(current, (RetryForbiddenError, ssl.SSLCertVerificationError))
+                or _typed_connectivity_error(current)
+                or isinstance(current, _TRANSPORT_WRAPPERS)
+                or any(phrase in text for phrase in transport_phrases)
+                or is_permanent_error(current) or is_server_error(current)):
+            return False
+        if _RATE_LIMIT_EXC and isinstance(current, (
+            _ccxt.ExchangeError, _ccxt.InvalidNonce, _ccxt.ExchangeNotAvailable,
+        )):
+            return False
+        explicit = (
+            (_RATE_LIMIT_EXC and isinstance(current, _RATE_LIMIT_EXC))
+            or _HTTP_RATE_LIMIT_CODE_RE.search(text)
+            or _MEXC_RATE_LIMIT_CODE_RE.search(text)
+        )
+        if not explicit:
+            return False
+        for linked in (current.__cause__, current.__context__):
+            if isinstance(linked, BaseException) and not visit(linked):
+                return False
+        active.remove(identity)
+        return True
+
+    return visit(exc)
+
+
 def is_transient_network(exc: BaseException) -> bool:
     """True for transient connectivity blips: DNS failure, SSL EOF, read/
     connect timeout, connection reset. These are NOT code bugs  they happen
@@ -162,6 +277,36 @@ def is_transient_network(exc: BaseException) -> bool:
     networks). Callers should log these compactly (one line) rather than
     dumping a full traceback for every hiccup, and simply retry next cycle.
     """
+    chain = _network_exception_chain(exc)
+    if chain is None:
+        return False
+    for linked in chain:
+        text = _exception_text(linked).lower()
+        if isinstance(linked, (RetryForbiddenError, ssl.SSLCertVerificationError)):
+            return False
+        if _RATE_LIMIT_EXC and isinstance(linked, (
+            _ccxt.ExchangeError, _ccxt.InvalidNonce, _ccxt.ExchangeNotAvailable,
+        )):
+            return False
+        if ("certificate_verify_failed" in text or "certificate verify failed" in text
+                or is_permanent_error(linked) or is_server_error(linked)):
+            return False
+    if _typed_connectivity_error(exc) and not any(
+        is_rate_limited(linked) for linked in chain
+    ):
+        return True
+    # A transport wrapper may lose its message, but a programming error merely
+    # raised while handling a network error must remain visible.
+    if isinstance(exc, _TRANSPORT_WRAPPERS) and any(
+        _typed_connectivity_error(linked) for linked in chain[1:]
+    ):
+        return True
+    # A rejection with lost transport evidence still merits connectivity logging.
+    # Order resubmission uses the independent rejection guard above.
+    if is_rate_limited(exc) and any(
+        _typed_connectivity_error(linked) for linked in chain[1:]
+    ):
+        return True
     s = _exception_text(exc).lower()
     needles = (
         "getaddrinfo failed", "failed to resolve", "name resolution",
@@ -170,7 +315,7 @@ def is_transient_network(exc: BaseException) -> bool:
         "read timed out", "read timeout", "connection timed out",
         "connect timeout", "max retries exceeded", "connection reset",
         "connection aborted", "connection refused", "remote end closed",
-        "requesttimeout", "networkerror", "ddosprotection",
+        "requesttimeout", "networkerror",
     )
     return any(n in s for n in needles)
 
