@@ -1240,11 +1240,22 @@ def _find_order_by_client_id(
         market_id = market.get("id")
         if callable(native) and market_id:
             try:
-                raw = _budgeted(
-                    "order_recovery_mexc_external_oid",
-                    "mexc_exact",
-                    lambda: native({"symbol": market_id, "externalOid": cid}),
-                )
+                # This venue lookup can fail transiently while the other
+                # authenticated recovery endpoints succeed. Each retry gets
+                # its own API reservation; an exhausted/denied budget remains
+                # unavailable and can never count as negative evidence.
+                for exact_attempt in range(3):
+                    try:
+                        raw = _budgeted(
+                            "order_recovery_mexc_external_oid",
+                            "mexc_exact",
+                            lambda: native({"symbol": market_id, "externalOid": cid}),
+                        )
+                        break
+                    except Exception:
+                        if exact_attempt == 2:
+                            raise
+                        time.sleep(2.0)
                 data = raw.get("data") if isinstance(raw, dict) else None
                 if isinstance(data, dict):
                     expected_cid = _order_id_text(cid)

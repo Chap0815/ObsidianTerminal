@@ -51,6 +51,38 @@ def _positive_float_or_none(value) -> float | None:
     return parsed if parsed is not None and parsed > 0 else None
 
 
+def _unsubmitted_provisional_generation(row: dict, intent: dict) -> bool:
+    """Only a never-observed entry may be removed after zero-fill quorum."""
+    if not isinstance(row, dict) or not isinstance(intent, dict):
+        return False
+    direction = str(intent.get("direction") or "").upper()
+    observed = _finite_float_or_none(row.get("futures_entry_observed_amount"))
+    pending_close = _finite_float_or_none(row.get("pending_close_filled_amount", 0))
+    return bool(
+        direction in {"LONG", "SHORT"}
+        and intent.get("status") == "RECOVERY_REQUIRED"
+        and str(intent.get("mode") or "").upper() == "LIVE"
+        and not intent.get("filled_amount")
+        and not intent.get("exchange_order_id")
+        and str(row.get("position_type") or "").upper() == direction
+        and row.get("entry_id") == intent.get("intent_id")
+        and row.get("futures_entry_client_order_id") == intent.get("client_order_id")
+        and row.get("provisional") is True
+        and row.get("entry_price_unverified") is True
+        and observed == 0.0
+        and pending_close == 0.0
+        and _positive_float_or_none(row.get("futures_entry_requested_amount"))
+        and not row.get("futures_entry_order_id")
+        and not row.get("entry_basis_pending_closes")
+        and not row.get("accounting_pending_partials")
+        and not row.get("unpriced_external_partials")
+        and row.get("verified_flat_pending_accounting") is not True
+        and row.get("accounting_already_booked") is not True
+        and row.get("claim_release_pending") is not True
+        and row.get("claim_conflict") is not True
+    )
+
+
 def _actual_futures_entry_price(order: dict) -> float | None:
     average = _positive_float_or_none(order.get("average"))
     if average is not None:
@@ -1984,10 +2016,15 @@ class FuturesReconcileMixin:
         try:
             from core.database import (
                 _base_symbol,
+                _strict_claim_extra_object,
                 finalize_qualified_zero_fill_order_intent,
+                get_open_positions_db,
+                get_order_intent,
                 list_qualified_zero_fill_order_intents,
                 order_intent_recovery_health,
             )
+            from core.symbol_locks import close_lock
+            from bot_utils.trade_state import remove_with_restore_fields
 
             local_bases = {
                 _base_symbol(symbol)
@@ -1997,17 +2034,54 @@ class FuturesReconcileMixin:
             finalized = 0
             for item in list_qualified_zero_fill_order_intents(self.BOT_NAME):
                 base = _base_symbol(item.get("symbol"))
-                if (
-                    not base
-                    or base in open_bases
-                    or base in ambiguous_bases
-                    or base in local_bases
-                ):
+                if not base or base in open_bases or base in ambiguous_bases:
                     continue
+                released_claim = False
+                if base in local_bases:
+                    with close_lock(base, bot_name=self.BOT_NAME) as acquired:
+                        if not acquired:
+                            continue
+                        intent = get_order_intent(item["intent_id"])
+                        row = self.state.get(base)
+                        if not _unsubmitted_provisional_generation(row, intent):
+                            continue
+                        claims = [
+                            claim for claim in get_open_positions_db(self.BOT_NAME)
+                            if _base_symbol(claim.get("symbol")) == base
+                        ]
+                        if len(claims) != 1:
+                            continue
+                        claim = claims[0]
+                        extra = _strict_claim_extra_object(claim.get("extra_json"))
+                        if not (
+                            str(claim.get("state") or "").upper() == "OPEN"
+                            and isinstance(extra, dict)
+                            and extra.get("entry_id") == item["intent_id"]
+                            and extra.get("futures_entry_client_order_id")
+                            == intent.get("client_order_id")
+                            and extra.get("entry_price_unverified") is True
+                            and _finite_float_or_none(
+                                extra.get("futures_entry_observed_amount")
+                            ) == 0.0
+                            and not extra.get("futures_entry_order_id")
+                        ):
+                            continue
+                        if self._still_open_on_exchange(base, row.get("position_type")):
+                            continue
+                        if not remove_with_restore_fields(
+                            self.state,
+                            base,
+                            {"entry_aborted": True,
+                             "entry_abort_reason": "qualified zero-fill recovery"},
+                            expected_row=row,
+                        ) or self.state.has(base):
+                            continue
+                        released_claim = True
                 if finalize_qualified_zero_fill_order_intent(
                     item["intent_id"],
                     bot_name=self.BOT_NAME,
                     expected_attempt_count=item["recovery_attempt_count"],
+                    allow_released_claim=released_claim or base not in local_bases,
                 ):
                     finalized += 1
             health = order_intent_recovery_health(

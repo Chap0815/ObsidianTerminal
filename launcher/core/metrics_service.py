@@ -715,10 +715,8 @@ def get_futures_state_count(bot_name: str = None,
         )
     else:
         rows = query_db_dict("SELECT * FROM futures_state")
-    _require_verified_entry_basis(
-        keys if bot_name else [row.get("bot_name") for row in rows if row.get("bot_name")],
-        check_price=False,
-    )
+    # Counting persisted rows does not require an execution price. A separate
+    # provisional claim must not hide the counts of the other bot cards.
     return sum(1 for row in rows if is_futures_state_fresh(row))
 
 
@@ -737,7 +735,6 @@ def get_futures_state_counts(
         for key in keys:
             owners.setdefault(key, []).append(bot)
     all_keys = tuple(owners)
-    _require_verified_entry_basis(all_keys, check_price=False)
     placeholders = ",".join("?" for _ in all_keys)
     rows = query_db_dict(
         f"SELECT * FROM futures_state WHERE bot_name IN ({placeholders})",

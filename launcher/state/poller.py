@@ -374,6 +374,8 @@ class DataPoller:
             "spot_equity":    None,
             "futures_equity": None,
             "metrics_error": "",
+            "metrics_error_scope": "global",
+            "metrics_error_bots": {},
             "runtime_status": {bot: {} for bot in BOT_ORDER},
         }
         self.lock = threading.Lock()
@@ -604,6 +606,10 @@ class DataPoller:
         while self.running:
             try:
                 new_data: dict = {}
+                new_data["metrics_error_scope"] = "global"
+                new_data["metrics_error_bots"] = dict(
+                    self.cache.get("metrics_error_bots", {})
+                )
                 new_data["system"]   = get_system_stats()
                 try:
                     (
@@ -775,6 +781,23 @@ class DataPoller:
                         unr.update(
                             get_unrealized_pnl_futures_batch(futures_requests)
                         )
+                        for fut_bot in futures_requests:
+                            new_data["metrics_error_bots"].pop(fut_bot, None)
+                    except MetricsMarketDataError:
+                        cached_unrealized = self.cache.get("unrealized", {})
+                        for fut_bot, is_sim in futures_requests.items():
+                            try:
+                                unr[fut_bot] = get_unrealized_pnl_futures(
+                                    fut_bot, mode_is_sim=is_sim
+                                )
+                                new_data["metrics_error_bots"].pop(fut_bot, None)
+                            except MetricsMarketDataError as exc:
+                                new_data["metrics_error_bots"][fut_bot] = (
+                                    _safe_error_text(exc, 160)
+                                )
+                                unr[fut_bot] = cached_unrealized.get(fut_bot, 0.0)
+                        if new_data["metrics_error_bots"]:
+                            unrealized_error = "unverified position metrics"
                     except MetricsDbReadError as exc:
                         unrealized_error = _safe_error_text(exc, 160)
                         self._log_diag(
@@ -832,6 +855,11 @@ class DataPoller:
                     )
                 if unrealized_error:
                     new_data["metrics_error"] = unrealized_error
+                    if (
+                        unrealized_error == "unverified position metrics"
+                        and new_data["metrics_error_bots"]
+                    ):
+                        new_data["metrics_error_scope"] = "bot"
 
                 # Incremental read via _ErrorLogCounter  O(1) when no new errors.
                 new_data["error_count"] = self._error_counter.count()
