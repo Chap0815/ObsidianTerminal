@@ -10410,6 +10410,7 @@ def finalize_qualified_zero_fill_order_intent(
     *,
     bot_name: str,
     expected_attempt_count: int,
+    allow_released_claim: bool = False,
     now: str | None = None,
 ) -> bool:
     """Atomically finalize one proven absent LIVE order and release its generation.
@@ -10429,6 +10430,8 @@ def finalize_qualified_zero_fill_order_intent(
         or not 1 <= expected_attempt_count <= 1_000_000
     ):
         raise ValueError("expected recovery attempt count is invalid")
+    if not isinstance(allow_released_claim, bool):
+        raise ValueError("released claim flag is invalid")
     if now is None:
         now_dt = _utcnow()
         now_text = now_dt.strftime("%Y-%m-%d %H:%M:%S")
@@ -10508,26 +10511,27 @@ def finalize_qualified_zero_fill_order_intent(
                 WHERE bot_name=? AND symbol=?""",
             (validated_bot, claim_base),
         ).fetchone()
-        if claim is None:
+        released_claim = claim is None and allow_released_claim
+        if claim is None and not released_claim:
             raise ValueError("zero-fill claim is missing")
-        claim_extra = _strict_claim_extra_object(claim["extra_json"])
-        if claim_extra is None:
-            raise ValueError("zero-fill claim metadata is invalid")
-        claim_amount = _required_finite_float_db(
-            claim["amount"], "zero-fill claim amount", minimum=0.0
-        )
-        claim_invested = _required_finite_float_db(
-            claim["invested_usdt"], "zero-fill claim invested", minimum=0.0
-        )
-        if not (
-            str(claim["state"]).strip().upper() == "CLAIMING"
-            and claim_amount == 0.0
-            and claim_invested == 0.0
-            and isinstance(claim_extra, dict)
-            and claim_extra.get("entry_id") == validated_intent
-            and str(claim["position_type"]).strip().upper() == direction
-        ):
-            raise ValueError("zero-fill claim generation does not match intent")
+        if claim is not None:
+            claim_extra = _strict_claim_extra_object(claim["extra_json"])
+            if claim_extra is None:
+                raise ValueError("zero-fill claim metadata is invalid")
+            claim_amount = _required_finite_float_db(
+                claim["amount"], "zero-fill claim amount", minimum=0.0
+            )
+            claim_invested = _required_finite_float_db(
+                claim["invested_usdt"], "zero-fill claim invested", minimum=0.0
+            )
+            if not (
+                str(claim["state"]).strip().upper() == "CLAIMING"
+                and claim_amount == 0.0
+                and claim_invested == 0.0
+                and claim_extra.get("entry_id") == validated_intent
+                and str(claim["position_type"]).strip().upper() == direction
+            ):
+                raise ValueError("zero-fill claim generation does not match intent")
         reservation = conn.execute(
             """SELECT bot_name, symbol, notional_usdt, mode, status
                  FROM portfolio_reservations WHERE intent_id=?""",
@@ -10544,7 +10548,8 @@ def finalize_qualified_zero_fill_order_intent(
             reservation["bot_name"] == validated_bot
             and _base_symbol(reservation["symbol"]) == claim_base
             and str(reservation["mode"]).strip().upper() == "LIVE"
-            and str(reservation["status"]).strip().upper() == "ACTIVE"
+            and str(reservation["status"]).strip().upper()
+            == ("RELEASED" if released_claim else "ACTIVE")
             and reserved_notional > 0.0
         ):
             raise ValueError("zero-fill reservation does not match intent")
@@ -10566,21 +10571,22 @@ def finalize_qualified_zero_fill_order_intent(
         )
         if finalized.rowcount != 1:
             raise ValueError("zero-fill intent finalization lost generation")
-        released = conn.execute(
-            """UPDATE portfolio_reservations SET status='RELEASED'
-                WHERE intent_id=? AND bot_name=? AND status='ACTIVE'""",
-            (validated_intent, validated_bot),
-        )
-        if released.rowcount != 1:
-            raise ValueError("zero-fill reservation release lost generation")
-        deleted = conn.execute(
-            """DELETE FROM bot_open_positions
-                WHERE bot_name=? AND symbol=? AND state='CLAIMING'
-                  AND amount=0 AND invested_usdt=0""",
-            (validated_bot, claim_base),
-        )
-        if deleted.rowcount != 1:
-            raise ValueError("zero-fill claim release lost generation")
+        if not released_claim:
+            released = conn.execute(
+                """UPDATE portfolio_reservations SET status='RELEASED'
+                    WHERE intent_id=? AND bot_name=? AND status='ACTIVE'""",
+                (validated_intent, validated_bot),
+            )
+            if released.rowcount != 1:
+                raise ValueError("zero-fill reservation release lost generation")
+            deleted = conn.execute(
+                """DELETE FROM bot_open_positions
+                    WHERE bot_name=? AND symbol=? AND state='CLAIMING'
+                      AND amount=0 AND invested_usdt=0""",
+                (validated_bot, claim_base),
+            )
+            if deleted.rowcount != 1:
+                raise ValueError("zero-fill claim release lost generation")
         resolved = conn.execute(
             """UPDATE order_intent_zero_fill_quorum
                   SET resolved_at=?, updated_at=?

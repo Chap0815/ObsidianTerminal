@@ -4827,10 +4827,17 @@ class ObsidianApp(ctk.CTk):
                 card["restart_hint"].configure(text="")
 
             metrics_error = str(cache.get("metrics_error") or "").strip()
+            if cache.get("metrics_error_scope") == "bot":
+                metrics_error = str(
+                    (cache.get("metrics_error_bots") or {}).get(bot) or ""
+                ).strip()
             stats = cache.get("stats", {}).get(bot, {"pnl": 0, "total": 0, "wr": 0,
                                                           "today_pnl": 0, "today_cnt": 0})
             if metrics_error:
-                card["pnl_var"].set("DB ERR")
+                card["pnl_var"].set(
+                    "STATE ERR" if "unverified" in metrics_error.lower()
+                    else "DB ERR"
+                )
                 card["pnl_lbl"].configure(text_color=COLORS["warning"])
                 card["total_var"].set("--")
                 card["today_var"].set("--")
@@ -4870,7 +4877,10 @@ class ObsidianApp(ctk.CTk):
                 if metrics_error:
                     card["payoff_var"].set("")
                     card["payoff_lbl"].configure(text_color=COLORS["warning"])
-                    card["payoff_detail"].set("DB read failed")
+                    card["payoff_detail"].set(
+                        "State unverified" if "unverified" in metrics_error.lower()
+                        else "DB read failed"
+                    )
                 elif stats["total"] > 0 and avg_loss == 0:
                     card["payoff_var"].set("N/A")
                     card["payoff_lbl"].configure(text_color=COLORS["text_dim"])
@@ -5238,7 +5248,7 @@ class ObsidianApp(ctk.CTk):
             self.gpu_name_lbl.configure(text="")
 
         # Connections
-        if metrics_error:
+        if metrics_error and cache.get("metrics_error_scope") != "bot":
             self.sb_db.set("Read error")
             self.sb_db._lbl.configure(text_color=COLORS["warning"])
         elif os.path.exists(DB_PATH):
@@ -5249,7 +5259,7 @@ class ObsidianApp(ctk.CTk):
             self.sb_db._lbl.configure(text_color=COLORS["danger"])
 
         ex = cache.get("exchange") or {"active": False, "label": ""}
-        if metrics_error:
+        if metrics_error and cache.get("metrics_error_scope") != "bot":
             self.sb_exchange.set("DB Error")
             self.sb_exchange._lbl.configure(text_color=COLORS["warning"])
         else:

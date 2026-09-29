@@ -1,6 +1,6 @@
 {
-  "build_id": "1d7908d93277a0ae",
-  "created_at": "2026-09-27 08:51:36",
+  "build_id": "46895419650f375d",
+  "created_at": "2026-09-29 14:00:34",
   "source": "update_deploy_manifest.py",
   "file_count": 223,
   "files": [
@@ -106,8 +106,8 @@
     },
     {
       "path": "bot_utils/futures_order.py",
-      "sha256": "75d032ae7b906a7a9d0f8acb99c6b8f0e7ac3a7fbf583cf0a2a07d92a7b2a1bc",
-      "bytes": 109282
+      "sha256": "a41d955cadccec3e29de78639d523d75f456624c2daf7e76abbe86abd3fd7621",
+      "bytes": 109882
     },
     {
       "path": "bot_utils/indicators.py",
@@ -296,8 +296,8 @@
     },
     {
       "path": "core/database.py",
-      "sha256": "2a2cdc01b3c78aa29f3b10e902c17d7115ef12d3501ca306c057fd9dd5f80486",
-      "bytes": 552186
+      "sha256": "f40c8faf4a4973e553172ad7061489590046b122c462740669cb52ff31812435",
+      "bytes": 552614
     },
     {
       "path": "core/event_bus.py",
@@ -316,8 +316,8 @@
     },
     {
       "path": "core/futures_bot_reconcile.py",
-      "sha256": "f3eb0ca6f008642b77a65c541408dd93ba6edfa0b5d6928fca9a4a912558b37d",
-      "bytes": 166561
+      "sha256": "26676ba42d5c61823b853f75e0bee05754cc113c6ab290f69688bb129cdf2b53",
+      "bytes": 170628
     },
     {
       "path": "core/futures_bot_scan.py",
@@ -446,8 +446,8 @@
     },
     {
       "path": "launcher/core/metrics_service.py",
-      "sha256": "0523b121915252ff04fb0f19b572cea2ba0477487b344040410d6d538427e65d",
-      "bytes": 48929
+      "sha256": "4ab592603ad8e3f91ca06fc251564b8c944bcfcc85d8eb902e71790ff9e8809b",
+      "bytes": 48857
     },
     {
       "path": "launcher/core/positions.py",
@@ -481,8 +481,8 @@
     },
     {
       "path": "launcher/state/poller.py",
-      "sha256": "f6383f21bf0cbd02eade7f98a39f72a067b7cabae3bc5b8b8ac1d0bdc7b57bfd",
-      "bytes": 66130
+      "sha256": "ea593d8c8c8062b797819b17247838da73e0af7ee5fed0d90015223a3aa17e77",
+      "bytes": 67733
     },
     {
       "path": "launcher/supervisor.py",
@@ -501,8 +501,8 @@
     },
     {
       "path": "launcher/ui/app.py",
-      "sha256": "a38f2f3be60bd6b2bc31553e7d75da9deb524503747b6fcf7537afcea254574c",
-      "bytes": 249402
+      "sha256": "baff15753dcd8cf98a943703edb7b173a73a3b887d67bedcb1b0b7a6edb11b3e",
+      "bytes": 249941
     },
     {
       "path": "launcher/ui/cadence.py",
