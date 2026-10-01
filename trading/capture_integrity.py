@@ -55,7 +55,9 @@ SEAL_GRACE = timedelta(hours=1)
 GAP_EXCLUSION_BUFFER = timedelta(minutes=2)
 DAY_MAX_SINGLE_OUTAGE = timedelta(minutes=45)
 DAY_MAX_TOTAL_OUTAGE = timedelta(hours=1)
-DAY_MAX_OUTAGE_EPISODES = 6
+LEGACY_DAY_MAX_OUTAGE_EPISODES = 6
+DAY_MAX_OUTAGE_EPISODES = 36
+DAY_MAX_EXCLUDED_OUTAGE = timedelta(hours=3)
 CONTINUITY_WINDOW_DAYS = 30
 CONTINUITY_MAX_DEGRADED_RATIO = 0.20
 INTEGRITY_REPORT_MAX_BYTES = 4 * 1024 * 1024
@@ -370,10 +372,15 @@ def _availability_summary(
         (window["end"] - window["start"]).total_seconds()
         for window in raw_windows
     )
+    excluded_seconds = sum(
+        (window["end"] - window["start"]).total_seconds()
+        for window in exclusions
+    )
     within_daily_budget = (
         maximum_gap_seconds <= DAY_MAX_SINGLE_OUTAGE.total_seconds()
         and total_gap_seconds <= DAY_MAX_TOTAL_OUTAGE.total_seconds()
         and len(raw_windows) <= DAY_MAX_OUTAGE_EPISODES
+        and excluded_seconds <= DAY_MAX_EXCLUDED_OUTAGE.total_seconds()
     )
     transport_changed = len(connection_epochs) > 1
     serialized_exclusions = [
@@ -395,7 +402,7 @@ def _availability_summary(
     if gaps:
         warnings.append("bounded_capture_outage_excluded")
     return {
-        "contract": "bounded_outage_exclusion_v1",
+        "contract": "bounded_outage_exclusion_v2",
         "state": (
             "degraded" if gaps or transport_changed else "complete"
         ),
@@ -405,14 +412,12 @@ def _availability_summary(
         ),
         "maximum_total_outage_seconds": DAY_MAX_TOTAL_OUTAGE.total_seconds(),
         "maximum_outage_episodes": DAY_MAX_OUTAGE_EPISODES,
+        "maximum_excluded_seconds": DAY_MAX_EXCLUDED_OUTAGE.total_seconds(),
         "outage_episodes": len(raw_windows),
         "maximum_gap_seconds": round(maximum_gap_seconds, 6),
         "total_gap_seconds": round(total_gap_seconds, 6),
         "exclusion_buffer_seconds": GAP_EXCLUSION_BUFFER.total_seconds(),
-        "excluded_seconds": round(sum(
-            (window["end"] - window["start"]).total_seconds()
-            for window in exclusions
-        ), 6),
+        "excluded_seconds": round(excluded_seconds, 6),
         "transport_connection_epochs": connection_epochs,
         "warnings": warnings,
         "exclusion_intervals": serialized_exclusions,
@@ -1802,6 +1807,13 @@ def _verify_sealed_report(
         raise RuntimeError("sealed capture sequence contract is invalid")
     if status in {"valid", "usable_with_gaps"}:
         availability = report.get("availability")
+        availability_contract = (
+            availability.get("contract")
+            if isinstance(availability, dict) else None
+        )
+        legacy_availability = (
+            availability_contract == "bounded_outage_exclusion_v1"
+        )
         availability_fields = {
             "contract",
             "state",
@@ -1818,13 +1830,18 @@ def _verify_sealed_report(
             "warnings",
             "exclusion_intervals",
         }
+        if not legacy_availability:
+            availability_fields.add("maximum_excluded_seconds")
         expected_availability_state = (
             "complete" if status == "valid" else "degraded"
         )
         if (
             not isinstance(availability, dict)
             or set(availability) != availability_fields
-            or availability.get("contract") != "bounded_outage_exclusion_v1"
+            or availability_contract not in {
+                "bounded_outage_exclusion_v1",
+                "bounded_outage_exclusion_v2",
+            }
             or availability.get("state") != expected_availability_state
             or availability.get("within_daily_budget") is not True
             or not isinstance(availability.get("exclusion_intervals"), list)
@@ -1843,6 +1860,14 @@ def _verify_sealed_report(
             ),
             "exclusion_buffer_seconds": GAP_EXCLUSION_BUFFER.total_seconds(),
         }
+        if not legacy_availability:
+            expected_policy_seconds["maximum_excluded_seconds"] = (
+                DAY_MAX_EXCLUDED_OUTAGE.total_seconds()
+            )
+        maximum_episodes = (
+            LEGACY_DAY_MAX_OUTAGE_EPISODES
+            if legacy_availability else DAY_MAX_OUTAGE_EPISODES
+        )
         if any(
             type(availability.get(field)) not in {int, float}
             or not math.isfinite(float(availability[field]))
@@ -1851,7 +1876,7 @@ def _verify_sealed_report(
         ) or (
             type(availability.get("maximum_outage_episodes")) is not int
             or availability["maximum_outage_episodes"]
-            != DAY_MAX_OUTAGE_EPISODES
+            != maximum_episodes
         ):
             raise RuntimeError("sealed capture availability is invalid")
         try:
@@ -1922,6 +1947,11 @@ def _verify_sealed_report(
                 or not math.isfinite(float(excluded_seconds))
                 or float(excluded_seconds)
                 != round(total_excluded_seconds, 6)
+                or (
+                    not legacy_availability
+                    and float(excluded_seconds)
+                    > DAY_MAX_EXCLUDED_OUTAGE.total_seconds()
+                )
             ):
                 raise ValueError("excluded duration is invalid")
             outage_episodes = availability.get("outage_episodes")
@@ -1930,7 +1960,7 @@ def _verify_sealed_report(
             if (
                 type(outage_episodes) is not int
                 or outage_episodes < 0
-                or outage_episodes > DAY_MAX_OUTAGE_EPISODES
+                or outage_episodes > maximum_episodes
                 or type(maximum_gap_seconds) not in {int, float}
                 or type(total_gap_seconds) not in {int, float}
                 or not math.isfinite(float(maximum_gap_seconds))
