@@ -1,6 +1,6 @@
 {
-  "build_id": "46895419650f375d",
-  "created_at": "2026-09-29 14:00:34",
+  "build_id": "e1fb0e17facede22",
+  "created_at": "2026-10-01 16:55:59",
   "source": "update_deploy_manifest.py",
   "file_count": 223,
   "files": [
@@ -866,8 +866,8 @@
     },
     {
       "path": "trading/capture_integrity.py",
-      "sha256": "1c87bacc6ee46bb7239a75f387ea0b5f2de8523785b5b3834fde6b7182a205c8",
-      "bytes": 92409
+      "sha256": "9d4c5f1469c00c4227724349d5d0644ea9ab530e621a7f5e046d206cf17a1958",
+      "bytes": 93593
     },
     {
       "path": "trading/capture_replay_validation.py",
@@ -1046,8 +1046,8 @@
     },
     {
       "path": "trading/research_experiment_suite.py",
-      "sha256": "988a26642f316c81cb91894d4695b4904698f62acab11216deaec68bc6947e6d",
-      "bytes": 191668
+      "sha256": "98addd00fc1a96f2eecca79a93b554638f636dfa2718bb39d2b6dbe07da49fe2",
+      "bytes": 191748
     },
     {
       "path": "trading/risk_manager.py",

@@ -1644,8 +1644,10 @@ def _verified_carry_capture_scope(venue_root: Path) -> dict | None:
             availability = report.get("availability")
             if (
                 not isinstance(availability, dict)
-                or availability.get("contract")
-                != "bounded_outage_exclusion_v1"
+                or availability.get("contract") not in {
+                    "bounded_outage_exclusion_v1",
+                    "bounded_outage_exclusion_v2",
+                }
                 or availability.get("within_daily_budget") is not True
                 or not isinstance(
                     availability.get("exclusion_intervals"), list
