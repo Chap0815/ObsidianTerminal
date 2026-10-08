@@ -483,6 +483,9 @@ from core.runtime_status import _read_json, read_runtime_status
 from launcher.core.system_monitor import HAS_PSUTIL
 from launcher.state.poller import DataPoller, _runtime_status_is_fresh
 from launcher.ui.components.widgets import (
+    safe_geometry,
+    keyboard_button,
+    AdaptiveActionRow,
     BadHoursRow,
     MiniBar,
     ParamRow,
@@ -912,7 +915,7 @@ class ObsidianApp(ctk.CTk):
             is_visible = self._visible[bot]
             # Short labels keep all five filters usable on laptop screens.
             label_text = meta['label'].title()
-            pill = ctk.CTkButton(
+            pill = keyboard_button(
                 inner_pills, text=label_text,
                 width=108 if bot == "FUTREND" else 84, height=32, corner_radius=6,
                 font=ctk.CTkFont(FONT_BODY, 11, "bold"),
@@ -935,7 +938,7 @@ class ObsidianApp(ctk.CTk):
             )
 
         # Open Dashboard (rechts)
-        dash_btn = ctk.CTkButton(
+        dash_btn = keyboard_button(
             bar, text="Open Dashboard",
             width=144, height=34, corner_radius=8,
             font=ctk.CTkFont(FONT_BODY, 12, "bold"),
@@ -1020,9 +1023,9 @@ class ObsidianApp(ctk.CTk):
             "Total equity across all live wallets:\n"
             "  free USDT  +  margin in open positions  +  unrealized PnL\n\n"
             "This is the REAL number  what the exchange shows as your\n"
-            "wallet balance. Read live every 15 s, never from the local DB.\n"
-            "If a coin's price is unreachable it's silently excluded from\n"
-            "the total rather than showing a wrong number.",
+            "wallet balance. Refreshed live every 30 s.\n"
+            "If a required coin price is unavailable, the total is unknown\n"
+            "until a complete wallet snapshot is available.",
             delay_ms=500
         )
         # Separate spot/futures wallet rows. Shown only when both wallet types
@@ -1060,7 +1063,7 @@ class ObsidianApp(ctk.CTk):
         sim_header_row.pack(fill="x", pady=0)
 
         # Create the button first and pack it on the right.
-        self.sb_reset_btn = ctk.CTkButton(
+        self.sb_reset_btn = keyboard_button(
             sim_header_row, text="", width=20, height=20, corner_radius=4,
             font=ctk.CTkFont(FONT_BODY, 12, "bold"),
             fg_color="transparent", hover_color=COLORS["panel_hover"],
@@ -1124,7 +1127,7 @@ class ObsidianApp(ctk.CTk):
                                           text_color=COLORS["text_dim"], anchor="w")
         self.sb_llm_model.pack(fill="x", pady=(2, 2))
 
-        ctk.CTkButton(_c, text="Change Model", height=22, corner_radius=4,
+        keyboard_button(_c, text="Change Model", height=22, corner_radius=4,
                        font=ctk.CTkFont(FONT_BODY, 9, "bold"),
                        fg_color="transparent", hover_color=COLORS["panel_hover"],
                        text_color=COLORS["text_muted"],
@@ -1172,7 +1175,7 @@ class ObsidianApp(ctk.CTk):
         tools_box = ctk.CTkFrame(_c, fg_color="transparent")
         tools_box.pack(fill="x", pady=(0, 2))
 
-        bt_btn = ctk.CTkButton(
+        bt_btn = keyboard_button(
             tools_box, text=" Run Backtest", height=26, corner_radius=5,
             font=ctk.CTkFont(FONT_BODY, 10, "bold"),
             fg_color=COLORS["bg"], hover_color=COLORS["panel_hover"],
@@ -1188,7 +1191,7 @@ class ObsidianApp(ctk.CTk):
             delay_ms=400
         )
 
-        opt_btn = ctk.CTkButton(
+        opt_btn = keyboard_button(
             tools_box, text=" Optimize Parameters", height=26, corner_radius=5,
             font=ctk.CTkFont(FONT_BODY, 10, "bold"),
             fg_color=COLORS["bg"], hover_color=COLORS["panel_hover"],
@@ -1204,7 +1207,7 @@ class ObsidianApp(ctk.CTk):
             delay_ms=400
         )
 
-        heatmap_btn = ctk.CTkButton(
+        heatmap_btn = keyboard_button(
             tools_box, text=" Win/Loss Heatmap", height=26, corner_radius=5,
             font=ctk.CTkFont(FONT_BODY, 10, "bold"),
             fg_color=COLORS["bg"], hover_color=COLORS["panel_hover"],
@@ -1220,7 +1223,7 @@ class ObsidianApp(ctk.CTk):
             delay_ms=400
         )
 
-        selftest_btn = ctk.CTkButton(
+        selftest_btn = keyboard_button(
             tools_box, text=" Run Self-Test", height=26, corner_radius=5,
             font=ctk.CTkFont(FONT_BODY, 10, "bold"),
             fg_color=COLORS["bg"], hover_color=COLORS["panel_hover"],
@@ -1237,7 +1240,7 @@ class ObsidianApp(ctk.CTk):
             delay_ms=400
         )
 
-        env_btn = ctk.CTkButton(
+        env_btn = keyboard_button(
             tools_box, text=" Env Settings (.env)", height=26, corner_radius=5,
             font=ctk.CTkFont(FONT_BODY, 10, "bold"),
             fg_color=COLORS["bg"], hover_color=COLORS["panel_hover"],
@@ -1560,7 +1563,7 @@ class ObsidianApp(ctk.CTk):
 
         prompt_btn = None
         if meta.get("uses_llm", True):
-            prompt_btn = ctk.CTkButton(
+            prompt_btn = keyboard_button(
                 action_frame, text="Prompt",
                 width=76, height=30, corner_radius=6,
                 font=ctk.CTkFont(FONT_BODY, 11, "bold"),
@@ -1579,7 +1582,7 @@ class ObsidianApp(ctk.CTk):
             )
 
         if name == "CROSS":
-            reb = ctk.CTkButton(
+            reb = keyboard_button(
                 action_frame, text="Rebalance",
                 width=90, height=30, corner_radius=6,
                 font=ctk.CTkFont(FONT_BODY, 11, "bold"),
@@ -1599,7 +1602,7 @@ class ObsidianApp(ctk.CTk):
 
         emerg = None
         if is_futures:
-            emerg = ctk.CTkButton(
+            emerg = keyboard_button(
                 action_frame, text="Close & Stop",
                 width=108, height=30, corner_radius=6,
                 font=ctk.CTkFont(FONT_BODY, 11, "bold"),
@@ -1622,7 +1625,7 @@ class ObsidianApp(ctk.CTk):
 
         # SIM/LIVE Badge  cyan im SIM-Mode wie React-Mockup
         is_sim = self.config[name].get("SIMULATION", True)
-        sim_btn = ctk.CTkButton(
+        sim_btn = keyboard_button(
             head, text="SIM" if is_sim else "LIVE",
             width=68, height=30, corner_radius=6,
             font=ctk.CTkFont(FONT_BODY, 12, "bold"),
@@ -1740,8 +1743,8 @@ class ObsidianApp(ctk.CTk):
                       text_color=COLORS["text_subtle"], height=12
                       ).pack()
         attach_tooltip(payoff_lbl,
-                        "Payoff-Faktor = -Gewinn / |-Verlust|.\n"
-                        "Grn = positiver Erwartungswert bei aktueller Win-Rate,\n"
+                        "Payoff-Faktor = ØGewinn / |ØVerlust|.\n"
+                        "Grün = positiver Erwartungswert bei aktueller Win-Rate,\n"
                         "Gelb = grenzwertig, Rot = negativer Erwartungswert.\n"
                         "N/A = no losing trade sample; normalized expectancy unavailable.\n"
                         "Faustregel: bei 67% WR brauchst du  ~0.49.",
@@ -1805,7 +1808,7 @@ class ObsidianApp(ctk.CTk):
             value=("> PARAMETERS" if collapsed_flag["value"]
                    else "v PARAMETERS")
         )
-        chevron_lbl = ctk.CTkButton(
+        chevron_lbl = keyboard_button(
             param_header, textvariable=chevron_var,
             width=122, height=28, corner_radius=5,
             font=ctk.CTkFont(self.display_font, 11, "bold"),
@@ -1819,7 +1822,7 @@ class ObsidianApp(ctk.CTk):
                                     text_color=COLORS["warning"])
         unsaved_lbl.pack(side="left", padx=(10, 0))
 
-        ctk.CTkButton(param_header, text=" Default",
+        keyboard_button(param_header, text=" Default",
                        width=72, height=22, corner_radius=5,
                        font=ctk.CTkFont(FONT_BODY, 9, "bold"),
                        fg_color="transparent", hover_color=COLORS["panel_hover"],
@@ -1828,7 +1831,7 @@ class ObsidianApp(ctk.CTk):
                        command=lambda n=name: self._reset_params(n)
                        ).pack(side="right", padx=(4, 0))
 
-        save_btn = ctk.CTkButton(
+        save_btn = keyboard_button(
             param_header, text=" Save",
             width=72, height=28, corner_radius=5,
             font=ctk.CTkFont(FONT_BODY, 11, "bold"),
@@ -1934,7 +1937,7 @@ class ObsidianApp(ctk.CTk):
         btn_row = ctk.CTkFrame(actions, fg_color="transparent")
         btn_row.pack(fill="both", expand=True)
 
-        start_btn = ctk.CTkButton(
+        start_btn = keyboard_button(
             btn_row, text="Start", height=32, corner_radius=6,
             font=ctk.CTkFont(FONT_BODY, 11, "bold"),
             fg_color=COLORS["success"],
@@ -1946,7 +1949,7 @@ class ObsidianApp(ctk.CTk):
         )
         start_btn.pack(side="left", fill="both", expand=True, padx=(0, 3))
 
-        restart_btn = ctk.CTkButton(
+        restart_btn = keyboard_button(
             btn_row, text="Restart", height=32, corner_radius=6,
             font=ctk.CTkFont(FONT_BODY, 11, "bold"),
             fg_color="transparent",
@@ -1957,7 +1960,7 @@ class ObsidianApp(ctk.CTk):
         )
         restart_btn.pack(side="left", fill="both", expand=True, padx=3)
 
-        stop_btn = ctk.CTkButton(
+        stop_btn = keyboard_button(
             btn_row, text="Stop", height=32, corner_radius=6,
             font=ctk.CTkFont(FONT_BODY, 11, "bold"),
             fg_color="transparent",
@@ -1990,7 +1993,7 @@ class ObsidianApp(ctk.CTk):
                       text_color=COLORS["text_muted"]
                       ).pack(side="left")
 
-        log_expand_btn = ctk.CTkButton(
+        log_expand_btn = keyboard_button(
             log_head, text="Expand", width=68, height=22, corner_radius=4,
             font=ctk.CTkFont(FONT_BODY, 11, "bold"),
             fg_color="transparent", hover_color=COLORS["panel_hover"],
@@ -2031,7 +2034,7 @@ class ObsidianApp(ctk.CTk):
             delay_ms=400,
         )
 
-        ctk.CTkButton(log_head, text="Clear", width=58, height=22,
+        keyboard_button(log_head, text="Clear", width=58, height=22,
                        font=ctk.CTkFont(FONT_BODY, 11, "bold"),
                        fg_color="transparent", hover_color=COLORS["panel_hover"],
                        text_color=COLORS["text_muted"],
@@ -2385,7 +2388,7 @@ class ObsidianApp(ctk.CTk):
         right = ctk.CTkFrame(bar, fg_color="transparent")
         right.pack(side="right", padx=22, pady=6)
 
-        self.update_button = ctk.CTkButton(
+        self.update_button = keyboard_button(
             right,
             text="Update",
             width=82,
@@ -2424,23 +2427,15 @@ class ObsidianApp(ctk.CTk):
                         lbl.configure(text_color="#2ecc8b")
                 self.status_text.set("No bots active")
             else:
-                mode_cache = {}
-                try:
-                    mode_cache = (self.poller.get_all() or {}).get("mode_is_sim") or {}
-                except Exception:
-                    mode_cache = {}
-
-                def _running_bot_is_sim(bot: str) -> bool:
+                def _running_bot_is_sim(bot: str) -> bool | None:
                     rs = external.get(bot)
-                    runtime_sim = _runtime_simulation_flag(rs)
-                    if runtime_sim is not None:
-                        return runtime_sim
-                    if bot in mode_cache:
-                        return bool(mode_cache[bot])
-                    return bool(self.config.get(bot, {}).get("SIMULATION", True))
+                    if rs is not None:
+                        return (_runtime_simulation_flag(rs)
+                                if _runtime_status_is_fresh(rs) else None)
+                    return self._runtime_sim_for_running_bot(bot)
 
-                # Prfen, ob IRGENDEIN laufender Bot im LIVE-Modus ist
-                any_live = any(not _running_bot_is_sim(b) for b in active)
+                runtime_modes = [_running_bot_is_sim(b) for b in active]
+                any_live = any(mode is False for mode in runtime_modes)
 
                 if any_live:
                     # Mindestens einer ist Live  orange Warnung
@@ -2450,7 +2445,7 @@ class ObsidianApp(ctk.CTk):
                     for lbl in self.status_badge.winfo_children():
                         if isinstance(lbl, ctk.CTkLabel):
                             lbl.configure(text_color="#fbbf24")
-                else:
+                elif all(mode is True for mode in runtime_modes):
                     # Alle laufenden Bots sind in Simulation  entspanntes Cyan
                     self.status_badge_text.set("Sim")
                     self.status_badge.configure(fg_color="#0c2a3a",
@@ -2458,6 +2453,13 @@ class ObsidianApp(ctk.CTk):
                     for lbl in self.status_badge.winfo_children():
                         if isinstance(lbl, ctk.CTkLabel):
                             lbl.configure(text_color="#22d3ee")
+                else:
+                    self.status_badge_text.set("Unknown")
+                    self.status_badge.configure(fg_color=COLORS["panel"],
+                                                border_color=COLORS["warning"])
+                    for lbl in self.status_badge.winfo_children():
+                        if isinstance(lbl, ctk.CTkLabel):
+                            lbl.configure(text_color=COLORS["warning"])
 
                 bot_names = ", ".join(active)
                 suffix = f" ({len(external)} external)" if external else ""
@@ -2628,29 +2630,36 @@ class ObsidianApp(ctk.CTk):
         if not new_sim:
             dlg = ctk.CTkToplevel(self)
             dlg.title("Switch to LIVE Trading")
-            dlg.geometry("480x280" if is_futures else "460x240")
+            safe_geometry(dlg, 480 if is_futures else 460,
+                          280 if is_futures else 240, parent=self)
             dlg.configure(fg_color=COLORS["panel"])
             dlg.grab_set()
             dlg.transient(self)
             force_dark_titlebar(dlg)
 
-            ctk.CTkLabel(dlg, text="!",
+            row = AdaptiveActionRow(dlg, fg_color="transparent")
+            row.pack(side="bottom", fill="x", padx=12, pady=8)
+            body = ctk.CTkScrollableFrame(dlg, fg_color="transparent",
+                                          scrollbar_button_color=COLORS["border"])
+            body.pack(fill="both", expand=True, padx=8, pady=4)
+
+            ctk.CTkLabel(body, text="!",
                           font=ctk.CTkFont(self.mono_font, 36, "bold"),
                           text_color=COLORS["danger"]
                           ).pack(pady=(20, 4))
-            ctk.CTkLabel(dlg, text="Switch to LIVE Trading?",
+            ctk.CTkLabel(body, text="Switch to LIVE Trading?",
                           font=ctk.CTkFont(FONT_BODY, 14, "bold"),
                           text_color=COLORS["text"]
                           ).pack()
 
             if is_futures:
-                lev = int(self.config[bot_name].get("LEVERAGE", 3))
+                lev = _ui_finite_float(self.config[bot_name].get("LEVERAGE", 1))
                 warn_text = (
-                    f"Real money on FUTURES with {lev} leverage.\n"
-                    f"Liquidation possible. At {lev} a ~{int(100/lev)}% move\n"
-                    f"against you wipes the margin.\n\n"
-                    f"Liquidation safety buffer will close BEFORE liquidation,\n"
-                    f"but does not eliminate risk."
+                    f"Real money on FUTURES with {lev:g}x effective leverage.\n"
+                    f"Margin and liquidation depend on the venue and account.\n\n"
+                    f"Local protective exits require a running bot, fresh prices\n"
+                    f"and successful exchange requests. They cannot guarantee\n"
+                    f"an exit before liquidation or at the configured price."
                 )
             else:
                 warn_text = (
@@ -2659,25 +2668,23 @@ class ObsidianApp(ctk.CTk):
                     f"and you understand the risks."
                 )
 
-            ctk.CTkLabel(dlg, text=warn_text,
+            ctk.CTkLabel(body, text=warn_text,
                           font=ctk.CTkFont(FONT_BODY, 11, "bold"),
-                          text_color=COLORS["text_dim"], justify="center"
+                          text_color=COLORS["text_dim"], justify="center", wraplength=300
                           ).pack(pady=(8, 16))
 
-            row = ctk.CTkFrame(dlg, fg_color="transparent")
-            row.pack()
 
             def _confirm():
                 dlg.destroy()
                 self._apply_simulation(bot_name, False, card)
 
-            ctk.CTkButton(row, text="Yes, go LIVE",
+            keyboard_button(row, text="Yes, go LIVE",
                            fg_color=COLORS["danger"], hover_color="#dc2626",
                            text_color="#ffffff", width=140, height=34, corner_radius=8,
                            font=ctk.CTkFont(FONT_BODY, 12, "bold"),
                            command=_confirm
                            ).pack(side="left", padx=6)
-            ctk.CTkButton(row, text="Cancel",
+            keyboard_button(row, text="Cancel",
                            fg_color="transparent", hover_color=COLORS["panel_hover"],
                            text_color=COLORS["text_dim"], width=110, height=34, corner_radius=8,
                            font=ctk.CTkFont(FONT_BODY, 11, "bold"),
@@ -2924,7 +2931,7 @@ class ObsidianApp(ctk.CTk):
                 f"http://127.0.0.1:{port}/_stcore/health",
                 timeout=0.35,
             )
-            return response.status_code < 500
+            return response.status_code == 200
         except Exception:
             return False
 
@@ -2942,46 +2949,9 @@ class ObsidianApp(ctk.CTk):
 
     @staticmethod
     def _dashboard_process_is_current_root(parts, cwd) -> bool:
-        try:
-            tokens = [
-                str(part).strip().strip('"').replace("\\", "/").lower()
-                for part in (parts or [])
-            ]
-            cwd_text = str(cwd or "").replace("\\", "/").rstrip("/").lower()
-        except Exception:
-            return False
-        root_text = str(PROJECT_ROOT).replace("\\", "/").rstrip("/").lower()
-        script = f"{root_text}/tools/dashboard.py"
-        if not tokens:
-            return False
-        executable_name = tokens[0].rsplit("/", 1)[-1]
-        if not re.fullmatch(
-            r"(?:python(?:w|\d+(?:\.\d+)*)?|pypy\d*|py)(?:\.exe)?",
-            executable_name,
-        ):
-            return False
-        index = 1
-        while index < len(tokens):
-            token = tokens[index]
-            if token == "-m":
-                if (
-                    index + 3 >= len(tokens)
-                    or tokens[index + 1] != "streamlit"
-                    or tokens[index + 2] != "run"
-                ):
-                    return False
-                dashboard_script = tokens[index + 3]
-                return dashboard_script == script or (
-                    dashboard_script == "tools/dashboard.py"
-                    and cwd_text == root_text
-                )
-            if token in {"-c", "--"}:
-                return False
-            if token.startswith("-"):
-                index += 2 if token in {"-W", "-X"} else 1
-                continue
-            return False
-        return False
+        from core.process_identity import dashboard_process_scope
+
+        return dashboard_process_scope(parts, PROJECT_ROOT, cwd) == "root"
 
     @staticmethod
     def _running_dashboard_processes() -> list[dict[str, int | float]]:
@@ -3210,7 +3180,7 @@ class ObsidianApp(ctk.CTk):
             return
         try:
             response = _req.get(f"{url}/_stcore/health", timeout=0.6)
-            if response.status_code < 500:
+            if response.status_code == 200:
                 webbrowser.open(url)
                 return
         except Exception:
@@ -3429,7 +3399,7 @@ class ObsidianApp(ctk.CTk):
                 elif reason == "repo_missing":
                     msg = "Update-System nicht konfiguriert."
                 elif reason == "remote_unreachable":
-                    msg = "Update-Check nicht erreichbar. Pruefe SSH-Key/GitHub-Zugriff."
+                    msg = "Update-Check nicht erreichbar. Pruefe Netzwerk, Proxy und GitHub-Zugriff."
                 elif reason == "check_failed":
                     detail = str(data.get("message") or "").strip()
                     msg = "Update-Check fehlgeschlagen" + (f": {detail[:180]}" if detail else ".")
@@ -3783,6 +3753,13 @@ class ObsidianApp(ctk.CTk):
                         self._ollama_switch_generation == generation
                         and self._ollama_switch_desired == model
                     ):
+                        # Retire admission under the quiescence lock. A new
+                        # request after unlock must acquire its own worker.
+                        owner_state["done"].set()
+                        if self._ollama_switch_state is owner_state:
+                            self._ollama_switch_state = None
+                            if self._ollama_switch_thread is owner_state.get("thread"):
+                                self._ollama_switch_thread = None
                         return
         finally:
             with self._ollama_switch_lock:
@@ -3951,8 +3928,8 @@ class ObsidianApp(ctk.CTk):
     def _show_model_selector(self):
         dlg = ctk.CTkToplevel(self)
         dlg.title("Select LLM Model")
-        dlg.geometry("480x600")
-        dlg.minsize(480, 560)
+        width, height = safe_geometry(dlg, 480, 600, parent=self)
+        dlg.minsize(min(480, width), min(560, height))
         dlg.configure(fg_color=COLORS["panel"])
         dlg.grab_set()
         dlg.transient(self)
@@ -3962,8 +3939,11 @@ class ObsidianApp(ctk.CTk):
         # are always visible even when the radio-button list is dynamically
         # inserted above them by the background model-fetch thread.
         # (Old: packed last  130px ScrollableFrame pushed btn_row off-screen)
-        btn_row = ctk.CTkFrame(dlg, fg_color="transparent")
+        btn_row = AdaptiveActionRow(dlg, fg_color="transparent")
         btn_row.pack(side="bottom", fill="x", padx=24, pady=16)
+        body = ctk.CTkScrollableFrame(dlg, fg_color="transparent",
+                                      scrollbar_button_color=COLORS["border"])
+        body.pack(fill="both", expand=True, padx=8, pady=4)
 
         def _apply():
             new_model = manual_entry.get().strip() or selected_var.get()
@@ -4033,12 +4013,12 @@ class ObsidianApp(ctk.CTk):
                                 f"LLM_MODEL  {new_model} "
                                 f"(loading into VRAM)")
 
-        ctk.CTkButton(btn_row, text="Apply", height=36, corner_radius=8,
+        keyboard_button(btn_row, text="Apply", height=36, corner_radius=8,
                        font=ctk.CTkFont(FONT_BODY, 12, "bold"),
                        fg_color=COLORS["purple"], hover_color=COLORS["purple_dim"],
                        text_color="#ffffff", width=120, command=_apply
                        ).pack(side="right")
-        ctk.CTkButton(btn_row, text="Cancel", height=36, corner_radius=8,
+        keyboard_button(btn_row, text="Cancel", height=36, corner_radius=8,
                        font=ctk.CTkFont(FONT_BODY, 11, "bold"),
                        fg_color="transparent", hover_color=COLORS["panel_hover"],
                        text_color=COLORS["text_muted"],
@@ -4047,11 +4027,11 @@ class ObsidianApp(ctk.CTk):
                        ).pack(side="right", padx=(0, 8))
 
         #  Content (top-anchored, fills space above the fixed buttons) 
-        ctk.CTkLabel(dlg, text="Select LLM Model",
+        ctk.CTkLabel(body, text="Select LLM Model",
                       font=ctk.CTkFont(FONT_BODY, 14, "bold"),
                       text_color=COLORS["text"]
                       ).pack(padx=24, pady=(20, 4), anchor="w")
-        ctk.CTkLabel(dlg,
+        ctk.CTkLabel(body,
                       text="Any Ollama model that generates text works.\n"
                             "Reasoning models (deepseek-r1, qwen) give best results.",
                       font=ctk.CTkFont(FONT_BODY, 11, "bold"),
@@ -4067,7 +4047,7 @@ class ObsidianApp(ctk.CTk):
 
         # Show the currently-configured model prominently so the user can
         # tell at a glance whether their last "Apply" stuck.
-        current_box = ctk.CTkFrame(dlg, fg_color=COLORS["bg"], corner_radius=6,
+        current_box = ctk.CTkFrame(body, fg_color=COLORS["bg"], corner_radius=6,
                                      border_width=1, border_color=COLORS["border"])
         current_box.pack(fill="x", padx=24, pady=(12, 4))
         ctk.CTkLabel(current_box, text="CURRENT (from bot_config.json):",
@@ -4080,7 +4060,7 @@ class ObsidianApp(ctk.CTk):
                       ).pack(side="left", pady=8)
 
         installed = []
-        status_lbl = ctk.CTkLabel(dlg, text="Loading installed models...",
+        status_lbl = ctk.CTkLabel(body, text="Loading installed models...",
                                     font=ctk.CTkFont(FONT_BODY, 11, "bold"),
                                     text_color=COLORS["text_muted"])
         status_lbl.pack(padx=24, pady=(12, 4), anchor="w")
@@ -4095,7 +4075,7 @@ class ObsidianApp(ctk.CTk):
             if scroll_container["widget"] is not None:
                 return  # already built
             if installed:
-                scroll = ctk.CTkScrollableFrame(dlg, fg_color=COLORS["bg"], height=130,
+                scroll = ctk.CTkScrollableFrame(body, fg_color=COLORS["bg"], height=130,
                                                   scrollbar_button_color=COLORS["border"])
                 # Pack BEFORE the "Or enter model name manually" label so the
                 # visual order matches the original (radio list  divider  entry)
@@ -4159,7 +4139,7 @@ class ObsidianApp(ctk.CTk):
         # gepackten) Apply/Cancel-Buttons verankern, damit die dynamisch
         # eingefgte Modell-Liste sie nie aus dem Fenster drckt. Wegen
         # bottom-Stacking zuerst das Feld (landet unten), dann das Label.
-        manual_entry = ctk.CTkEntry(dlg, height=34, corner_radius=6,
+        manual_entry = ctk.CTkEntry(body, height=34, corner_radius=6,
                                       font=ctk.CTkFont(self.mono_font, 12),
                                       fg_color=COLORS["bg"], border_color=COLORS["border"],
                                       text_color=COLORS["text"],
@@ -4167,7 +4147,7 @@ class ObsidianApp(ctk.CTk):
         manual_entry.pack(side="bottom", fill="x", padx=24, pady=(0, 4))
         manual_entry.insert(0, current)
 
-        manual_label = ctk.CTkLabel(dlg, text="Or enter model name manually:",
+        manual_label = ctk.CTkLabel(body, text="Or enter model name manually:",
                       font=ctk.CTkFont(FONT_BODY, 11, "bold"),
                       text_color=COLORS["text_muted"])
         manual_label.pack(side="bottom", padx=24, pady=(12, 4), anchor="w")
@@ -4206,7 +4186,7 @@ class ObsidianApp(ctk.CTk):
         error_log_path = _error_log_path()
         dlg = ctk.CTkToplevel(self)
         dlg.title("Error log history")
-        dlg.geometry("780x520")
+        safe_geometry(dlg, 780, 520, parent=self)
         dlg.configure(fg_color=COLORS["panel"])
         dlg.transient(self)
         force_dark_titlebar(dlg)
@@ -4259,12 +4239,12 @@ class ObsidianApp(ctk.CTk):
 
         btns = ctk.CTkFrame(head, fg_color="transparent")
         btns.pack(side="right")
-        ctk.CTkButton(btns, text="Copy All", width=90, height=28,
+        keyboard_button(btns, text="Copy All", width=90, height=28,
                        font=ctk.CTkFont(FONT_BODY, 11, "bold"),
                        fg_color=COLORS["purple"], hover_color=COLORS["purple_dim"],
                        text_color="#ffffff", corner_radius=6, command=_copy
                        ).pack(side="left", padx=(0, 6))
-        ctk.CTkButton(btns, text="Clear Log", width=90, height=28,
+        keyboard_button(btns, text="Clear Log", width=90, height=28,
                        font=ctk.CTkFont(FONT_BODY, 11, "bold"),
                        fg_color="transparent", hover_color=COLORS["panel_hover"],
                        text_color=COLORS["danger"], border_width=1,
@@ -4342,25 +4322,29 @@ class ObsidianApp(ctk.CTk):
         """
         dlg = ctk.CTkToplevel(self)
         dlg.title("Reset Virtual Capital")
-        dlg.geometry("400x190")
+        safe_geometry(dlg, 400, 190, parent=self)
         dlg.configure(fg_color=COLORS["panel"])
         dlg.grab_set()
         dlg.transient(self)
         force_dark_titlebar(dlg)
 
-        ctk.CTkLabel(dlg, text="!",
+        row = AdaptiveActionRow(dlg, fg_color="transparent")
+        row.pack(side="bottom", fill="x", padx=12, pady=8)
+        body = ctk.CTkScrollableFrame(dlg, fg_color="transparent",
+                                      scrollbar_button_color=COLORS["border"])
+        body.pack(fill="both", expand=True, padx=8, pady=4)
+
+        ctk.CTkLabel(body, text="!",
                       font=ctk.CTkFont(self.mono_font, 36, "bold"),
                       text_color=COLORS["warning"]).pack(pady=(20, 4))
-        ctk.CTkLabel(dlg, text="Reset Virtual Capital Display?",
+        ctk.CTkLabel(body, text="Reset Virtual Capital Display?",
                       font=ctk.CTkFont(FONT_BODY, 14, "bold"),
                       text_color=COLORS["text"]).pack()
-        ctk.CTkLabel(dlg,
+        ctk.CTkLabel(body,
                       text="The display resets to 1000 USDT.\nNo trades are deleted.",
                       font=ctk.CTkFont(FONT_BODY, 11, "bold"),
                       text_color=COLORS["text_dim"], justify="center").pack(pady=(8, 16))
 
-        row = ctk.CTkFrame(dlg, fg_color="transparent")
-        row.pack()
 
         def _confirm():
             # Store current PnL as offset so the display jumps back to 1000.
@@ -4376,12 +4360,12 @@ class ObsidianApp(ctk.CTk):
                 self._vc_offset = 0.0
             dlg.destroy()
 
-        ctk.CTkButton(row, text="Reset Display",
+        keyboard_button(row, text="Reset Display",
                        fg_color=COLORS["warning"], hover_color="#d97706",
                        text_color="#000000", width=130, height=34, corner_radius=8,
                        font=ctk.CTkFont(FONT_BODY, 12, "bold"),
                        command=_confirm).pack(side="left", padx=6)
-        ctk.CTkButton(row, text="Cancel",
+        keyboard_button(row, text="Cancel",
                        fg_color="transparent", hover_color=COLORS["panel_hover"],
                        text_color=COLORS["text_dim"], width=100, height=34, corner_radius=8,
                        font=ctk.CTkFont(FONT_BODY, 12, "bold"),
@@ -4835,14 +4819,17 @@ class ObsidianApp(ctk.CTk):
                                                           "today_pnl": 0, "today_cnt": 0})
             if metrics_error:
                 card["pnl_var"].set(
-                    "STATE ERR" if "unverified" in metrics_error.lower()
+                    "STATE ERR" if cache.get("metrics_error_scope") == "bot"
                     else "DB ERR"
                 )
                 card["pnl_lbl"].configure(text_color=COLORS["warning"])
                 card["total_var"].set("--")
                 card["today_var"].set("--")
                 card["wr_var"].set("")
-                card["open_var"].set("--")
+                card["open_var"].set(
+                    str(_ui_nonnegative_int(cache.get("open", {}).get(bot)))
+                    if cache.get("metrics_error_scope") == "bot" else "--"
+                )
             else:
                 sign = "+" if stats["pnl"] >= 0 else ""
                 card["pnl_var"].set(f"{sign}{stats['pnl']:.2f}")
@@ -4878,7 +4865,7 @@ class ObsidianApp(ctk.CTk):
                     card["payoff_var"].set("")
                     card["payoff_lbl"].configure(text_color=COLORS["warning"])
                     card["payoff_detail"].set(
-                        "State unverified" if "unverified" in metrics_error.lower()
+                        "State unverified" if cache.get("metrics_error_scope") == "bot"
                         else "DB read failed"
                     )
                 elif stats["total"] > 0 and avg_loss == 0:
@@ -4932,7 +4919,7 @@ class ObsidianApp(ctk.CTk):
                               else COLORS["text_muted"])
                 card["unr_lbl"].configure(text_color=unr_color)
         m = cache.get("market")
-        if m:
+        if m and m.get("regime") in {"BULL", "BEAR", "NEUTRAL"}:
             phase = m["regime"]
             phase_color = (COLORS["success"] if phase == "BULL" else
                             COLORS["danger"]  if phase == "BEAR" else
@@ -4943,14 +4930,23 @@ class ObsidianApp(ctk.CTk):
             self.sb_btc.set(f"{btc_sign}{m['btc_24h']:.2f}%")
             btc_color = COLORS["success"] if m["btc_24h"] >= 0 else COLORS["danger"]
             self.sb_btc._lbl.configure(text_color=btc_color)
-            fg_label = ("Extreme Fear" if m["fg"] <= 25 else
+        else:
+            self.sb_phase.set("Unknown")
+            self.sb_phase._lbl.configure(text_color=COLORS["text_muted"])
+            self.sb_btc.set("--")
+            self.sb_btc._lbl.configure(text_color=COLORS["text_muted"])
+        fg = m.get("fg") if isinstance(m, dict) else None
+        if type(fg) is int and 0 <= fg <= 100:
+            fg_label = ("Extreme Fear" if fg <= 25 else
                          "Fear"          if m["fg"] <= 45 else
                          "Neutral"       if m["fg"] <= 55 else
                          "Greed"         if m["fg"] <= 75 else
                          "Extreme Greed")
-            self.sb_fg.set(f"{m['fg']}  {fg_label}")
+            self.sb_fg.set(f"{fg}  {fg_label}")
+            self.sb_fg._lbl.configure(text_color=COLORS["text"])
         else:
-            self.sb_phase.set("offline")
+            self.sb_fg.set("Unknown")
+            self.sb_fg._lbl.configure(text_color=COLORS["text_muted"])
 
         # Sidebar Account  Dynamisches Ein-/Ausblenden je nach Bot-Modus
         live_bal = cache.get("balance_live",  "")
@@ -5064,6 +5060,9 @@ class ObsidianApp(ctk.CTk):
         metrics_error = str(cache.get("metrics_error") or "").strip()
 
         # Virtual Capital Sektion (nur sichtbar wenn mind. 1 Bot auf SIM steht)
+        # Local price failures do not invalidate realized DB aggregates/counts.
+        if cache.get("metrics_error_scope") == "bot":
+            metrics_error = ""
         if any_sim:
             self.sb_balance_sim._wrap.master.pack(fill="x", pady=0)
             # Offset abziehen damit die Anzeige nach Reset bei 1000 USDT startet.
@@ -5138,7 +5137,11 @@ class ObsidianApp(ctk.CTk):
             for b in BOT_ORDER
             if _cache_sim(b) != money_scope_live
         )
-        if metrics_error:
+        unrealized_unknown = bool(metrics_error) or any(
+            (cache.get("metrics_error_bots") or {}).get(b)
+            for b in BOT_ORDER if _cache_sim(b) != money_scope_live
+        )
+        if unrealized_unknown:
             self.sb_unr_total.set("--")
             self.sb_unr_total._lbl.configure(text_color=COLORS["warning"])
         elif total_open > 0:
@@ -5265,7 +5268,9 @@ class ObsidianApp(ctk.CTk):
         else:
             self.sb_exchange.set(ex["label"])
             self.sb_exchange._lbl.configure(
-                text_color=COLORS["success"] if ex["active"] else COLORS["text_muted"]
+                text_color=(COLORS["success"] if ex["active"] else
+                            COLORS["warning"] if ex.get("unverified") else
+                            COLORS["text_muted"])
             )
 
         llm_enabled = any(

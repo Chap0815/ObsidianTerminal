@@ -1081,12 +1081,18 @@ def _interpret_challenge(resp, label: str) -> str:
     return "OVERRIDE_WAIT" if _BULL_BEAR_FAIL_CLOSED else "PROCEED"
 
 
+def challenge_failure_verdict():
+    return "OVERRIDE_WAIT" if _BULL_BEAR_FAIL_CLOSED else "PROCEED"
+
+
 def bull_bear_challenge(symbol, bull_analysis, context_brief="", confidence=""):
     # ``confidence`` lets the SPOT brains skip the 2nd LLM call on LOW-confidence
     # setups (not worth the latency; usually already filtered by the scan's
     # confidence gate). MEDIUM/HIGH BUYs are challenged.
-    if not _BULL_BEAR_ENABLED or not llm_available():
+    if not _BULL_BEAR_ENABLED:
         return "PROCEED"
+    if not llm_available():
+        return challenge_failure_verdict()
     if type(symbol) is not str or not symbol:
         return "OVERRIDE_WAIT" if _BULL_BEAR_FAIL_CLOSED else "PROCEED"
     if type(confidence) is str and str.upper(confidence) == "LOW":
@@ -1118,8 +1124,10 @@ def bull_bear_challenge(symbol, bull_analysis, context_brief="", confidence=""):
 
 
 def futures_bull_bear_challenge(symbol, direction, analysis, context_brief=""):
-    if not _BULL_BEAR_ENABLED or not llm_available():
+    if not _BULL_BEAR_ENABLED:
         return "PROCEED"
+    if not llm_available():
+        return challenge_failure_verdict()
     if type(symbol) is not str or not symbol:
         return "OVERRIDE_WAIT" if _BULL_BEAR_FAIL_CLOSED else "PROCEED"
     if type(direction) is not str or direction not in ("LONG", "SHORT"):

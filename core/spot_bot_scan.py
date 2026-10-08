@@ -208,6 +208,19 @@ class ScanMixin:
         safe_mode = getattr(self, "safe_mode", None)
         if safe_mode is None:
             return False
+        if not isinstance(getattr(self, "simulation", None), bool):
+            return False
+        try:
+            from trading.risk_manager import is_bot_paused
+
+            paused, _reason = is_bot_paused(
+                self.BOT_NAME, exchange=None,
+                simulation=getattr(self, "simulation", None),
+            )
+            if paused is not False:
+                return False
+        except Exception:
+            return False
         return (
             safe_mode.is_active() is False
             and ScanMixin._entry_integrity_allowed(self)
@@ -1219,6 +1232,7 @@ class ScanMixin:
             "entry_id": entry_id,
             "provisional": not getattr(entry, "basis_verified", True),
             "entry_price_unverified": not getattr(entry, "basis_verified", True),
+            "entry_fee_finalization_pending": False,
         }
         if sim_tca_pending is not None:
             position_fields[self._SIM_TCA_PENDING_FIELD] = sim_tca_pending
@@ -1232,6 +1246,8 @@ class ScanMixin:
             position_fields,
             {"entry_id": entry_id},
             create_fields=create_fields,
+            finalize_entry=True,
+            create_if_absent=self.simulation,
         )
         if state_ok is None:
             log_event(
@@ -1350,6 +1366,7 @@ class ScanMixin:
                 rationale=parse_rationale(ans) if ans is not None else "",
                 price=signal_price, size_usdt=float(trade_usdt),
                 sim=bool(self.simulation),
+                mode=entry_mode, entry_id=entry_id,
             )
         except Exception:
             pass
@@ -2054,10 +2071,11 @@ class ScanMixin:
             # On MEXC/Binance spot, CCXT interprets the `amount` arg of a market
             # buy as USDT COST (quote), not COIN QUANTITY (base). Detect via
             # ex.id and pass the USDT cost (with createMarketBuyOrderRequiresPrice
-            # disabled). Other exchanges (Bitget/Kraken/Kucoin) use standard
+            # disabled). Bitget also requires an explicit quote cost. Other
+            # exchanges (Kraken/Kucoin) use standard
             # coin-amount semantics.
             ex_id = (getattr(self.ex, "id", "") or "").lower()
-            quote_first_buy = ex_id in ("mexc", "binance", "binanceusdm",
+            quote_first_buy = ex_id in ("mexc", "bitget", "binance", "binanceusdm",
                                           "binancecoinm")
             entry_checkpoint_written = False
 
@@ -2118,7 +2136,7 @@ class ScanMixin:
                         before_submit=_checkpoint_entry_before_submit,
                     )
                 else:
-                    # Bitget/Kraken/etc: standard coin-amount semantics
+                    # Kraken/etc: standard coin-amount semantics
                     order = _create_market_buy_budgeted(
                         self.ex,
                         f"{sym}/USDT", amount_coins,
@@ -2316,6 +2334,7 @@ class ScanMixin:
                     "entry_id": entry_id,
                     "provisional": True,
                     "entry_price_unverified": not basis_verified,
+                    "entry_fee_finalization_pending": True,
                     "spot_entry_client_order_id": cid,
                     "spot_entry_order_id": order_id_text_or_none(order.get("id")),
                     "spot_entry_requested_amount": amount_coins,

@@ -68,6 +68,7 @@ _CLAIM_EXTRA_FIELDS = frozenset((
     "spot_entry_client_order_id", "spot_entry_order_id", "spot_entry_observed_amount",
     "spot_entry_requested_amount", "spot_entry_quote_budget", "spot_entry_quote_first",
     "spot_entry_initial_invested_usdt",
+    "entry_fee_finalization_pending",
     "futures_entry_client_order_id", "futures_entry_order_id",
     "futures_entry_observed_amount", "futures_entry_requested_amount",
     "verified_flat_pending_accounting", "verified_flat_reason", "verified_flat_time", "verified_flat_at",
@@ -77,6 +78,8 @@ _CLAIM_EXTRA_FIELDS = frozenset((
     "accounting_pending_profit_usdt", "accounting_pending_invested_usdt",
     "accounting_pending_fees_usdt", "accounting_pending_reason",
     "accounting_pending_funding_paid",
+    "accounting_pending_cooldown_until",
+    "accounting_pending_blacklist_decision", "accounting_pending_blacklist_checked",
     "pending_close_filled_amount", "pending_close_notional_sum", "pending_close_price",
     "pending_close_fee", "pending_close_order_id", "pending_close_reason",
     "full_exit_client_order_id", "full_exit_requested_amount", "full_exit_position_side",
@@ -512,6 +515,67 @@ def validated_pending_partial_accounting_item(
     return item
 
 
+def partial_accounting_allows_protection(state, sym: str, row: dict, *,
+                                        bot_name: str, mode_is_sim: bool,
+                                        is_futures: bool) -> bool:
+    """A priced, completed partial WAL may coexist with reducing the rest.
+
+    This is not permission to retry an unknown order. The caller must retain
+    its normal exit-intent/claim/flatness guards and close serialization.
+    """
+    if not isinstance(row, dict):
+        return False
+    pending = row.get("accounting_pending_partials")
+    if not pending:
+        return True
+    if (not isinstance(pending, list) or row.get("claim_conflict")
+            or row.get("entry_price_unverified")
+            or row.get("accounting_pending") or row.get("accounting_already_booked")
+            or row.get("verified_flat_pending_accounting")):
+        return False
+    try:
+        for item in pending:
+            checked = validated_pending_partial_accounting_item(
+                item, symbol=sym, bot_name=bot_name,
+                mode_is_sim=mode_is_sim, is_futures=is_futures,
+            )
+            if row.get("entry_id") and checked.get("entry_id") != row.get("entry_id"):
+                return False
+            if checked.get("buy_time") != row.get("buy_time"):
+                return False
+            for key in ("buy_price", "sell_price", "invested_usdt"):
+                value = _finite_float_or_none(checked.get(key))
+                if value is None or value <= 0.0:
+                    return False
+            for key in ("profit_usdt", "profit_pct"):
+                value = checked.get(key)
+                if isinstance(value, bool) or not math.isfinite(float(value)):
+                    return False
+        if not update_many_if_current(
+                state, sym, {"accounting_pending_partials": pending}, row):
+            return False
+        live = state.get(sym)
+        return bool(isinstance(live, dict) and _same_position_generation(live, row)
+                    and live.get("accounting_pending_partials") == pending)
+    except Exception:
+        return False
+
+
+def _unaccounted_entry_basis_closes(row: dict, restore_fields: Optional[dict] = None) -> bool:
+    fragments = row.get("entry_basis_pending_closes")
+    if not fragments:
+        return False
+    if not isinstance(fragments, list) or row.get("entry_price_unverified"):
+        return True
+    booked = row.get("accounting_already_booked") is True or (
+        isinstance(restore_fields, dict) and restore_fields.get("accounting_already_booked") is True)
+    if not booked:
+        return True
+    return any(not isinstance(fragment, dict) or fragment.get("staged") is not True
+               or (index < len(fragments) - 1 and fragment.get("accounted") is not True)
+               for index, fragment in enumerate(fragments))
+
+
 def remove_with_restore_fields(
     state,
     sym: str,
@@ -520,6 +584,14 @@ def remove_with_restore_fields(
     expected_row: Optional[dict] = None,
 ) -> bool:
     """Remove state while supporting older/fake state objects in tests/tools."""
+    getter = getattr(state, "get", None)
+    current = getter(sym) if callable(getter) else None
+    if (isinstance(current, dict)
+            and (expected_row is None or _same_position_generation(current, expected_row))
+            and (current.get("accounting_pending_partials")
+                 or _unaccounted_entry_basis_closes(current, fields))):
+        update_many_if_current(state, sym, fields, current)
+        return False
     remove = state.remove
     try:
         params = inspect.signature(remove).parameters
@@ -734,6 +806,48 @@ def release_claim_if_absent_for_generation(
     return result is None or result is True
 
 
+def _merge_final_entry_fields(current: dict, fields: dict) -> dict:
+    """Final entry metadata cannot rewind an already monitored generation."""
+    merged = copy.deepcopy(fields)
+    active = current.get("entry_price_unverified") is not True
+    reduced = _finite_float(current.get("amount")) < _finite_float(current.get("original_amount"))
+    basis_recovery = bool(current.get("entry_basis_pending_closes")) and current.get("entry_price_unverified") is True
+    closed = current.get("accounting_pending") or current.get("accounting_already_booked") or current.get("verified_flat_pending_accounting")
+    if active or reduced or closed or basis_recovery:
+        for key in ("amount", "invested_usdt", "original_amount", "highest", "lowest",
+                    "funding_paid", "liquidation_price", "initial_liq_distance"):
+            if key in current:
+                merged.pop(key, None)
+        for key in ("partial_sold", "break_even", "be_active"):
+            if current.get(key) is True:
+                merged[key] = True
+        if closed or basis_recovery:
+            for key in ("buy", "initial_entry_fee", "fees_paid"):
+                merged.pop(key, None)
+        else:
+            old_fee = _finite_float(current.get("initial_entry_fee"))
+            final_fee = _finite_float(fields.get("initial_entry_fee"), old_fee)
+            if "fees_paid" in fields:
+                merged["fees_paid"] = _finite_float(current.get("fees_paid")) + (final_fee - old_fee)
+            # Spot's final net amount may remove a base-currency entry fee.
+            # Apply that correction to the CURRENT rest, never its old gross.
+            if current.get("position_type", "SPOT") == "SPOT":
+                gross = _finite_float(current.get("original_amount"))
+                final_original = _finite_float(fields.get("original_amount"), gross)
+                base_fee = max(0.0, gross - final_original)
+                if base_fee:
+                    merged["amount"] = max(0.0, _finite_float(current.get("amount")) - base_fee)
+                    merged["original_amount"] = final_original
+    if basis_recovery:
+        # Executed close receipts must still pass the dedicated entry-basis
+        # healer. Late entry completion cannot declare that ledger resolved.
+        for key in ("entry_price_unverified", "provisional", "entry_fee_finalization_pending"):
+            merged.pop(key, None)
+    if current.get("buy_time"):
+        merged.pop("buy_time", None)
+    return merged
+
+
 def promote_position_generation(
     state,
     sym: str,
@@ -741,6 +855,8 @@ def promote_position_generation(
     expected_row: dict,
     *,
     create_fields: Optional[Dict[str, Any]] = None,
+    finalize_entry: bool = False,
+    create_if_absent: bool = True,
 ) -> Optional[bool]:
     """Promote one entry generation without rewriting a replacement.
 
@@ -751,8 +867,17 @@ def promote_position_generation(
     """
     has = getattr(state, "has", None)
     create_path = not (callable(has) and has(sym))
+    if create_path and not create_if_absent:
+        return None
     if not create_path:
-        result = update_many_if_current(state, sym, fields, expected_row)
+        if finalize_entry and "finalize_entry" in inspect.signature(state.update_many).parameters:
+            result = state.update_many(sym, fields, expected_row=expected_row, finalize_entry=True)
+        else:
+            if finalize_entry:
+                current = state.get(sym)
+                if isinstance(current, dict) and _same_position_generation(current, expected_row):
+                    fields = _merge_final_entry_fields(current, fields)
+            result = update_many_if_current(state, sym, fields, expected_row)
     else:
         payload = fields if create_fields is None else create_fields
         add = state.add
@@ -1793,6 +1918,7 @@ class TradeState:
         fields: dict,
         *,
         expected_row: Optional[dict] = None,
+        finalize_entry: bool = False,
     ) -> bool:
         """Set multiple fields atomically; returns False if not durable.
 
@@ -1851,6 +1977,11 @@ class TradeState:
             ):
                 generation_obsolete = True
             elif current_row is not None:
+                if finalize_entry:
+                    safe_fields = _merge_final_entry_fields(current_row, safe_fields)
+                    locked_reject_reason = _reject_update_reason(safe_fields)
+                    if locked_reject_reason is not None:
+                        return False
                 if _CLAIM_UPDATE_FIELDS.intersection(safe_fields):
                     candidate = copy.deepcopy(current_row)
                     candidate.update(safe_fields)
@@ -2054,6 +2185,8 @@ class TradeState:
                     state_absent = True
                 else:
                     state_absent = False
+                    if current.get("accounting_pending_partials") or _unaccounted_entry_basis_closes(current, safe_restore_fields):
+                        return False
                     if self._bot_name:
                         staged = copy.deepcopy(self._trades[sym])
                         if safe_restore_fields:

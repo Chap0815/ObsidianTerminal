@@ -1705,15 +1705,22 @@ def _run_migrations(conn) -> None:
     # daily_pnl  MAX_DAILY_LOSS tripping late).
     _add_column_if_missing(conn, "trades", "exchange_order_id", "TEXT")
 
-    try:
-        c.execute("DROP INDEX IF EXISTS idx_trades_dedup")
-    except Exception:
-        pass
-    c.execute("""
+    dedup_index_sql = """
     CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_dedup
     ON trades(bot_name, symbol, buy_time, sell_time, is_partial,
               COALESCE(is_futures, 0), COALESCE(exchange_order_id, ''),
-              COALESCE(entry_id, ''))""")
+              COALESCE(entry_id, ''))"""
+    existing_dedup = c.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+        ("idx_trades_dedup",),
+    ).fetchone()
+    def normalized_index_sql(sql):
+        return re.sub(r"\s+", "", str(sql).lower()).replace("ifnotexists", "")
+    if existing_dedup and (
+        normalized_index_sql(existing_dedup[0]) != normalized_index_sql(dedup_index_sql)
+    ):
+        c.execute("DROP INDEX idx_trades_dedup")
+    c.execute(dedup_index_sql)
     c.execute("CREATE INDEX IF NOT EXISTS idx_trades_bot_partial ON trades(bot_name, is_partial, sell_time)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_trades_futures ON trades(is_futures, sell_time)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_trades_mode ON trades(is_sim, sell_time)")
@@ -1758,6 +1765,18 @@ def _run_migrations(conn) -> None:
         blacklisted_until TEXT    NOT NULL,
         reason            TEXT,
         UNIQUE(symbol, bot_name)
+    )""")
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS coin_blacklist_events (
+        symbol       TEXT NOT NULL,
+        bot_name     TEXT NOT NULL,
+        event_key    TEXT NOT NULL,
+        loss_usdt    REAL NOT NULL,
+        hours        INTEGER NOT NULL,
+        reason       TEXT NOT NULL,
+        incremental  INTEGER NOT NULL,
+        created_at   TEXT NOT NULL,
+        PRIMARY KEY(symbol, bot_name, event_key)
     )""")
     c.execute("""
     CREATE TABLE IF NOT EXISTS learning_log (
@@ -2253,7 +2272,7 @@ def _run_migrations(conn) -> None:
     # Record current schema version  every successful migration run leaves a
     # fingerprint, useful for diagnostics ("did the migration run?") and for
     # future versioned migrations.
-    _CURRENT_SCHEMA_VERSION = 7
+    _CURRENT_SCHEMA_VERSION = 8
     try:
         existing = conn.execute(
             "SELECT version FROM schema_versions WHERE version=?",
@@ -6186,10 +6205,11 @@ def cleanup_expired_blacklist() -> int:
 
 def add_to_blacklist(symbol: str, bot_name: str, loss_usdt: float,
                      hours: int = 72, reason: str = "",
-                     incremental: bool = True) -> None:
+                     incremental: bool = True, *, event_key: str | None = None) -> None:
     """incremental=True (default): counts as ONE additional loss event.
     incremental=False: replaces total_loss_usdt with the given value (used for
-    risk_manager-summed totals)."""
+    risk_manager-summed totals). An optional durable event_key makes replay
+    idempotent: event receipt and blacklist changes commit together."""
     validated_symbol, validated_bot = _validated_blacklist_key_db(
         symbol, bot_name
     )
@@ -6205,11 +6225,34 @@ def add_to_blacklist(symbol: str, bot_name: str, loss_usdt: float,
     )
     if not isinstance(incremental, bool):
         raise ValueError("incremental must be boolean")
+    validated_event = (
+        _required_text_db(event_key, "event_key", max_length=128)
+        if event_key is not None else None
+    )
     now = _utcnow()
     until = (now + timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
     now_s = now.strftime("%Y-%m-%d %H:%M:%S")
     conn = get_connection()
     try:
+        if validated_event is not None:
+            receipt = conn.execute(
+                """INSERT INTO coin_blacklist_events
+                     (symbol, bot_name, event_key, loss_usdt, hours, reason, incremental, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(symbol, bot_name, event_key) DO NOTHING""",
+                (validated_symbol, validated_bot, validated_event,
+                 loss_clean, hours, validated_reason, int(incremental), now_s),
+            )
+            if receipt.rowcount == 0:
+                existing = conn.execute(
+                    """SELECT loss_usdt, hours, reason, incremental FROM coin_blacklist_events
+                         WHERE symbol=? AND bot_name=? AND event_key=?""",
+                    (validated_symbol, validated_bot, validated_event),
+                ).fetchone()
+                if existing is None or tuple(existing) != (loss_clean, hours, validated_reason, int(incremental)):
+                    raise ValueError("blacklist event replay payload differs")
+                conn.commit()
+                return
         if incremental:
             conn.execute("""
             INSERT INTO coin_blacklist
@@ -6520,6 +6563,8 @@ def get_historical_winrate_for_setup(bot_name: str, rsi_1h_bucket: int,
             return False
         rsi = _required_finite_float_db(row["rsi_1h"], "rsi_1h")
         change = _required_finite_float_db(row["change_pct"], "change_pct")
+        if is_fut_filter:
+            change = abs(change)
         return rsi_lo <= rsi < rsi_hi and chg_lo <= change < chg_hi
 
     try:
@@ -14024,11 +14069,9 @@ def get_performance_metrics(bot_name: str, days: int = 30) -> dict:
         mean_return / std_all * annualization
         if std_all > 0 else None
     )
-    negative_returns = [value for value in returns if value < 0]
-    neg_dev = (
-        _stat.stdev(negative_returns)
-        if len(negative_returns) > 1 else 0.0
-    )
+    # Downside deviation around MAR=0 includes every observation. Equal losses
+    # carry downside risk even though their sample standard deviation is zero.
+    neg_dev = math.hypot(*(min(value, 0.0) for value in returns)) / math.sqrt(n)
     sortino = (
         mean_return / neg_dev * annualization
         if neg_dev > 0 else None

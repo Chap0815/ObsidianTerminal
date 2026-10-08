@@ -100,8 +100,8 @@ quality. See [Research & AI](manual/Research-and-AI.md).
 
 ## Get started on Windows
 
-The reference environment is **Windows x64 with Python 3.12**. Python 3.12 is
-recommended for the supplied dependency lock. Other platforms are not presented
+The reference environment is **Windows x64 with Python 3.13.16**. Python 3.13 starting at patch 16 is
+required for the supplied dependency lock. Other platforms are not presented
 as verified installation targets. A GPU is not needed for trading without AI;
 optional local models have their own hardware requirements.
 

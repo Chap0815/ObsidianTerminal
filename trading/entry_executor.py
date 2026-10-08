@@ -166,6 +166,9 @@ def _durable_finalized_order_matches(
     intent_id: str,
     order: object,
     target_amount: float,
+    *,
+    exchange=None,
+    symbol: str | None = None,
 ) -> bool:
     """Prove a complete venue result survived an ambiguous finalization error."""
     getter = getattr(journal, "get", None)
@@ -185,7 +188,7 @@ def _durable_finalized_order_matches(
             intent.get("filled_notional"), "persisted filled notional"
         )
         order_filled = _positive_finite_float(order.get("filled"), "order fill")
-        order_notional = _recovered_fill_notional(order, order_filled)
+        order_notional = _recovered_fill_notional(order, order_filled, exchange=exchange, symbol=symbol)
         order_ids = _explicit_order_ids(order)
         persisted_order_id = _external_text(intent.get("exchange_order_id"))
     except Exception:
@@ -213,17 +216,71 @@ def _number(value, default=0.0) -> float:
     return result if math.isfinite(result) and result >= 0.0 else default
 
 
-def _recovered_fill_notional(order: dict, filled: float) -> float | None:
+def _fill_quote_is_usdt(exchange, symbol: str | None) -> bool:
+    """Require cached/canonical USDT units before booking quote cost as USDT."""
+    if not isinstance(symbol, str) or not symbol:
+        return False
+    markets = getattr(exchange, "markets", None)
+    market = markets.get(symbol) if isinstance(markets, dict) else None
+    market = market if isinstance(market, dict) else {}
+    options = getattr(exchange, "options", None)
+    default_type = options.get("defaultType") if isinstance(options, dict) else None
+    derivative = (":" in symbol or market.get("contract") is True
+                  or market.get("swap") is True or market.get("future") is True
+                  or market.get("linear") in (True, False)
+                  or market.get("inverse") is True
+                  or default_type in {"swap", "future", "futures"})
+    if market.get("quote") not in (None, "USDT"):
+        return False
+    if not derivative:
+        return symbol.endswith("/USDT")
+    if (market.get("inverse") is True or market.get("linear") is False
+            or market.get("settle") not in (None, "USDT")):
+        return False
+    if symbol.endswith("/USDT:USDT"):
+        return True
+    return (market.get("linear") is True and market.get("settle") == "USDT"
+            and market.get("quote") == "USDT")
+
+
+def _fill_contract_size(exchange, symbol: str | None) -> float | None:
+    """Read cached unit evidence only; never load markets or call the venue."""
+    if not _fill_quote_is_usdt(exchange, symbol):
+        return None
+    markets = getattr(exchange, "markets", None)
+    market = markets.get(symbol) if isinstance(markets, dict) else None
+    options = getattr(exchange, "options", None)
+    default_type = options.get("defaultType") if isinstance(options, dict) else None
+    derivative = (":" in symbol or default_type in {"swap", "future", "futures"}
+                  or isinstance(market, dict) and any(
+                      market.get(key) is True for key in ("contract", "swap", "future", "linear", "inverse")))
+    if not derivative:
+        return 1.0
+    if not isinstance(market, dict):
+        return None
+    if market.get("inverse") is True or market.get("linear") is False:
+        return None
+    from bot_utils.futures_order import futures_contract_size_or_none
+    return futures_contract_size_or_none(exchange, symbol)
+
+
+def _recovered_fill_notional(order: dict, filled: float, *,
+                             exchange=None, symbol: str | None = None) -> float | None:
     if not isinstance(order, dict) or filled <= 0.0:
+        return None
+    if not _fill_quote_is_usdt(exchange, symbol):
+        return None
+    average = _number(order.get("average"))
+    # CCXT safe_order synthesizes cost from the quoted/limit price when
+    # average is unavailable. Neither of those fields then proves execution.
+    if average <= 0.0 and _number(order.get("price")) > 0.0:
         return None
     cost = _number(order.get("cost"))
     if cost > 0.0:
         return cost
-    for price_field in ("average", "price"):
-        price = _number(order.get(price_field))
-        if price <= 0.0:
-            continue
-        notional = price * filled
+    contract_size = _fill_contract_size(exchange, symbol)
+    if average > 0.0 and contract_size is not None:
+        notional = average * filled * contract_size
         if math.isfinite(notional) and notional > 0.0:
             return notional
     return None
@@ -233,6 +290,43 @@ def _has_fill_notional_without_amount(order: dict) -> bool:
     if not isinstance(order, dict):
         return False
     return _number(order.get("filled")) <= 0.0 and _number(order.get("cost")) > 0.0
+
+
+def _aggregate_fill_average(exchange, symbol: str, legs: list[dict]) -> float:
+    """Aggregate execution prices without treating contracts as base coins."""
+    quantity = weighted_price = 0.0
+    for leg in legs:
+        filled = _number(leg.get("filled"))
+        if filled <= 0.0:
+            continue
+        price = _number(leg.get("average"))
+        if price <= 0.0:
+            notional = _recovered_fill_notional(leg, filled, exchange=exchange, symbol=symbol)
+            contract_size = _fill_contract_size(exchange, symbol)
+            if notional is not None and contract_size is not None:
+                price = notional / (filled * contract_size)
+        if price <= 0.0 or not math.isfinite(price):
+            raise RuntimeError("aggregate fill price unavailable")
+        quantity += filled
+        weighted_price += price * filled
+    return _positive_finite_float(weighted_price / quantity, "aggregate fill price")
+
+
+def _recovered_aggregate_fill_order(order, filled, notional, fee, *, exchange, symbol):
+    """Replace fallback-leg metadata with the journal's complete execution."""
+    result = dict(order)
+    result.update(filled=filled, amount=filled, cost=notional)
+    contract_size = _fill_contract_size(exchange, symbol)
+    result["average"] = (
+        notional / (filled * contract_size)
+        if filled > 0 and notional > 0 and contract_size is not None else None
+    )
+    # A fallback quote is not the aggregate execution price. Missing unit
+    # evidence must suppress TCA rather than reuse that leg's price.
+    result["price"] = None
+    result["fee"] = {"currency": "USDT", "cost": fee}
+    result["fees"] = [dict(result["fee"])]
+    return result
 
 
 def _verified_final_canceled_fill(order: dict) -> float:
@@ -247,11 +341,12 @@ def _verified_final_canceled_fill(order: dict) -> float:
     return filled
 
 
-def _with_verified_fill_notional(order: dict, context: str) -> dict:
+def _with_verified_fill_notional(order: dict, context: str, *,
+                                exchange=None, symbol: str | None = None) -> dict:
     if not isinstance(order, dict):
         raise RuntimeError(f"{context} returned no order object")
     filled = _number(order.get("filled"))
-    notional = _recovered_fill_notional(order, filled)
+    notional = _recovered_fill_notional(order, filled, exchange=exchange, symbol=symbol)
     if filled <= 0.0 or notional is None:
         raise RuntimeError(f"{context} fill notional unavailable")
     normalized = dict(order)
@@ -611,6 +706,7 @@ def _refresh_order(
                 order,
                 response,
                 target_amount,
+                exchange=exchange, symbol=symbol,
             )
         return True
 
@@ -664,7 +760,7 @@ def _reconcile_market_response(
     expected_order_id = _order_id(latest)
     if (
         _order_status(latest, amount) == "FILLED"
-        and _recovered_fill_notional(latest, _number(latest.get("filled")))
+        and _recovered_fill_notional(latest, _number(latest.get("filled")), exchange=exchange, symbol=symbol)
         is not None
     ) or not expected_order_id:
         return latest
@@ -684,18 +780,19 @@ def _reconcile_market_response(
             continue
         if (
             _order_status(latest, amount) == "FILLED"
-            and _recovered_fill_notional(latest, _number(latest.get("filled")))
+            and _recovered_fill_notional(latest, _number(latest.get("filled")), exchange=exchange, symbol=symbol)
             is not None
         ):
             break
     return latest
 
 
-def _transition_from_order(journal, intent_id: str, order: dict, amount: float) -> str:
+def _transition_from_order(journal, intent_id: str, order: dict, amount: float, *,
+                           exchange=None, symbol: str | None = None) -> str:
     _require_positive_partial_fill(order, "entry order")
     status = _order_status(order, amount)
     filled = _number(order.get("filled"))
-    cost = _number(order.get("cost"))
+    cost = _recovered_fill_notional(order, filled, exchange=exchange, symbol=symbol) or 0.0
     journal.transition(
         intent_id,
         status,
@@ -711,6 +808,9 @@ def _monotonic_order_fill_fields(
     current_order: dict,
     observed_order: dict,
     target_amount: float,
+    *,
+    exchange=None,
+    symbol: str | None = None,
 ) -> dict | None:
     current_filled = _number(current_order.get("filled"))
     observed_filled = _number(observed_order.get("filled"))
@@ -720,10 +820,12 @@ def _monotonic_order_fill_fields(
     current_notional = _recovered_fill_notional(
         current_order,
         current_filled,
+        exchange=exchange, symbol=symbol,
     )
     observed_notional = _recovered_fill_notional(
         observed_order,
         observed_filled,
+        exchange=exchange, symbol=symbol,
     )
     notional_tolerance = max(
         1e-12,
@@ -767,6 +869,9 @@ def _monotonic_order_fill_fields(
 def _strongest_order_fill_evidence(
     orders: tuple[dict, ...],
     target_amount: float,
+    *,
+    exchange=None,
+    symbol: str | None = None,
 ) -> tuple[float, float | None]:
     strongest = dict(orders[0])
     for observed in orders[1:]:
@@ -774,6 +879,7 @@ def _strongest_order_fill_evidence(
             strongest,
             observed,
             target_amount,
+            exchange=exchange, symbol=symbol,
         )
         if fields is None:
             continue
@@ -785,7 +891,7 @@ def _strongest_order_fill_evidence(
             merged.pop("cost", None)
         strongest = merged
     filled = _number(strongest.get("filled"))
-    return filled, _recovered_fill_notional(strongest, filled)
+    return filled, _recovered_fill_notional(strongest, filled, exchange=exchange, symbol=symbol)
 
 
 def execute_entry_order(
@@ -978,8 +1084,8 @@ def execute_entry_order(
                     "market order response conflicts with submitted request"
                 )
             if market_status == "FILLED":
-                order = _with_verified_fill_notional(order, "market")
-            status = _transition_from_order(journal, intent_id, order, amount)
+                order = _with_verified_fill_notional(order, "market", exchange=exchange, symbol=symbol)
+            status = _transition_from_order(journal, intent_id, order, amount, exchange=exchange, symbol=symbol)
             if status == "FILLED":
                 journal.transition(intent_id, "FINALIZED")
             elif terminal_zero_fill:
@@ -1012,7 +1118,7 @@ def execute_entry_order(
                     error="terminal market partial fill requires reconciliation",
                 )
             _record_fill_tca(
-                journal, intent_id, arrival, order, symbol=symbol, side=side
+                journal, intent_id, arrival, order, symbol=symbol, side=side, exchange=exchange
             )
             return order
         except FuturesOrderNotSubmitted as exc:
@@ -1029,6 +1135,7 @@ def execute_entry_order(
                 intent_id,
                 order,
                 amount,
+                exchange=exchange, symbol=symbol,
             ):
                 try:
                     from core.logger import log_struct
@@ -1156,6 +1263,7 @@ def execute_entry_order(
                 maker_order = _with_verified_fill_notional(
                     maker_order,
                     "maker",
+                    exchange=exchange, symbol=symbol,
                 )
             except RuntimeError:
                 order_id = _order_id(maker_order)
@@ -1200,8 +1308,9 @@ def execute_entry_order(
                 maker_order = _with_verified_fill_notional(
                     refreshed_maker,
                     "maker",
+                    exchange=exchange, symbol=symbol,
                 )
-        status = _transition_from_order(journal, intent_id, maker_order, amount)
+        status = _transition_from_order(journal, intent_id, maker_order, amount, exchange=exchange, symbol=symbol)
         if (
             status == "PARTIAL"
             and _external_text(maker_order.get("status", ""))
@@ -1214,6 +1323,7 @@ def execute_entry_order(
                 maker_order,
                 symbol=symbol,
                 side=side,
+                exchange=exchange,
             )
             journal.transition(
                 intent_id,
@@ -1230,6 +1340,7 @@ def execute_entry_order(
                 maker_order,
                 symbol=symbol,
                 side=side,
+                exchange=exchange,
             )
             return maker_order
         if config.ttl_seconds:
@@ -1289,8 +1400,8 @@ def execute_entry_order(
             latest_filled = _number(latest.get("filled"))
             if latest_filled + max(1e-12, amount * 1e-9) < current_filled:
                 raise _OrderSnapshotConflict("terminal maker fill amount decreased")
-            current_notional = _recovered_fill_notional(maker_order, current_filled)
-            latest_notional = _recovered_fill_notional(latest, latest_filled)
+            current_notional = _recovered_fill_notional(maker_order, current_filled, exchange=exchange, symbol=symbol)
+            latest_notional = _recovered_fill_notional(latest, latest_filled, exchange=exchange, symbol=symbol)
             if current_notional is not None and latest_notional is not None:
                 tolerance = max(
                     1e-12, max(current_notional, latest_notional) * 1e-9
@@ -1301,7 +1412,7 @@ def execute_entry_order(
                     )
         _require_positive_partial_fill(latest, "maker status refresh")
         if latest_status == "FILLED":
-            latest = _with_verified_fill_notional(latest, "maker")
+            latest = _with_verified_fill_notional(latest, "maker", exchange=exchange, symbol=symbol)
             fill_fields = {
                 "exchange_order_id": _order_id(latest),
                 "filled_amount": _number(latest.get("filled")),
@@ -1313,7 +1424,7 @@ def execute_entry_order(
             journal.transition(intent_id, "FILLED", **fill_fields)
             journal.transition(intent_id, "FINALIZED")
             _record_fill_tca(
-                journal, intent_id, arrival, latest, symbol=symbol, side=side
+                journal, intent_id, arrival, latest, symbol=symbol, side=side, exchange=exchange
             )
             return latest
         if latest_status == "PARTIAL":
@@ -1321,6 +1432,7 @@ def execute_entry_order(
                 maker_order,
                 latest,
                 amount,
+                exchange=exchange, symbol=symbol,
             )
             if partial_fields is not None:
                 journal.transition(
@@ -1340,6 +1452,7 @@ def execute_entry_order(
                     latest,
                     symbol=symbol,
                     side=side,
+                    exchange=exchange,
                 )
                 journal.transition(
                     intent_id,
@@ -1407,6 +1520,7 @@ def execute_entry_order(
         filled, maker_notional = _strongest_order_fill_evidence(
             (maker_order, latest, canceled),
             amount,
+            exchange=exchange, symbol=symbol,
         )
         fill_tolerance = max(1e-12, amount * 1e-9)
         if filled > amount + fill_tolerance:
@@ -1452,6 +1566,7 @@ def execute_entry_order(
                     canceled,
                     symbol=symbol,
                     side=side,
+                    exchange=exchange,
                 )
             return canceled
         fallback_client_order_id = _fallback_client_order_id(
@@ -1492,7 +1607,7 @@ def execute_entry_order(
             expected_amount=residual,
         ):
             raise RuntimeError("market fallback changed submitted request")
-        fallback_notional = _recovered_fill_notional(fallback, fallback_filled)
+        fallback_notional = _recovered_fill_notional(fallback, fallback_filled, exchange=exchange, symbol=symbol)
         fallback_fee, fallback_fee_known = _fee_usdt_known(fallback)
         if fallback_filled > 0.0 and fallback_notional is None:
             raise RuntimeError("market fallback fill notional unavailable")
@@ -1501,6 +1616,7 @@ def execute_entry_order(
             fallback_fee = fallback_cost * DEFAULT_TAKER_FEE
         total_filled = filled + fallback_filled
         total_cost = (maker_notional or 0.0) + fallback_cost
+        total_average = _aggregate_fill_average(exchange, symbol, [canceled, fallback])
         if total_filled < amount * (1.0 - 1e-9):
             raise RuntimeError("market fallback did not fill verified residual")
         fallback_recorder = getattr(
@@ -1528,13 +1644,16 @@ def execute_entry_order(
         journal.transition(intent_id, "FINALIZED")
         result = dict(fallback)
         result["filled"] = total_filled
+        result["amount"] = total_filled
         result["cost"] = total_cost
+        result["average"] = total_average
+        result["entry_fill_legs"] = [dict(canceled), dict(fallback)]
         result["maker_filled"] = filled
         total_fee = maker_fee + fallback_fee
         result["fee"] = {"cost": total_fee, "currency": "USDT"}
         result["fees"] = [dict(result["fee"])]
         _record_fill_tca(
-            journal, intent_id, arrival, result, symbol=symbol, side=side
+            journal, intent_id, arrival, result, symbol=symbol, side=side, exchange=exchange
         )
         return result
     except FuturesOrderNotSubmitted as exc:
@@ -1561,6 +1680,7 @@ def execute_entry_order(
                 fallback_not_submitted_order,
                 symbol=symbol,
                 side=side,
+                exchange=exchange,
             )
             return fallback_not_submitted_order
         raise
@@ -1577,6 +1697,7 @@ def _record_fill_tca(
     *,
     symbol: str,
     side: str,
+    exchange=None,
 ) -> None:
     recorder = getattr(journal, "record_tca", None)
     if arrival is None or not callable(recorder) or not isinstance(order, dict):
@@ -1584,15 +1705,17 @@ def _record_fill_tca(
     try:
         from trading.execution_quality import compute_fill_tca
 
-        average = order.get("average")
-        if average is None:
-            filled = _number(order.get("filled"))
-            cost = _number(order.get("cost"))
-            average = cost / filled if filled else None
-        if average is None:
+        average = _number(order.get("average"))
+        notional = _recovered_fill_notional(order, _number(order.get("filled")), exchange=exchange, symbol=symbol)
+        if notional is None:
             return
+        if average <= 0.0:
+            filled = _number(order.get("filled"))
+            contract_size = _fill_contract_size(exchange, symbol)
+            if contract_size is None or filled <= 0.0:
+                return
+            average = notional / (filled * contract_size)
         fee_cost, fee_known = _fee_usdt_known(order)
-        notional = _number(order.get("cost"))
         if fee_known and notional:
             fee_rate = fee_cost / notional
         else:
@@ -1993,9 +2116,12 @@ def recover_nonterminal_order_intents(
         effective_order = order
         effective_fee_usdt, effective_fee_known = _fee_usdt_known(order)
         if fallback_client_order_id and current == "FILLED":
-            effective_order = dict(order)
-            effective_order["filled"] = _number(intent.get("filled_amount"))
-            effective_order["cost"] = _number(intent.get("filled_notional"))
+            effective_fee_usdt = _number(intent.get("fee_usdt"))
+            effective_order = _recovered_aggregate_fill_order(
+                order, _number(intent.get("filled_amount")),
+                _number(intent.get("filled_notional")), effective_fee_usdt,
+                exchange=exchange, symbol=str(intent["symbol"]),
+            )
             status = "FILLED"
         elif fallback_client_order_id:
             persisted_fallback_filled = _number(
@@ -2022,6 +2148,7 @@ def recover_nonterminal_order_intents(
             recovered_fallback_notional = _recovered_fill_notional(
                 order,
                 recovered_fallback_filled,
+                exchange=exchange, symbol=str(intent["symbol"]),
             )
             fallback_filled = max(
                 persisted_fallback_filled,
@@ -2127,9 +2254,10 @@ def recover_nonterminal_order_intents(
                 intent["status"] = "RECOVERY_REQUIRED"
                 unresolved.append(intent)
                 continue
-            effective_order = dict(order)
-            effective_order["filled"] = maker_filled + fallback_filled
-            effective_order["cost"] = maker_cost + fallback_cost
+            effective_order = _recovered_aggregate_fill_order(
+                order, maker_filled + fallback_filled, maker_cost + fallback_cost,
+                effective_fee_usdt, exchange=exchange, symbol=str(intent["symbol"]),
+            )
             status = "FILLED"
         else:
             status = _order_status(order, target_amount)
@@ -2157,6 +2285,7 @@ def recover_nonterminal_order_intents(
             recovered_notional = _recovered_fill_notional(
                 effective_order,
                 _number(effective_order.get("filled")),
+                exchange=exchange, symbol=str(intent["symbol"]),
             )
             persisted_notional = _number(intent.get("filled_notional"))
             persisted_fill_is_complete = (
@@ -2165,6 +2294,21 @@ def recover_nonterminal_order_intents(
                 >= target_amount - tolerance
                 and persisted_notional > 0.0
             )
+            if persisted_fill_is_complete:
+                persisted_id = _order_id({"id": intent.get("exchange_order_id")})
+                fresh_id = _order_id(effective_order)
+                fresh_filled = _number(effective_order.get("filled"))
+                same_quantity = abs(fresh_filled - _number(intent.get("filled_amount"))) <= tolerance
+                notional_conflict = (recovered_notional is not None and same_quantity
+                    and abs(recovered_notional - persisted_notional)
+                    > max(1e-12, persisted_notional * 1e-9))
+                if (persisted_id and fresh_id != persisted_id) or notional_conflict:
+                    transition_order_intent(
+                        intent_id, "RECOVERY_REQUIRED",
+                        error="recovered full fill conflicts with durable fill evidence",
+                    )
+                    unresolved.append(persisted_snapshot(intent_id, intent))
+                    continue
             if recovered_notional is None and not persisted_fill_is_complete:
                 if current != "RECOVERY_REQUIRED":
                     transition_order_intent(
@@ -2203,7 +2347,9 @@ def recover_nonterminal_order_intents(
             partial_fields = {
                 "exchange_order_id": _order_id(effective_order),
                 "filled_amount": partial_amount,
-                "filled_notional": _number(effective_order.get("cost")),
+                "filled_notional": _recovered_fill_notional(
+                    effective_order, partial_amount, exchange=exchange,
+                    symbol=str(intent["symbol"])) or 0.0,
                 "fee_usdt": _fee_usdt(order),
             }
             try:
@@ -2358,6 +2504,7 @@ def recover_nonterminal_order_intents(
                             ArrivalTCA(**arrival_payload),
                             effective_order,
                             symbol=str(intent["symbol"]),
+                            exchange=exchange,
                             side=(
                                 "buy"
                                 if str(intent["direction"]).upper() == "LONG"

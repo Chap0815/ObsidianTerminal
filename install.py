@@ -1,6 +1,6 @@
 """
 
-  OBSIDIAN TRADING TERMINAL  -  One-Click Installer (Python 3.12.10)
+  OBSIDIAN TRADING TERMINAL  -  One-Click Installer (Python 3.13.16)
 
 
 Einmal ausfuehren -> installiert ALLES was der Bot braucht:
@@ -8,7 +8,7 @@ Einmal ausfuehren -> installiert ALLES was der Bot braucht:
   python install.py
 
 Was es macht:
-  1. Prueft Python-Version (empfohlen: 3.12.10; erlaubt 3.10 - 3.12)
+  1. Prueft Python-Version (Ziel: 3.13.16; erlaubt 3.13 ab Patch 16)
   2. Erstellt/benutzt .venv im Projektordner
   3. Stellt pip offline aus der Python-Distribution im .venv bereit
   4. Installiert alle Pflicht-Pakete hashgeprueft aus requirements.lock.txt
@@ -81,13 +81,13 @@ INSTALL_ENV_MAX_BYTES = 1024 * 1024
 INSTALL_IMPORT_TIMEOUT_SECONDS = 60.0
 
 # Empfohlene Zielversion
-TARGET_PY = (3, 12, 10)
+TARGET_PY = (3, 13, 16)
 
 #  Pflicht-Pakete (PyPI-Name, Import-Name)  -  Fallback, falls die
 #    requirements-Datei fehlt. Indikatoren laufen nativ (kein pandas-ta).
 REQUIRED = [
-    ("numpy<2", "numpy"),
-    ("pandas==2.2.2", "pandas"),
+    ("numpy==2.2.6", "numpy"),
+    ("pandas==2.2.3", "pandas"),
     ("ccxt>=4.3.0,<5.0.0", "ccxt"),
     ("requests>=2.31.0", "requests"),
     ("python-dotenv>=1.0.1", "dotenv"),
@@ -233,19 +233,12 @@ def check_python() -> bool:
     head("[1/10] Python-Version pruefen")
     v = sys.version_info
     cur = f"{v.major}.{v.minor}.{v.micro}"
-    if v.major != 3 or v.minor < 10:
-        err(f"Python {cur} ist zu alt  -  benoetigt 3.10-3.12, empfohlen 3.12.10.")
-        err("Installiere Python 3.12.10 von https://www.python.org/downloads/")
+    if (v.major, v.minor) != (3, 13) or v.micro < 16:
+        err(f"Python {cur} liegt ausserhalb des geprueften Bereichs 3.13 ab Patch 16.")
+        err("Installiere Python 3.13.16 von https://www.python.org/downloads/release/python-31316/")
         return False
-    if v.minor > 12:
-        err(f"Python {cur} ist neuer als der getestete Bereich 3.10-3.12.")
-        err("Installiere Python 3.12.10 und starte install.bat erneut.")
-        return False
-    if (v.major, v.minor) == (3, 12):
-        ok(f"Python {cur}  -  OK (Zielversion)")
-    else:
-        warn(f"Python {cur}  -  funktioniert, empfohlen ist 3.12.10.")
-        ok("Fortfahren ...")
+    ok(f"Python {cur}  -  OK (Zielreihe)")
+
     return True
 
 
@@ -292,12 +285,16 @@ def install_packages() -> bool:
         err(f"{REQ_FILE.name} fehlt  -  Release ist unvollstaendig.")
         return False
     info(f"installiere aus {REQ_FILE.name} (exakt gepinnt + Hashpruefung) ...")
-    r = _pip(
-        "install",
-        "--require-hashes", "-r", str(REQ_FILE),
-        capture=False,
-    )
-    if r.returncode != 0:
+    try:
+        from tools.install_locked_dependencies import install_locked_requirements
+
+        result = install_locked_requirements(
+            REQ_FILE, pip_runner=lambda *args: _pip(*args, capture=False)
+        )
+    except (OSError, UnicodeError, ValueError) as exc:
+        err(f"Dependency-Lock abgelehnt: {exc}")
+        return False
+    if result != 0:
         err("Hash-gepruefte Paketinstallation fehlgeschlagen.")
         err("Kein Fallback auf ungepruefte oder abweichende Versionen.")
         return False
@@ -598,7 +595,7 @@ def main() -> int:
     _sanitize_python_environment()
     print(f"""
 {C.BOLD}{C.B}
-   OBSIDIAN TRADING TERMINAL  -  Installer (Python 3.12)    
+   OBSIDIAN TRADING TERMINAL  -  Installer (Python 3.13)
 {C.END}
 """)
     info(f"Projekt: {PROJECT_ROOT}")

@@ -442,7 +442,7 @@ PARAM_DEFS_SPOT = [
      "Initial stop-loss level. Tighter (closer to 0) = quicker exit on bad trades."),
     ("BREAKEVEN_TRIGGER", "Breakeven At",         0.25,  0.0,  10.0,  ".2f", "%",
      "Move stop-loss to entry price when profit reaches this %. 0 = disabled. "
-     "Makes trades risk-free once the move starts working."),
+     "Local execution, fees and slippage can still produce a loss."),
     ("PARTIAL_SELL_PCT",  "Partial Sell",         0.05,  0.05, 1.00,  ".2f", "",
      "Fraction of position sold at Activation TP. 0.30 = sell 30%, keep 70% for trailing."),
     ("RSI_MAX",           "RSI Max",              1.0,  40.0, 90.0,  ".0f", "",
@@ -487,7 +487,8 @@ PARAM_DEFS_FUTURES = [
     ("INITIAL_STOP_LOSS", "Stop Loss",            0.5, -15.0, -0.5,  ".1f", "%",
      "Initial stop in raw price terms. -3.5% sits above normal coin noise."),
     ("BREAKEVEN_TRIGGER", "Breakeven At",         0.25,  0.0,  10.0,  ".2f", "%",
-     "Move SL to entry when profit reaches this %. 0 = disabled. Risk-free trades once moving."),
+     "Move SL to entry when profit reaches this %. 0 = disabled. "
+     "Execution delays, fees and slippage can still produce a loss."),
     ("PRE_ACTIVATION_GIVEBACK_STOP_ENABLED", "Peak Trail", 1.0, 0.0, 1.0, ".0f", "",
      "1 = protect favorable moves before the partial close. 0 = disabled."),
     ("PRE_ACTIVATION_MIN_MFE_PCT", "Peak Activation", 0.25, 0.25, 10.0, ".2f", "%",
@@ -515,7 +516,7 @@ PARAM_DEFS_FUTURES = [
     ("NEW_ENTRIES_ENABLED", "New Entries (0/1)",   1.0,   0.0,   1.0, ".0f", "",
      "0 blocks only new FUTURES entries; monitoring, reconciliation and exits continue."),
     ("LEVERAGE",          "Leverage",             1.0,   1.0,  10.0, ".0f", "x",
-     "Leverage 1-10x. 3x default = total loss at ~33% price move against."),
+     "Leverage 1-10x; public default 1x. Liquidation depends on venue and account margin."),
     ("LIQ_SAFETY_PCT",    "Liq Safety Buffer",    1.0,   5.0,  50.0, ".0f", "%",
      "Auto-close when distance to liquidation drops below this %."),
     ("SCAN_INTERVAL",     "Scan Interval",        15.0,  30.0, 600.0, ".0f", "s",
@@ -547,7 +548,7 @@ PARAM_DEFS_TREND = [
      "Maximum number of coins held at once. With the 12-major universe, 12 "
      "means all of them when in trend."),
     ("TREND_VOTE_MIN",    "Trend Sensitivity",     1.0,   1.0,   3.0, ".0f", "",
-     "How many of the 3 trend rules (P>SMA50, P>SMA100, SMA20>50) must agree to "
+     "How many of the 3 configured trend rules must agree to "
      "go long. 1 = aggressive (more time in market), 2 = balanced, 3 = strict."),
     ("TREND_EXIT_VOTE",   "Exit Threshold",        1.0,   1.0,   3.0, ".0f", "",
      "Sell when votes fall BELOW this. Set lower than Sensitivity for hysteresis "
@@ -567,9 +568,9 @@ PARAM_DEFS_TREND = [
     ("TREND_SMA_SLOW",    "SMA Slow",              5.0,  20.0, 300.0, ".0f", "d",
      "Slow price moving-average length in days. Default 100."),
     ("TREND_CROSS_FAST",  "Cross Fast",            5.0,   5.0, 100.0, ".0f", "d",
-     "Fast MA for the cross rule (SMA_fast > SMA_slow). Default 20."),
+     "Fast MA for the cross rule (SMA_fast > SMA_slow). Public default 50."),
     ("TREND_CROSS_SLOW",  "Cross Slow",            5.0,  10.0, 200.0, ".0f", "d",
-     "Slow MA for the cross rule. Default 50."),
+     "Slow MA for the cross rule. Public default 150."),
     ("TREND_VOL_TARGET",  "Vol-Targeting (0/1)",   1.0,   0.0,   1.0, ".0f", "",
      "0 = flat sizing (same USDT per coin). 1 = inverse-volatility sizing: calm "
      "coins get a bigger slot, wild coins a smaller one, so each contributes "

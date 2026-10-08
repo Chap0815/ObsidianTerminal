@@ -176,6 +176,19 @@ class FuturesScanMixin:
         safe_mode = getattr(self, "safe_mode", None)
         if safe_mode is None:
             return False
+        if not isinstance(getattr(self, "simulation", None), bool):
+            return False
+        try:
+            from trading.risk_manager import is_bot_paused
+
+            paused, _reason = is_bot_paused(
+                self.BOT_NAME, exchange=None,
+                simulation=getattr(self, "simulation", None),
+            )
+            if paused is not False:
+                return False
+        except Exception:
+            return False
         return (
             safe_mode.is_active() is False
             and FuturesScanMixin._entry_integrity_allowed(self)
@@ -2581,6 +2594,8 @@ class FuturesScanMixin:
             sym,
             trade_data,
             {"entry_id": entry_id},
+            finalize_entry=True,
+            create_if_absent=self.simulation,
         )
         if state_ok is None:
             log_event(
@@ -2685,6 +2700,7 @@ class FuturesScanMixin:
                 margin_usdt=float(actual_margin),
                 intended_margin_usdt=float(margin_usdt),
                 sim=bool(self.simulation),
+                mode=entry_mode,
                 entry_quality_score=quality.score,
                 entry_quality_label=quality.label,
                 entry_quality_reasons=",".join(quality.reasons),

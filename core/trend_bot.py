@@ -191,6 +191,14 @@ class TrendBot(SpotBot):
 
     def _handle_exit_recovery_gate(self, sym: str, d: dict) -> bool:
         """Handle pending accounting/conflict state before TREND exits."""
+        if d.get("accounting_pending_partials") and (
+                d.get("accounting_pending") or d.get("accounting_already_booked")):
+            self._retry_pending_partial_accounting(sym, d)
+            fresh = self.state.get(sym)
+            from bot_utils.trade_state import same_position_generation
+            if not isinstance(fresh, dict) or not same_position_generation(fresh, d):
+                return True
+            d = fresh
         from bot_utils.spot_exits import (
             service_spot_entry_basis, spot_entry_close_amount, has_pending_spot_exit_for_other_leg,
         )
@@ -258,7 +266,13 @@ class TrendBot(SpotBot):
             return True
         self._retry_pending_partial_accounting(sym, d)
         d_live = self.state.get(sym) or d
-        return bool(d_live.get("accounting_pending_partials"))
+        if not d_live.get("accounting_pending_partials"):
+            return False
+        from bot_utils.trade_state import partial_accounting_allows_protection
+        return not partial_accounting_allows_protection(
+            self.state, sym, d_live, bot_name=self.BOT_NAME,
+            mode_is_sim=self.simulation, is_futures=False,
+        )
 
     def _evaluate(self, sym: str, held: bool,
                   p: Optional[TrendParams] = None) -> Tuple[bool, int, Dict[str, bool]]:
@@ -812,6 +826,7 @@ class TrendBot(SpotBot):
             "entry_id": entry_id,
             "provisional": not basis_verified,
             "entry_price_unverified": not basis_verified,
+            "entry_fee_finalization_pending": False,
         }
         if sim_tca_pending is not None:
             fields[self._SIM_TCA_PENDING_FIELD] = sim_tca_pending
@@ -825,6 +840,8 @@ class TrendBot(SpotBot):
             fields,
             {"entry_id": entry_id},
             create_fields=create_fields,
+            finalize_entry=True,
+            create_if_absent=self.simulation,
         )
 
     #  MONITOR loop: exit coins that fell out of trend, + killswitch 

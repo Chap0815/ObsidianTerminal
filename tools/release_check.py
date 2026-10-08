@@ -25,6 +25,7 @@ from tools.release_requirements import (  # noqa: E402, I001
     REQUIRED_MANIFEST_FILES,
     REQUIRED_RELEASE_DIRS,
     REQUIRED_RELEASE_ITEMS,
+    is_release_root_file,
 )
 from tools.update_deploy_manifest import (  # noqa: E402
     _collect_source_records,
@@ -111,7 +112,7 @@ _EXACT_REQUIREMENT_RE = re.compile(
 )
 DEPENDENCY_ADVISORY_POLICY_REL = Path("config/dependency_advisory_policy.json")
 DEPENDENCY_ADVISORY_POLICY_MAX_BYTES = 1024 * 1024
-DEPENDENCY_ADVISORY_MAX_AGE = timedelta(days=30)
+DEPENDENCY_ADVISORY_MAX_AGE = timedelta(days=7)
 DEPENDENCY_ADVISORY_FUTURE_TOLERANCE = timedelta(minutes=5)
 OSV_QUERYBATCH_URL = "https://api.osv.dev/v1/querybatch"
 RELEASE_METADATA_MAX_BYTES = 4 * 1024 * 1024
@@ -373,7 +374,7 @@ def _dependency_advisory_errors(root: Path) -> list[str]:
             errors.append("dependency advisory policy retrieval time is in the future")
         elif now - retrieved_at > DEPENDENCY_ADVISORY_MAX_AGE:
             errors.append(
-                "dependency advisory policy is older than 30 days; run the "
+                "dependency advisory policy is older than 7 days; run the "
                 "explicit OSV policy refresh and review every result"
             )
     expected_lock_hash = str(policy.get("requirements_lock_sha256") or "").lower()
@@ -797,6 +798,9 @@ def _is_forbidden_release_artifact(path: Path, root: Path) -> str | None:
     rel_posix = rel.as_posix()
     rel_posix_lower = rel_posix.lower()
     allowed_root_metadata = rel_posix_lower in ALLOWED_ROOT_METADATA_NAMES
+    if (len(rel.parts) == 1 and not is_release_root_file(rel.name)
+            and (not path.is_dir() or _is_linklike(path))):
+        return f"forbidden unapproved root file in release: {rel}"
     if rel.parts and rel.parts[0].lower() == "tools" and rel_posix not in RELEASE_TOOL_FILES:
         return f"forbidden non-release tool in release: {rel}"
     if parts_lower & forbidden_dirs_lower or any(_is_test_temp_name(part) for part in rel.parts):

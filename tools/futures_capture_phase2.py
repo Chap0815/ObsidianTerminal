@@ -1196,16 +1196,46 @@ def _sync_phase2_output_directory(path: Path) -> None:
                 pass
 
 
-def _sync_phase2_publication_chain(path: Path) -> None:
-    """Sync the output parent and every ancestor through its filesystem root."""
+def _sync_phase2_publication_chain(path: Path, *, stop_at: Path | None = None) -> None:
+    """Sync every changed namespace through the stable caller boundary."""
     directory = path.resolve(strict=True)
+    boundary = stop_at.resolve(strict=True) if stop_at is not None else None
+    if boundary is not None and not directory.is_relative_to(boundary):
+        raise ValueError("phase-2 durability boundary is outside output ancestry")
     for _depth in range(_MAX_DURABILITY_PARENT_DEPTH):
         _sync_phase2_output_directory(directory)
+        if directory == boundary:
+            return
         parent = directory.parent
         if parent == directory:
             return
         directory = parent
     raise ValueError("phase-2 output directory depth exceeds durability limit")
+
+
+def _windows_phase2_publication_boundary(path: Path) -> tuple[Path, tuple[int, int]]:
+    """Use an existing profile/first-level namespace, never bypass a failed flush.
+
+    A non-admin Windows writer cannot flush C:\\ or C:\\Users. It never changes
+    their existing profile reference. Custom drive/UNC locations must still pass
+    their actual native barrier; creating a new first level requires root access.
+    """
+    anchor = Path(path.anchor)
+    profile = Path.home().absolute()
+    if profile != anchor and path.parent.is_relative_to(profile) and profile.is_dir():
+        boundary = _absolute_without_links(profile, label="phase-2 profile boundary")
+    else:
+        relative = path.parent.relative_to(anchor)
+        boundary = anchor / relative.parts[0] if relative.parts else anchor
+    if boundary == anchor or not boundary.is_dir():
+        # Check before mkdir so a denied root barrier cannot leave new root refs.
+        _sync_phase2_output_directory(anchor)
+        boundary = anchor
+    boundary = _absolute_without_links(boundary, label="phase-2 durability boundary")
+    identity = boundary.stat(follow_symlinks=False)
+    if not stat.S_ISDIR(identity.st_mode):
+        raise ValueError("phase-2 durability boundary must be a directory")
+    return boundary, (identity.st_dev, identity.st_ino)
 
 
 def _atomic_json(path: Path, payload: dict) -> None:
@@ -1220,8 +1250,16 @@ def _atomic_json(path: Path, payload: dict) -> None:
         + "\n"
     ).encode("utf-8")
     path = _absolute_without_links(path, label="immutable JSON output path")
+    boundary, boundary_identity = (
+        _windows_phase2_publication_boundary(path) if os.name == "nt" else (None, None)
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     path = _absolute_without_links(path, label="immutable JSON output path")
+    if boundary is not None:
+        current = boundary.stat(follow_symlinks=False)
+        if (_is_linklike(boundary) or not stat.S_ISDIR(current.st_mode)
+                or (current.st_dev, current.st_ino) != boundary_identity):
+            raise ValueError("phase-2 durability boundary changed during parent creation")
 
     def existing_matches() -> bool:
         if not path.is_file() or _is_linklike(path):
@@ -1235,7 +1273,7 @@ def _atomic_json(path: Path, payload: dict) -> None:
             return False
 
     def sync_publication() -> None:
-        _sync_phase2_publication_chain(path.parent)
+        _sync_phase2_publication_chain(path.parent, stop_at=boundary)
 
     if path.exists():
         if existing_matches():

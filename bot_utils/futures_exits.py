@@ -155,41 +155,60 @@ def _utc_now_str() -> str:
     return _date()
 
 
-def _extract_fill_from_order(order: dict) -> Optional[float]:
+def _extract_fill_from_order(order: dict, *, contract_size=None) -> Optional[float]:
+    """Execution average, with actual cost/quantity agreement when supplied.
+
+    ``price`` is an order quote, not evidence of an executed market price.
+    """
     if not isinstance(order, dict):
         return None
-    for key in ("average", "price"):
-        val = order.get(key)
-        if isinstance(val, bool):
-            continue
-        if isinstance(val, str) and len(val) > _MAX_NUMERIC_TEXT_CHARS:
-            continue
-        if val is None:
-            continue
+    def positive(value):
+        if isinstance(value, bool) or (
+                isinstance(value, str) and len(value) > _MAX_NUMERIC_TEXT_CHARS):
+            return None
         try:
-            v = float(val)
-            if math.isfinite(v) and v > 0:
-                return v
+            parsed = float(value)
         except Exception:
-            continue
+            return None
+        return parsed if math.isfinite(parsed) and parsed > 0 else None
+
+    averages = []
+    candidates = [order.get("average")]
     info = order.get("info")
     if isinstance(info, dict):
-        for key in ("avgPrice", "averagePrice", "filledAvgPrice",
-                     "fillPrice", "price"):
-            val = info.get(key)
-            if isinstance(val, bool):
-                continue
-            if isinstance(val, str) and len(val) > _MAX_NUMERIC_TEXT_CHARS:
-                continue
-            if val is None:
-                continue
-            try:
-                v = float(val)
-                if math.isfinite(v) and v > 0:
-                    return v
-            except Exception:
-                continue
-    return None
+        candidates.extend(info.get(key) for key in (
+            "avgPrice", "averagePrice", "filledAvgPrice", "fillPrice"))
+    for candidate in candidates:
+        if candidate in (None, "", 0, "0") and not isinstance(candidate, bool):
+            continue
+        value = positive(candidate)
+        if value is None:
+            return None
+        averages.append(value)
+    if averages and any(not math.isclose(value, averages[0], rel_tol=1e-8,
+                                         abs_tol=1e-12) for value in averages):
+        return None
+    cost_raw = order.get("cost")
+    cost = positive(cost_raw)
+    if cost_raw not in (None, "", 0, "0") or isinstance(cost_raw, bool):
+        if cost is None:
+            return None
+        filled = positive(order.get("filled"))
+        cs = positive(contract_size)
+        if filled is None or cs is None:
+            return None
+        inferred = cost / filled / cs
+        if not math.isfinite(inferred) or inferred <= 0:
+            return None
+        if averages:
+            return averages[0] if math.isclose(
+                averages[0], inferred, rel_tol=1e-8, abs_tol=1e-12) else None
+        # CCXT can derive cost from a quoted price even without a real fill
+        # average.  Such an order still needs authenticated fill recovery.
+        if positive(order.get("price")) is not None:
+            return None
+        return inferred
+    return averages[0] if averages else None
 
 
 def _positive_finite_or_zero(value) -> float:
@@ -302,6 +321,21 @@ def _trade_as_order_snapshot(
     return snapshot
 
 
+def _adopt_verified_fill_snapshot(order: dict, recovered: dict, price: float) -> None:
+    """Keep the bound identity and replace stale execution/accounting facts."""
+    for field in ("filled", "cost", "fee", "fees", "info"):
+        if field not in recovered:
+            order.pop(field, None)
+            continue
+        value = recovered[field]
+        if isinstance(value, dict):
+            value = dict(value)
+        elif isinstance(value, list):
+            value = [dict(item) if isinstance(item, dict) else item for item in value]
+        order[field] = value
+    order["average"] = price
+
+
 def _resolve_fill_price(ex,
                         symbol_full: str,
                         order: dict,
@@ -312,9 +346,13 @@ def _resolve_fill_price(ex,
                         expected_position_side: str = "",
                         expected_client_id: Optional[str] = None,
                         expected_amount: Optional[float] = None,
+                        contract_size: Optional[float] = None,
                         ) -> Tuple[float, str]:
     """Multi-stage fill-price recovery  returns (price, source_label)."""
     fallback = _positive_finite_or_zero(fallback_price)
+    if contract_size is None:
+        from bot_utils.futures_order import futures_contract_size_or_none
+        contract_size = futures_contract_size_or_none(ex, symbol_full)
 
     def _trade_identity_conflict_fallback() -> Tuple[float, str]:
         try:
@@ -351,7 +389,7 @@ def _resolve_fill_price(ex,
     ):
         return fallback, "fallback"
 
-    fp = _extract_fill_from_order(order)
+    fp = _extract_fill_from_order(order, contract_size=contract_size)
     if fp is not None:
         return fp, "order"
 
@@ -410,8 +448,9 @@ def _resolve_fill_price(ex,
                     except Exception:
                         pass
                     continue
-                fp = _extract_fill_from_order(fetched)
+                fp = _extract_fill_from_order(fetched, contract_size=contract_size)
                 if fp is not None:
+                    _adopt_verified_fill_snapshot(order, fetched, fp)
                     return fp, "fetch_order"
             except Exception as e:
                 if attempt == _FILL_RESOLVE_MAX_RETRIES - 1:
@@ -520,8 +559,9 @@ def _resolve_fill_price(ex,
                 expected_amount=expected_amount,
             ):
                 return _trade_identity_conflict_fallback()
-            fp = _extract_fill_from_order(recovered)
+            fp = _extract_fill_from_order(recovered, contract_size=contract_size)
             if fp is not None:
+                _adopt_verified_fill_snapshot(order, recovered, fp)
                 return fp, "trades"
     except Exception as trade_history_error:
         try:
@@ -661,6 +701,12 @@ def _close_single_position(**kw):
                 )
             kw = dict(kw)
             kw["d"] = live
+            if live.get("accounting_pending_partials"):
+                from bot_utils.trade_state import partial_accounting_allows_protection
+                if not partial_accounting_allows_protection(
+                        state, sym, live, bot_name=kw.get("bot_name"),
+                        mode_is_sim=kw.get("simulation"), is_futures=True):
+                    return (sym, "failed", 0.0, "partial accounting WAL is not verified durable")
         return _close_single_position_impl(**kw)
 
 
@@ -1034,6 +1080,7 @@ def _close_single_position_impl(*,
                     expected_position_side=pos_type,
                     expected_client_id=client_order_id,
                     expected_amount=close_amount,
+                    contract_size=d.get("entry_contract_size") or d.get("contract_size"),
                 )
                 if resolved is not None and resolved > 0:
                     fill_price = resolved

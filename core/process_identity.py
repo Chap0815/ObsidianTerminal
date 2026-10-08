@@ -7,6 +7,7 @@ also references this project and the bot's module or script path.
 from __future__ import annotations
 
 import os
+import ntpath
 import re
 import shlex
 import subprocess
@@ -136,14 +137,23 @@ def _python_invocation_target(cmdline: str) -> tuple[str, str]:
         ]
     except (TypeError, ValueError):
         return "", ""
+    kind, target, _arguments = python_invocation_from_argv(tokens)
+    return kind, target
+
+
+def python_invocation_from_argv(argv) -> tuple[str, str, tuple[str, ...]]:
+    """Parse the actual Python target without joining/loss of argv boundaries."""
+    if not isinstance(argv, (list, tuple)) or any(not isinstance(t, str) for t in argv):
+        return "", "", ()
+    tokens = [_unquote_cmdline_token(token) for token in argv]
     if len(tokens) < 2:
-        return "", ""
+        return "", "", ()
     executable_name = _norm(tokens[0]).rsplit("/", 1)[-1]
     if not re.fullmatch(
         r"(?:python(?:w|\d+(?:\.\d+)*)?|pypy\d*|pyw?)(?:\.exe)?",
         executable_name,
     ):
-        return "", ""
+        return "", "", ()
     index = 1
     while index < len(tokens):
         token = tokens[index]
@@ -162,33 +172,88 @@ def _python_invocation_target(cmdline: str) -> tuple[str, str]:
             "-VV",
             "--version",
         }:
-            return "", ""
+            return "", "", ()
         if token == "-m":
             if index + 1 >= len(tokens):
-                return "", ""
-            return "module", _norm(tokens[index + 1])
+                return "", "", ()
+            return "module", _norm(tokens[index + 1]), tuple(tokens[index + 2:])
         if token == "-c":
-            return "", ""
+            return "", "", ()
         if token == "--":
             index += 1
             if index >= len(tokens):
-                return "", ""
-            return "script", _norm(tokens[index])
+                return "", "", ()
+            return "script", _norm(tokens[index]), tuple(tokens[index + 1:])
         if token == "-":
-            return "", ""
+            return "", "", ()
         if token == "--check-hash-based-pycs":
             if (
                 index + 1 >= len(tokens)
                 or tokens[index + 1] not in {"always", "default", "never"}
             ):
-                return "", ""
+                return "", "", ()
             index += 2
             continue
         if token.startswith("-"):
             index += 2 if token in {"-W", "-X"} else 1
             continue
-        return "script", _norm(token)
-    return "", ""
+        return "script", _norm(token), tuple(tokens[index + 1:])
+    return "", "", ()
+
+
+def commandline_argv(commandline: str) -> tuple[str, ...]:
+    """Decode a Windows-style command line without executing or expanding it."""
+    try:
+        return tuple(_unquote_cmdline_token(token)
+                     for token in shlex.split(commandline, posix=False))
+    except (TypeError, ValueError):
+        raise ValueError("process command line cannot be parsed") from None
+
+
+def script_target_scope(target: str, relative_target: str, root, cwd=None) -> str:
+    """Attribute one actual script path; unknown cwd is never foreign/flat proof."""
+    root_path = ntpath.normcase(ntpath.normpath(str(root)))
+    expected = ntpath.normcase(ntpath.normpath(ntpath.join(root_path, relative_target)))
+    target_path = ntpath.normcase(ntpath.normpath(target))
+    if ntpath.isabs(target_path):
+        # A rooted path without drive depends on the process's current drive.
+        if ntpath.splitdrive(root_path)[0] and not ntpath.splitdrive(target_path)[0]:
+            if not cwd or not ntpath.splitdrive(str(cwd))[0]:
+                return "unknown"
+            target_path = ntpath.splitdrive(str(cwd))[0] + target_path
+        return "root" if target_path == expected else "foreign"
+    if ntpath.splitdrive(target_path)[0] or not cwd or not ntpath.isabs(str(cwd)):
+        return "unknown"
+    actual = ntpath.normcase(ntpath.normpath(ntpath.join(str(cwd), target_path)))
+    return "root" if actual == expected else "foreign"
+
+
+def dashboard_process_scope(argv, root, cwd=None) -> str | None:
+    """Recognize only Python's real Streamlit run target, then bind its root."""
+    kind, target, arguments = python_invocation_from_argv(argv)
+    if kind != "module" or target != "streamlit" or len(arguments) < 2 or arguments[0] != "run":
+        return None
+    script = _norm(arguments[1])
+    normalized = ntpath.normcase(ntpath.normpath(script))
+    relative = ntpath.normcase(ntpath.normpath("tools/dashboard.py"))
+    if normalized != relative and not normalized.endswith("\\" + relative):
+        return None
+    return script_target_scope(script, "tools/dashboard.py", root, cwd)
+
+
+def bot_process_scope(argv, root, bot_meta: dict, cwd=None) -> str | None:
+    """Conservative bot-module barrier and exact root attribution for scripts."""
+    kind, target, _arguments = python_invocation_from_argv(argv)
+    if kind == "module" and any(target == _norm(meta.get("module")) for meta in bot_meta.values()):
+        return "root"
+    if kind == "script":
+        normalized = ntpath.normcase(ntpath.normpath(target))
+        for meta in bot_meta.values():
+            relative = str(meta.get("script") or "")
+            expected = ntpath.normcase(ntpath.normpath(relative))
+            if relative and (normalized == expected or normalized.endswith("\\" + expected)):
+                return script_target_scope(target, relative, root, cwd)
+    return None
 
 
 def cmdline_bot_match_kind(bot_name: str, cmdline: str) -> str:

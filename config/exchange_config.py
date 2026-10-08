@@ -423,6 +423,11 @@ def _publish_clock_offset_ms(offset_ms: float) -> None:
 def is_clock_skew_error(exc: BaseException) -> bool:
     """True if the error is a signing-timestamp / recvWindow problem a
     server-time resync can fix  independent of region or OS clock."""
+    # Transport errors can contain the signed request URL, including
+    # recvWindow. They do not prove the exchange rejected the request: retrying
+    # a POST here could duplicate an already accepted order.
+    if isinstance(exc, ccxt.NetworkError):
+        return False
     try:
         if isinstance(exc, ccxt.InvalidNonce):
             return True
@@ -652,11 +657,16 @@ def _finalize_connection(ex):
     return ex
 
 
+def _ccxt_exchange_class(exchange_name: str):
+    """Keep configured venue labels while resolving CCXT's canonical class."""
+    return getattr(ccxt, {"gateio": "gate"}.get(exchange_name, exchange_name))
+
+
 def get_exchange_connection():
     """Spot connection. Reads EXCHANGE from .env."""
     exchange_name, config = _build_base_config(market_type="spot")
     try:
-        exchange_class = getattr(ccxt, exchange_name)
+        exchange_class = _ccxt_exchange_class(exchange_name)
     except AttributeError:
         raise ValueError(
             f"Unknown exchange '{exchange_name}'. Check EXCHANGE in .env"
@@ -680,6 +690,7 @@ _FUTURES_TYPE_MAP = {
     "bybit":    "swap",
     "kucoin":   "swap",
     "gateio":   "swap",
+    "gate":     "swap",
     "mexc":     "swap",
 }
 
@@ -701,7 +712,7 @@ def get_futures_exchange_connection():
         config["options"]["productType"] = "USDT-FUTURES"
 
     try:
-        exchange_class = getattr(ccxt, exchange_name)
+        exchange_class = _ccxt_exchange_class(exchange_name)
     except AttributeError:
         raise ValueError(f"Unknown exchange '{exchange_name}'")
 
@@ -750,7 +761,7 @@ def get_public_futures_exchange_connection(exchange_name: str | None = None):
         config["proxies"] = {"http": proxy_url, "https": proxy_url}
 
     try:
-        exchange_class = getattr(ccxt, exchange_name)
+        exchange_class = _ccxt_exchange_class(exchange_name)
     except AttributeError:
         raise ValueError(f"Unknown exchange '{exchange_name}'")
     return _finalize_connection(exchange_class(config))

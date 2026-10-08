@@ -46,7 +46,7 @@ API_PASSPHRASE           default: (none)   [fallback: BITGET_PASSWORD]
 ================================================================================
 
 USE_PROXY                default: false
-    Set true to route exchange/HTTP traffic through a local SOCKS/HTTP proxy.
+    Set true to route exchange/HTTP traffic through an HTTP proxy.
 PROXY_HOST               default: 127.0.0.1
 PROXY_PORT               default: 10808
     Host/port of the proxy used when USE_PROXY=true.
@@ -218,8 +218,9 @@ NO_COLOR                 default: (unset)
 ================================================================================
 
 SIMULATION               default: (per bot_config.json SIMULATION flag)
-    Global override for paper-trading mode. Normally controlled per-bot in
-    bot_config.json / the UI; set here only to force all bots on/off.
+    Fallback for paper-trading mode when no per-bot value is configured.
+    Saved SIMULATION values in bot_config.json / the UI take precedence;
+    this environment setting does not override an existing LIVE selection.
 SIM_RANDOM_SEED          default: (none)
     Fixed RNG seed for the trade simulator (reproducible SIM runs).
 OPTIMIZER_SEED           default: (none)

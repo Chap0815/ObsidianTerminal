@@ -19,7 +19,9 @@ import customtkinter as ctk
 import tkinter as tk
 
 from launcher.config.settings import BOT_META, COLORS, FONT_BODY, PROJECT_ROOT
-from launcher.ui.components.widgets import safe_geometry
+from launcher.ui.components.widgets import (
+    safe_geometry, keyboard_button, AdaptiveActionRow,
+)
 from launcher.ui.theme import force_dark_titlebar
 from shared_limits import PROMPT_TEXT_MAX_BYTES, read_bounded_text_file
 
@@ -229,16 +231,16 @@ class PromptEditor(ctk.CTkToplevel):
         self.grab_set()
         # Clamp+center to usable screen; cap minsize so a short screen can still
         # reach the footer buttons (the editor body already scrolls).
-        safe_geometry(self, 980, 720, parent=parent)
+        width, height = safe_geometry(self, 980, 720, parent=parent)
         try:
-            self.minsize(min(800, self.winfo_screenwidth() - 80),
-                         min(600, self.winfo_screenheight() - 80))
+            self.minsize(min(800, width), min(600, height))
         except Exception:
             pass
 
         self._dirty = False
         self._build_ui()
         self._load_prompt()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     #  Layout 
 
@@ -373,38 +375,35 @@ class PromptEditor(ctk.CTkToplevel):
 
         #  Footer with actions 
         ctk.CTkFrame(self, fg_color=COLORS["border"], height=1).pack(fill="x")
-        footer = ctk.CTkFrame(self, fg_color=COLORS["panel"], height=64, corner_radius=0)
-        footer.pack(fill="x")
-        footer.pack_propagate(False)
+        footer = ctk.CTkFrame(self, fg_color=COLORS["panel"], corner_radius=0)
+        # Pack before the expandable editor to keep actions reachable at high DPI.
+        footer.pack(fill="x", side="bottom", before=body)
+        f_inner = AdaptiveActionRow(footer, fg_color="transparent")
+        f_inner.pack(fill="x", padx=20, pady=(4, 0))
 
-        f_inner = ctk.CTkFrame(footer, fg_color="transparent")
-        f_inner.pack(fill="both", expand=True, padx=20, pady=14)
-
-        ctk.CTkButton(f_inner, text=" Reset to default",
+        reset_button = keyboard_button(f_inner, text=" Reset to default",
                        width=160, height=36, corner_radius=8,
                        font=ctk.CTkFont(FONT_BODY, 12, "bold"),
                        fg_color="transparent", hover_color=COLORS["panel_hover"],
                        text_color=COLORS["text_dim"],
                        border_width=1, border_color=COLORS["border"],
-                       command=self._reset_to_default
-                       ).pack(side="left")
+                       command=self._reset_to_default)
 
-        ctk.CTkLabel(f_inner,
+        save_hint = ctk.CTkLabel(footer,
                       text="Speichern ueberschreibt die Datei. Bot danach neu starten.",
                       font=ctk.CTkFont(FONT_BODY, 11, "bold"),
-                      text_color=COLORS["text_muted"]
-                      ).pack(side="left", padx=(16, 0))
+                      text_color=COLORS["text_muted"], wraplength=320)
 
-        ctk.CTkButton(f_inner, text="Cancel",
+        keyboard_button(f_inner, text="Cancel",
                        width=100, height=36, corner_radius=8,
                        font=ctk.CTkFont(FONT_BODY, 12, "bold"),
                        fg_color="transparent", hover_color=COLORS["panel_hover"],
                        text_color=COLORS["text_dim"],
                        border_width=1, border_color=COLORS["border"],
-                       command=self.destroy
+                       command=self._on_close
                        ).pack(side="right", padx=(8, 0))
 
-        ctk.CTkButton(f_inner, text=" Save Prompt",
+        keyboard_button(f_inner, text=" Save Prompt",
                        width=150, height=36, corner_radius=8,
                        font=ctk.CTkFont(FONT_BODY, 12, "bold"),
                        fg_color=self.accent,
@@ -412,6 +411,8 @@ class PromptEditor(ctk.CTkToplevel):
                        text_color="#ffffff",
                        command=self._save
                        ).pack(side="right")
+        reset_button.pack(side="left")
+        save_hint.pack(fill="x", padx=20, pady=(0, 6))
 
     #  Data 
 
@@ -597,7 +598,7 @@ class PromptEditor(ctk.CTkToplevel):
                               text_color=COLORS["danger"]
                               ).pack(side="bottom", pady=(0, 8))
 
-        ctk.CTkButton(btns, text=" Create default files now",
+        keyboard_button(btns, text=" Create default files now",
                        height=32, corner_radius=6, width=220,
                        font=ctk.CTkFont(FONT_BODY, 11, "bold"),
                        fg_color=COLORS["success"], hover_color="#0d9b6c",
@@ -605,7 +606,7 @@ class PromptEditor(ctk.CTkToplevel):
                        command=_create_now
                        ).pack(side="right")
 
-        ctk.CTkButton(btns, text="Close",
+        keyboard_button(btns, text="Close",
                        height=32, corner_radius=6, width=100,
                        font=ctk.CTkFont(FONT_BODY, 11, "bold"),
                        fg_color=COLORS["bg"], hover_color=COLORS["panel_hover"],
@@ -693,6 +694,22 @@ class PromptEditor(ctk.CTkToplevel):
 
     #  Actions 
 
+    def _on_close(self):
+        if self._dirty:
+            from tkinter import messagebox
+
+            save = messagebox.askyesnocancel(
+                "Unsaved prompt", "Save your prompt changes before closing?",
+                parent=self,
+            )
+            if save is None:
+                return
+            if save:
+                self._save()
+                if self._dirty:
+                    return
+        self.destroy()
+
     def _save(self):
         content = self.editor.get("1.0", "end-1c")
         ok, err = self._validate(content)
@@ -726,18 +743,22 @@ class PromptEditor(ctk.CTkToplevel):
         force_dark_titlebar(dlg)
         safe_geometry(dlg, 400, 180, parent=self)
 
-        ctk.CTkLabel(dlg, text="Reset to default prompt?",
+        row = AdaptiveActionRow(dlg, fg_color="transparent")
+        row.pack(side="bottom", fill="x", padx=12, pady=8)
+        body = ctk.CTkScrollableFrame(dlg, fg_color="transparent",
+                                      scrollbar_button_color=COLORS["border"])
+        body.pack(fill="both", expand=True, padx=8, pady=4)
+
+        ctk.CTkLabel(body, text="Reset to default prompt?",
                       font=ctk.CTkFont(FONT_BODY, 13, "bold"),
                       text_color=COLORS["text"]
                       ).pack(pady=(20, 4))
 
-        ctk.CTkLabel(dlg, text="Your current changes will be lost.",
+        ctk.CTkLabel(body, text="Your current changes will be lost.",
                       font=ctk.CTkFont(FONT_BODY, 11, "bold"),
                       text_color=COLORS["text_dim"]
                       ).pack(pady=(0, 16))
 
-        row = ctk.CTkFrame(dlg, fg_color="transparent")
-        row.pack()
 
         def _confirm():
             try:
@@ -748,18 +769,18 @@ class PromptEditor(ctk.CTkToplevel):
                 self.status_lbl.configure(text=" Reset (unsaved)",
                                             text_color=COLORS["warning"])
                 self._update_char_count()
-            except Exception:
-                pass
+            except Exception as exc:
+                self._show_toast(f"Reset failed: {exc}", color=COLORS["danger"])
             dlg.destroy()
 
-        ctk.CTkButton(row, text="Reset", width=110, height=34,
+        keyboard_button(row, text="Reset", width=110, height=34,
                        fg_color=COLORS["warning"], hover_color="#d97706",
                        text_color="#ffffff", corner_radius=8,
                        font=ctk.CTkFont(FONT_BODY, 12, "bold"),
                        command=_confirm
                        ).pack(side="left", padx=6)
 
-        ctk.CTkButton(row, text="Cancel", width=110, height=34,
+        keyboard_button(row, text="Cancel", width=110, height=34,
                        fg_color="transparent", hover_color=COLORS["panel_hover"],
                        text_color=COLORS["text_dim"], corner_radius=8,
                        border_width=1, border_color=COLORS["border"],
@@ -778,5 +799,6 @@ class PromptEditor(ctk.CTkToplevel):
             height=30,
         )
         self._toast.place(relx=0.5, rely=0.9, anchor="center", relwidth=0.7)
-        self.after(2500, lambda: self._toast.destroy()
-                    if self._toast.winfo_exists() else None)
+        toast = self._toast
+        self.after(2500, lambda: toast.destroy()
+                    if toast.winfo_exists() else None)

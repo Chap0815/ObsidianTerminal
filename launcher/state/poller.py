@@ -796,7 +796,16 @@ class DataPoller:
                                     _safe_error_text(exc, 160)
                                 )
                                 unr[fut_bot] = cached_unrealized.get(fut_bot, 0.0)
-                        if new_data["metrics_error_bots"]:
+                            except MetricsDbReadError as exc:
+                                unrealized_error = _safe_error_text(exc, 160)
+                                self._log_diag(
+                                    f"unrealized fallback DB read failed: {_safe_error_text(exc)}"
+                                )
+                                if not new_data.get("metrics_error"):
+                                    new_data["metrics_error"] = unrealized_error
+                                new_data["metrics_error_scope"] = "global"
+                                unr[fut_bot] = cached_unrealized.get(fut_bot, 0.0)
+                        if new_data["metrics_error_bots"] and not unrealized_error:
                             unrealized_error = "unverified position metrics"
                     except MetricsDbReadError as exc:
                         unrealized_error = _safe_error_text(exc, 160)
@@ -806,7 +815,8 @@ class DataPoller:
                         cached_unrealized = self.cache.get("unrealized", {})
                         for fut_bot in futures_requests:
                             unr[fut_bot] = cached_unrealized.get(fut_bot, 0.0)
-                        new_data["metrics_error"] = unrealized_error
+                        if not new_data.get("metrics_error"):
+                            new_data["metrics_error"] = unrealized_error
                     # SPOT bots share one union ticker batch. This avoids two
                     # API reservations and round trips for one UI refresh.
                     spot_requests = {
@@ -826,12 +836,33 @@ class DataPoller:
                                 "_spot_exchange",
                                 get_spot_exchange_connection,
                             )
+                            spot_errors = {}
                             unr.update(
                                 get_unrealized_pnl_spots(
                                     spot_requests,
                                     spot_exchange,
+                                    per_bot_errors=spot_errors,
                                 )
                             )
+                            for spot_bot in spot_requests:
+                                if spot_bot in spot_errors:
+                                    new_data["metrics_error_bots"][spot_bot] = (
+                                        _safe_error_text(spot_errors[spot_bot], 160))
+                                    unr[spot_bot] = self.cache.get("unrealized", {}).get(spot_bot, 0.0)
+                                    if not unrealized_error:
+                                        unrealized_error = "unverified position metrics"
+                                else:
+                                    new_data["metrics_error_bots"].pop(spot_bot, None)
+                        except MetricsMarketDataError as exc:
+                            for spot_bot in spot_requests:
+                                new_data["metrics_error_bots"][spot_bot] = (
+                                    _safe_error_text(exc, 160)
+                                )
+                                unr[spot_bot] = self.cache.get(
+                                    "unrealized", {}
+                                ).get(spot_bot, 0.0)
+                            if not unrealized_error:
+                                unrealized_error = "unverified position metrics"
                         except Exception as exc:
                             unrealized_error = _safe_error_text(exc, 160)
                             self._log_diag(
@@ -843,7 +874,11 @@ class DataPoller:
                                 unr[spot_bot] = self.cache.get(
                                     "unrealized", {}
                                 ).get(spot_bot, 0.0)
-                            new_data["metrics_error"] = unrealized_error
+                            if not new_data.get("metrics_error"):
+                                new_data["metrics_error"] = unrealized_error
+                    if (unrealized_error == "unverified position metrics"
+                            and not new_data["metrics_error_bots"]):
+                        unrealized_error = ""
                     new_data["unrealized"] = unr
                     self._unrealized_metrics_error = unrealized_error
                     self._unrealized_next = cadence_now + 15.0
@@ -854,12 +889,17 @@ class DataPoller:
                         self, "_unrealized_metrics_error", ""
                     )
                 if unrealized_error:
-                    new_data["metrics_error"] = unrealized_error
                     if (
                         unrealized_error == "unverified position metrics"
                         and new_data["metrics_error_bots"]
                     ):
-                        new_data["metrics_error_scope"] = "bot"
+                        # A local pricing/basis failure must never replace a
+                        # global DB failure from an earlier read in this tick.
+                        if not new_data.get("metrics_error"):
+                            new_data["metrics_error"] = unrealized_error
+                            new_data["metrics_error_scope"] = "bot"
+                    elif not new_data.get("metrics_error"):
+                        new_data["metrics_error"] = unrealized_error
 
                 # Incremental read via _ErrorLogCounter  O(1) when no new errors.
                 new_data["error_count"] = self._error_counter.count()

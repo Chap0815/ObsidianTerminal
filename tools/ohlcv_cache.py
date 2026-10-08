@@ -74,7 +74,11 @@ def _exchange_cache_namespace(exchange) -> str:
     )
     if not namespace:
         raise ValueError("exchange cache identity is invalid")
-    return namespace[:64]
+    return _canonical_cache_namespace(namespace[:64])
+
+
+def _canonical_cache_namespace(namespace: str) -> str:
+    return "gate" if namespace == "gateio" else namespace
 
 
 def _validated_symbol(symbol: str) -> str:
@@ -264,6 +268,39 @@ def _load(
         return payload["rows"]
     except (OSError, TypeError, ValueError, OverflowError):
         return None
+
+
+def cached_series(timeframe: str, *, exchange_name: str | None = None,
+                  market_type: str | None = None) -> dict[str, list]:
+    """Read verified venue-scoped cached histories without fetching or migrating."""
+    if timeframe not in _TF_MS:
+        raise ValueError("unsupported cached timeframe")
+    if market_type not in {None, "spot", "swap"}:
+        raise ValueError("unsupported cached market type")
+    if exchange_name is None:
+        from config.exchange_config import get_active_exchange_name
+
+        exchange_name = get_active_exchange_name()
+    namespace = _validated_namespace(_canonical_cache_namespace(exchange_name.strip().lower()))
+    root = _cache_path_without_links(os.path.join(_CACHE_DIR, namespace))
+    if not root.is_dir():
+        return {}
+    result = {}
+    for path in root.glob(f"*__{timeframe}.json"):
+        path = _cache_path_without_links(str(path))
+        with path.open("rb") as handle:
+            payload = decode_ohlcv_cache_payload(handle.read(_CACHE_JSON_MAX_BYTES + 1))
+        if payload["exchange"] != namespace or payload["timeframe"] != timeframe:
+            raise ValueError("cached history has conflicting venue/timeframe identity")
+        symbol = payload["symbol"]
+        if path.name != ohlcv_cache_filename(symbol, timeframe) or symbol in result:
+            raise ValueError("cached history has conflicting symbol identity")
+        if market_type == "spot" and ":" in symbol:
+            continue
+        if market_type == "swap" and not symbol.endswith("/USDT:USDT"):
+            continue
+        result[symbol] = payload["rows"]
+    return result
 
 
 def _save(

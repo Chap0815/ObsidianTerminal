@@ -35,6 +35,7 @@ import itertools
 import multiprocessing
 import csv
 import json as _json
+import base64
 import random as _random
 import statistics
 import threading
@@ -1170,7 +1171,7 @@ def monte_carlo_perturbation(
     """Block-bootstrap the REAL per-position net returns and report the share of
     resampled equity paths that end positive.
 
-    Resamples contiguous blocks of actual position P&L (USDT) with replacement,
+    Resamples circular contiguous blocks of actual position P&L (USDT) with replacement,
     preserving the fat tails and local autocorrelation a Normal(avg, std)
     proxy destroys. Robust strategy >=90% positive; <70% concerning.
     """
@@ -1217,7 +1218,7 @@ def monte_carlo_perturbation(
         seq = []
         while len(seq) < trade_count:
             start = rng.randrange(trade_count)
-            seq.extend(nets[start : start + block])
+            seq.extend(nets[(start + offset) % trade_count] for offset in range(block))
         try:
             eq = math.fsum(seq[:trade_count])
         except (ArithmeticError, ValueError):
@@ -1252,6 +1253,7 @@ def monte_carlo_perturbation(
         "robust": share >= 0.90,
         "concerning": share < 0.70,
         "method": "block_bootstrap",
+        "block_boundary": "circular",
         "evidence_valid": True,
     }
 
@@ -3129,15 +3131,15 @@ def _label(p, strategy):
     return s
 
 
-def _cmd(p, strategy, days, use_maker):
+def _cmd(p, strategy, days, use_maker, dataset=None, *, validation_start=None, validation_end=None):
     c = f"python -m tools.backtester {strategy} {days}"
-    c += f" --pump {p['min_pump']:.0f}"
-    c += f" --activation {p['activation_profit']:.1f}"
-    c += f" --trailing {p['trailing_distance']:.1f}"
-    c += f" --partial {p['partial_pct']:.2f}"
-    c += f" --rsimax {p['rsi_max']:.0f}"
+    c += f" --pump {p['min_pump']!r}"
+    c += f" --activation {p['activation_profit']!r}"
+    c += f" --trailing {p['trailing_distance']!r}"
+    c += f" --partial {p['partial_pct']!r}"
+    c += f" --rsimax {p['rsi_max']!r}"
     if strategy in ("TREND", "FUTURES"):
-        c += f" --stop {abs(p.get('stop_loss', 2)):.1f}"
+        c += f" --stop {abs(p.get('stop_loss', 2))!r}"
     # Carry the leverage through so the validation command reproduces the run
     # (backtester defaults to 3.0 otherwise).
     _lev = p.get("leverage")
@@ -3145,6 +3147,20 @@ def _cmd(p, strategy, days, use_maker):
         c += f" --leverage {float(_lev):g}"
     if use_maker:
         c += " --maker"
+    command_params = dict(p)
+    if validation_start is not None or validation_end is not None:
+        if dataset is None or validation_start is None or validation_end is None:
+            raise ValueError("validation bounds require a frozen dataset and both endpoints")
+        for key, value in (("validation_start_utc", validation_start), ("validation_end_utc", validation_end)):
+            if not isinstance(value, datetime):
+                raise ValueError("validation bounds must be datetimes")
+            normalized = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+            command_params[key] = normalized.isoformat()
+    encoded = base64.b64encode(_json.dumps(command_params, sort_keys=True, allow_nan=False).encode("utf-8")).decode("ascii")
+    c += f" --params-b64 {encoded}"
+    if dataset is not None:
+        encoded_path = base64.b64encode(os.fspath(dataset).encode("utf-8")).decode("ascii")
+        c += f" --dataset-b64 {encoded_path}"
     return c
 
 
@@ -3983,6 +3999,11 @@ def run_optimizer(
         funding_8h,
         leverage,
     )
+    if funding_8h:
+        raise ValueError(
+            "OHLCV optimizer cannot model scalar --funding without historical "
+            "settlement-mark evidence. This OHLCV CLI does not support it."
+        )
     _validate_reproducible_run_inputs(
         workspace=workspace,
         dataset=dataset,
@@ -4052,17 +4073,12 @@ def run_optimizer(
             _p["funding_rate_8h"] = funding_8h
         if futures_screener_parity:
             _p["futures_screener_parity"] = True
-    if funding_8h:
-        print(
-            f"  Funding-Sensitivitt AKTIV  {funding_8h * 100:.4f}%/8h auf das "
-            f"Notional pro Hold-Dauer (Kosten, beide Seiten)"
-        )
-    elif strategy == "FUTURES":
+    if strategy == "FUTURES":
         print(
             "  FUNDING NICHT MODELLIERT (0%/8h)  echtes Leveraged-FUTURES "
-            "zahlt alle 8h Funding; gemeldete Edge ist OPTIMISTISCH. Mit "
-            "--funding R (z.B. 0.0001) realistisch rechnen, sonst kann eine "
-            "net-negative Config als 'deployment_validated' durchrutschen."
+            "traegt Fundingkosten; gemeldete Edge ist OPTIMISTISCH. "
+            "Scalar --funding ist hier ohne historische Settlement-Marken "
+            "nicht unterstuetzt."
         )
     if own_momentum:
         print(
@@ -4091,10 +4107,12 @@ def run_optimizer(
 
     dataset_manifest = None
     dataset_path = os.path.abspath(dataset) if dataset is not None else None
-    workspace_path = os.path.abspath(workspace) if workspace is not None else None
+    workspace_path = os.path.abspath(
+        workspace if workspace is not None else os.path.dirname(os.path.dirname(dataset_path)) if dataset_path else os.path.join(
+            _TOOL_PROJECT_ROOT, "data", "optimizer_workspace"
+        )
+    )
     if dataset_path is not None:
-        if workspace_path is None:
-            workspace_path = os.path.dirname(os.path.dirname(dataset_path))
         print(f" Lade und verifiziere unveraenderliches Dataset: {dataset_path}")
         t_load = time.time()
         history, dataset_manifest = load_history_dataset(dataset_path)
@@ -4514,7 +4532,8 @@ def run_optimizer(
         )
 
     for r in sorted_results:
-        r["cmd"] = _cmd(r["params"], strategy, days, use_maker)
+        r["cmd"] = _cmd(r["params"], strategy, days, use_maker, dataset=dataset_path,
+                        validation_start=tune_times[0], validation_end=tune_times[-1])
 
     # Top-Tabelle
     log_separator("", 78, color="\033[96m")
@@ -5064,8 +5083,8 @@ if __name__ == "__main__":
         print("       [--workspace PATH] [--dataset PATH] [--exchange NAME] [--resume]")
         print("       [--seed N] [--workers N] [--backend process|thread]")
         print(
-            "  --funding R     : model funding R per 8h (e.g. 0.0003) as a "
-            "cost sweep on the notional per hold-duration (default 0 = off)"
+            "  --funding R     : historical sweeps require R=0; use verified "
+            "capture replay with historical settlements for funding evaluation"
         )
         print(
             "  --holdout F     : reserve most-recent fraction F out-of-sample "

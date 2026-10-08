@@ -269,6 +269,7 @@ def _backtest_trend(closes, highs, lows, signal_fn):
             days_in += 1
         new = 1 if in_mkt[i] else 0
         if new != held:
+            opening_equity = e
             e *= 1 - COST  # pay the switch
             if held == 1 and new == 0 and entry_eq:
                 tr = e / entry_eq - 1
@@ -276,7 +277,7 @@ def _backtest_trend(closes, highs, lows, signal_fn):
                 if tr > 0:
                     wins += 1
             if new == 1:
-                entry_eq = e
+                entry_eq = opening_equity
         eq[i] = e
 
     with np.errstate(divide="ignore", invalid="ignore", over="ignore"):

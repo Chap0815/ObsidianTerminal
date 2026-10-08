@@ -720,7 +720,7 @@ def _fetch_one_rss(url: str, symbol: str) -> list:
         return []
     found = []
     for entry in entries[:25]:
-        if type(entry) is not dict:
+        if type(entry) not in (dict, feedparser.FeedParserDict):
             continue
         title = entry.get("title")
         if type(title) is not str:
@@ -921,7 +921,7 @@ def fetch_general_market_news() -> list:
     if not i_will_fetch:
         _general_inflight.wait(timeout=_ASCOMPLETED_BUFFER_SEC + 1.0)
         with _cache_lock:
-            if _general_cache["value"]:
+            if _general_cache["expires"] > time.monotonic() and _general_cache["value"]:
                 return list(_general_cache["value"])
             if _general_inflight.is_set():
                 _general_inflight.clear()

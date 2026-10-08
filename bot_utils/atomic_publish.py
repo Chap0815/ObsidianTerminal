@@ -7,6 +7,88 @@ import uuid
 from pathlib import Path
 
 
+def _directory_identity(path: Path) -> tuple[int, int]:
+    info = path.stat(follow_symlinks=False)
+    if (not stat.S_ISDIR(info.st_mode) or path.is_symlink()
+            or getattr(info, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)):
+        raise ValueError("publication directory must be an unlinked directory")
+    return info.st_dev, info.st_ino
+
+
+def _publication_boundary(directory: Path, sync) -> tuple[Path, tuple[int, int]]:
+    anchor = Path(directory.anchor)
+    if os.name != "nt":
+        boundary = anchor
+    else:
+        profile = Path.home().absolute()
+        if profile != anchor and directory.is_relative_to(profile) and profile.is_dir():
+            boundary = profile
+        else:
+            parts = directory.relative_to(anchor).parts
+            boundary = anchor / parts[0] if parts else anchor
+        if boundary == anchor or not boundary.exists():
+            # A new first-level reference requires its root namespace barrier.
+            # Check before mkdir; a denied flush must never count as durable.
+            sync(anchor)
+            boundary = anchor
+    return boundary, _directory_identity(boundary)
+
+
+def _sync_publication_chain(directory: Path, boundary: Path, identity, sync) -> None:
+    if not directory.is_relative_to(boundary):
+        raise ValueError("publication directory is outside durability boundary")
+    chain = []
+    current = directory
+    for _ in range(256):
+        chain.append((current, _directory_identity(current)))
+        if current == boundary:
+            break
+        current = current.parent
+    else:
+        raise ValueError("publication directory depth exceeds durability limit")
+    if chain[-1][1] != identity:
+        raise ValueError("publication boundary changed during directory creation")
+    for current, expected in chain:
+        if _directory_identity(current) != expected:
+            raise ValueError("publication directory generation changed")
+        sync(current)
+    for current, expected in chain:
+        if _directory_identity(current) != expected:
+            raise ValueError("publication directory changed during sync")
+
+
+def prepare_publication_directory(directory, *, sync_directory=None) -> None:
+    """Create and sync all parent references through a stable existing boundary.
+
+    Precreated directories are synced too, so retries cannot mistake a directory
+    left by a failed previous barrier for a durable parent reference.
+    """
+    path = Path(os.path.abspath(directory))
+    sync = sync_directory or _sync_directory
+    boundary, identity = _publication_boundary(path, sync)
+    # Validate existing ancestry before following it during mkdir.
+    current = path
+    for _ in range(256):
+        if current.exists() or current.is_symlink():
+            _directory_identity(current)
+        if current == boundary:
+            break
+        current = current.parent
+    else:
+        raise ValueError("publication directory depth exceeds durability limit")
+    path.mkdir(parents=True, exist_ok=True)
+    _sync_publication_chain(path, boundary, identity, sync)
+
+
+def sync_directory_chain(directory, *, sync_directory=None) -> None:
+    """Strictly sync an existing publication namespace, including retry parents."""
+    path = Path(os.path.abspath(directory))
+    sync = sync_directory or _sync_directory
+    boundary, identity = _publication_boundary(path, sync)
+    _sync_publication_chain(path, boundary, identity, sync)
+
+
 def _sync_directory(path: Path) -> None:
     directory = path.resolve(strict=True)
     if os.name == "nt":
@@ -86,7 +168,7 @@ def _sync_directory(path: Path) -> None:
 def atomic_write_bytes(path: str | os.PathLike[str], data: bytes) -> None:
     """Atomically and durably publish bytes without touching foreign temps."""
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
+    prepare_publication_directory(target.parent)
     temporary = target.with_name(
         f".{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     )
@@ -167,7 +249,7 @@ def atomic_write_bytes(path: str | os.PathLike[str], data: bytes) -> None:
 def atomic_create_bytes(path: str | os.PathLike[str], data: bytes) -> bool:
     """Durably create a file without overwriting an existing generation."""
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
+    prepare_publication_directory(target.parent)
     temporary = target.with_name(
         f".{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
     )

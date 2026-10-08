@@ -329,7 +329,9 @@ def prepare_shutdown_control(
         control_root / f"{name}-{run}.json",
         project_root=root,
     )
-    control_root.mkdir(parents=True, exist_ok=True)
+    from bot_utils.atomic_publish import prepare_publication_directory
+
+    prepare_publication_directory(control_root)
     target = _validate_target(
         target,
         project_root=root,
@@ -555,6 +557,7 @@ def consume_shutdown_request(
             or payload.get("run_id") != expected_run
             or type(payload_pid) is not int
             or payload_pid != expected_pid
+            or not isinstance(payload.get("mode"), str)
             or payload.get("mode") not in _VALID_MODES
         ):
             raise ValueError("shutdown control request identity is invalid")

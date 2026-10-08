@@ -73,6 +73,35 @@ COLORS = {
     "input_bg":     "#0d1118",
 }
 
+def _keyboard_button(*args, **kwargs):
+    """Keyboard access without importing the launcher before setup completes."""
+    button = ctk.CTkButton(*args, **kwargs)
+    target = button._canvas
+    target.configure(takefocus=1)
+    original = {}
+
+    def focus_in(_event):
+        original.update(color=button.cget("border_color"),
+                        width=button.cget("border_width"))
+        button.configure(border_color=COLORS["balanced"], border_width=2)
+
+    def focus_out(_event):
+        if original:
+            button.configure(border_color=original["color"],
+                             border_width=original["width"])
+
+    def activate(_event):
+        button.invoke()  # CTkButton.invoke() preserves the disabled guard.
+        return "break"
+
+    target.bind("<FocusIn>", focus_in, add="+")
+    target.bind("<FocusOut>", focus_out, add="+")
+    target.bind("<Return>", activate, add="+")
+    target.bind("<space>", activate, add="+")
+    button.bind("<Button-1>", lambda _event: target.focus_set(), add="+")
+    return button
+
+
 def _get_pythonw_exe() -> str:
     """Lokales pythonw.exe (embedded) oder System-pythonw."""
     base = os.path.dirname(os.path.abspath(__file__))
@@ -233,10 +262,12 @@ class SetupWizard(ctk.CTk):
         super().__init__()
 
         self.title("Obsidian - First-Time Setup")
-        screen_w = max(640, self.winfo_screenwidth())
-        screen_h = max(560, self.winfo_screenheight())
-        win_w = min(780, max(640, screen_w - 80))
-        win_h = min(680, max(560, screen_h - 120))
+        self.update_idletasks()
+        scaling = float(ctk.ScalingTracker.get_window_scaling(self))
+        usable_w = max(200, int((self.winfo_screenwidth() - 80) / scaling))
+        usable_h = max(200, int((self.winfo_screenheight() - 120) / scaling))
+        win_w = min(780, usable_w)
+        win_h = min(680, usable_h)
         self.geometry(f"{win_w}x{win_h}")
         self.minsize(min(760, win_w), min(620, win_h))
         self.resizable(True, True)
@@ -321,7 +352,6 @@ class SetupWizard(ctk.CTk):
         self.progress_bar.set(0.25)
 
         self.content = ctk.CTkFrame(self, fg_color="transparent")
-        self.content.pack(fill="both", expand=True, padx=40, pady=30)
 
         bottom = ctk.CTkFrame(self, fg_color=COLORS["panel"], height=72, corner_radius=0)
         bottom.pack(fill="x", side="bottom")
@@ -330,11 +360,13 @@ class SetupWizard(ctk.CTk):
         ctk.CTkFrame(self, fg_color=COLORS["border"], height=1, corner_radius=0).pack(
             fill="x", side="bottom"
         )
+        # Reserve navigation before the flexible body on short scaled screens.
+        self.content.pack(fill="both", expand=True, padx=40, pady=30)
 
         btn_box = ctk.CTkFrame(bottom, fg_color="transparent")
         btn_box.pack(fill="x", padx=26, pady=18)
 
-        self.btn_back = ctk.CTkButton(
+        self.btn_back = _keyboard_button(
             btn_box, text="<  Back",
             width=120, height=36, corner_radius=8,
             font=ctk.CTkFont(FONT_BODY, 13, "bold"),
@@ -345,7 +377,7 @@ class SetupWizard(ctk.CTk):
         )
         self.btn_back.pack(side="left")
 
-        self.btn_next = ctk.CTkButton(
+        self.btn_next = _keyboard_button(
             btn_box, text="Next  >",
             width=140, height=36, corner_radius=8,
             font=ctk.CTkFont(FONT_BODY, 13, "bold"),
@@ -363,6 +395,7 @@ class SetupWizard(ctk.CTk):
         self.skip_lbl.pack(side="left", padx=(20, 0))
 
     def _show_step(self, n):
+        self._capture_step_draft()
         self._connection_test_generation = getattr(self, "_connection_test_generation", 0) + 1
         for w in self.content.winfo_children():
             w.destroy()
@@ -401,6 +434,29 @@ class SetupWizard(ctk.CTk):
     def _prev_step(self):
         if self.current_step > 1:
             self._show_step(self.current_step - 1)
+
+    def _capture_step_draft(self):
+        """Keep current inputs in memory on Back without forcing validation."""
+        fields = {
+            2: (("api_key", "entry_key"), ("api_secret", "entry_secret"),
+                ("passphrase", "entry_pass")),
+            3: (("proxy_host", "entry_proxy_host"), ("proxy_port", "entry_proxy_port")),
+            4: (("telegram_token", "entry_tg_token"), ("telegram_chat_id", "entry_tg_chat_id"),
+                ("cryptopanic_token", "entry_cp_token"), ("cmc_api_key", "entry_cmc_key")),
+        }
+        for key, attr in fields.get(self.current_step, ()):
+            entry = getattr(self, attr, None)
+            if entry is not None:
+                self.data[key] = entry.get().strip()
+        toggles = {3: {"use_proxy": "proxy_var"},
+                   4: {"use_telegram": "tg_var", "use_cryptopanic": "cp_var"}}
+        for key, attr in toggles.get(self.current_step, {}).items():
+            variable = getattr(self, attr, None)
+            if variable is not None:
+                self.data[key] = bool(variable.get())
+        if self.current_step == 4 and hasattr(self, "tz_var"):
+            label = self.tz_var.get().strip()
+            self.data["timezone"] = label.split()[0] if label else "UTC"
 
     # -- STEP 1: Exchange Selection --------------------------------------------
 
@@ -462,6 +518,22 @@ class SetupWizard(ctk.CTk):
         lbl.place(relx=0.5, rely=0.5, anchor="center")
         lbl.bind("<Button-1>", lambda e, k=key: self._select_exchange(k))
 
+        target = card._canvas
+        target.configure(takefocus=1)
+
+        def activate(_event):
+            self._select_exchange(key)
+            return "break"
+
+        target.bind("<Return>", activate, add="+")
+        target.bind("<space>", activate, add="+")
+        target.bind("<FocusIn>", lambda _e: card.configure(
+            border_color=COLORS["purple"], border_width=2), add="+")
+        target.bind("<FocusOut>", lambda _e: self._highlight_exchange(
+            self.data["exchange"]), add="+")
+        card.bind("<Button-1>", lambda _e: target.focus_set(), add="+")
+        lbl.bind("<Button-1>", lambda _e: target.focus_set(), add="+")
+
         return card
 
     def _select_exchange(self, key):
@@ -481,11 +553,14 @@ class SetupWizard(ctk.CTk):
     # -- STEP 2: API Credentials -----------------------------------------------
 
     def _build_step2_credentials(self):
+        parent = ctk.CTkScrollableFrame(self.content, fg_color="transparent",
+                                       scrollbar_button_color=COLORS["border"])
+        parent.pack(fill="both", expand=True)
         ex = EXCHANGES[self.data["exchange"]]
-        self._heading(self.content, f"API Access - {ex['label']}",
+        self._heading(parent, f"API Access - {ex['label']}",
                        f"Create an API key in your {ex['label']} account and paste it here.")
 
-        info = ctk.CTkFrame(self.content, fg_color=COLORS["panel"], corner_radius=8,
+        info = ctk.CTkFrame(parent, fg_color=COLORS["panel"], corner_radius=8,
                             border_width=1, border_color=COLORS["border"])
         info.pack(fill="x", pady=(10, 20))
         ctk.CTkLabel(
@@ -495,7 +570,7 @@ class SetupWizard(ctk.CTk):
             text_color=COLORS["warning"], wraplength=640
         ).pack(padx=16, pady=12)
 
-        form = ctk.CTkFrame(self.content, fg_color="transparent")
+        form = ctk.CTkFrame(parent, fg_color="transparent")
         form.pack(fill="x")
 
         self.entry_key    = self._labeled_entry(form, "API Key",    self.data["api_key"], False)
@@ -511,11 +586,14 @@ class SetupWizard(ctk.CTk):
     # -- STEP 3: Proxy ---------------------------------------------------------
 
     def _build_step3_proxy(self):
-        self._heading(self.content, "Proxy Settings",
+        parent = ctk.CTkScrollableFrame(self.content, fg_color="transparent",
+                                       scrollbar_button_color=COLORS["border"])
+        parent.pack(fill="both", expand=True)
+        self._heading(parent, "Proxy Settings",
                        "If you're in a region where the exchange is blocked, "
                        "you can use a proxy (e.g. V2Ray, SSR).")
 
-        switch_box = ctk.CTkFrame(self.content, fg_color=COLORS["panel"], corner_radius=10,
+        switch_box = ctk.CTkFrame(parent, fg_color=COLORS["panel"], corner_radius=10,
                                     border_width=1, border_color=COLORS["border"])
         switch_box.pack(fill="x", pady=(20, 20))
 
@@ -537,7 +615,7 @@ class SetupWizard(ctk.CTk):
         ).pack(side="right")
 
         # Fields box shown/hidden based on proxy toggle
-        self.proxy_fields_box = ctk.CTkFrame(self.content, fg_color="transparent")
+        self.proxy_fields_box = ctk.CTkFrame(parent, fg_color="transparent")
 
         form = ctk.CTkFrame(self.proxy_fields_box, fg_color="transparent")
         form.pack(fill="x")
@@ -547,7 +625,7 @@ class SetupWizard(ctk.CTk):
 
         ctk.CTkLabel(
             self.proxy_fields_box,
-            text="Default for V2Ray/SSR is usually 127.0.0.1 with port 10808 (HTTP) or 10809 (SOCKS5)",
+            text="Use your proxy's HTTP listener, for example 127.0.0.1:10808; confirm its actual HTTP port.",
             font=ctk.CTkFont(FONT_BODY, 11, "bold"),
             text_color=COLORS["text_muted"], wraplength=640, justify="left"
         ).pack(fill="x", pady=(6, 0))
@@ -743,7 +821,7 @@ class SetupWizard(ctk.CTk):
             text_color=COLORS["text"]
         ).pack(side="left")
 
-        ctk.CTkButton(
+        _keyboard_button(
             test_head, text="Run Test",
             width=130, height=30, corner_radius=6,
             font=ctk.CTkFont(FONT_BODY, 12, "bold"),
@@ -870,10 +948,11 @@ class SetupWizard(ctk.CTk):
             self, text=f"WARN  {msg}",
             font=ctk.CTkFont(FONT_BODY, 12, "bold"),
             text_color=COLORS["danger"], fg_color="#1a0e10",
-            corner_radius=6
+            corner_radius=6, height=32
         )
-        self._toast.place(relx=0.5, rely=0.85, anchor="center", relwidth=0.7, height=32)
-        self.after(3000, lambda: self._toast.destroy() if self._toast.winfo_exists() else None)
+        self._toast.place(relx=0.5, rely=0.85, anchor="center", relwidth=0.7)
+        toast = self._toast
+        self.after(3000, lambda: toast.destroy() if toast.winfo_exists() else None)
 
     # -- Connection Test -------------------------------------------------------
 
@@ -1072,7 +1151,7 @@ class SetupWizard(ctk.CTk):
             text_color=COLORS["text_dim"], justify="center"
         ).pack(pady=(10, 30))
 
-        ctk.CTkButton(
+        _keyboard_button(
             success_box, text="Start Trading Terminal",
             width=240, height=42, corner_radius=8,
             font=ctk.CTkFont(FONT_BODY, 14, "bold"),
@@ -1081,7 +1160,7 @@ class SetupWizard(ctk.CTk):
             command=self._launch_terminal_and_close
         ).pack()
 
-        ctk.CTkButton(
+        _keyboard_button(
             success_box, text="Close",
             width=140, height=32, corner_radius=8,
             font=ctk.CTkFont(FONT_BODY, 12, "bold"),
@@ -1110,7 +1189,8 @@ class SetupWizard(ctk.CTk):
                     **kw
                 )
         except Exception:
-            pass
+            self._show_error("The terminal could not start. Check the update barrier and installation, then retry.")
+            return
         self.destroy()
 
 

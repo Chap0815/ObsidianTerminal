@@ -300,7 +300,8 @@ def _struct_log_writer() -> None:
                                 e,
                             )
                             break
-                        # Keep the accepted record unfinished until durable.
+                        # Keep the accepted record unfinished until written
+                        # and flushed to the OS; this is not a power-loss WAL.
                         # Retry transient Windows/rotation failures, but do
                         # not let one permanently unwritable or oversized
                         # record wedge every later structured event.
@@ -405,12 +406,13 @@ def _ensure_struct_writer(*, timeout: float | None = None) -> None:
 
 
 def flush_structured_logs(timeout: float = 2.0) -> bool:
-    """Wait boundedly until every accepted structured record is durable.
+    """Wait boundedly until accepted records are processed and flushed to the OS.
 
     The writer intentionally remains a daemon because logging must never keep
     a bot process alive indefinitely. This bounded flush closes the opposite
     failure mode: silently dropping the final audit records on a clean process
-    exit. Returns ``False`` on timeout or an unusable writer/queue.
+    exit, without promising persistence after power loss. Returns ``False``
+    on timeout or an unusable writer/queue.
     """
     if type(timeout) not in (int, float):
         return False

@@ -733,6 +733,15 @@ def _verify_full_exit_coverage(bot, sym, row, order, *, symbol_full,
         if not math.isfinite(filled) or filled < 0:
             raise ValueError("invalid full-exit fill")
         if price_known and filled > 0:
+            from bot_utils.futures_exits import _extract_fill_from_order
+            proved_price = _extract_fill_from_order(
+                order, contract_size=contract_size)
+            price_known = (
+                proved_price is not None
+                and math.isclose(proved_price, close_price, rel_tol=1e-8,
+                                 abs_tol=1e-12)
+            )
+        if price_known and filled > 0:
             fee_payload = _order_with_fee_context(
                 order, ex=bot.ex, symbol_full=symbol_full,
                 contract_size=contract_size,
@@ -1047,6 +1056,51 @@ def _recover_or_submit_futures_full_exit(
             "WARN",
         )
         return None, requested_amount, False
+    if (isinstance(current, dict) and current.get("accounting_pending_partials")
+            and not current.get(_FULL_EXIT_CLIENT_ID)):
+        # This exceptional protection path separates an executed partial's
+        # durable ledger from the physical rest. Re-prove that rest privately
+        # before creating a new full-close intent; ordinary exits/replays keep
+        # their existing reduce-only contract.
+        from bot_utils.trade_state import (
+            partial_accounting_allows_protection, same_position_generation,
+        )
+        from bot_utils.futures_order import fetch_open_position, _position_contracts_abs
+        if not partial_accounting_allows_protection(
+                bot.state, sym, current, bot_name=bot.BOT_NAME,
+                mode_is_sim=False, is_futures=True):
+            log_event(f"{action_label}: physical safety blocked: partial WAL unverified", "ERROR")
+            return None, requested_amount, False
+        position, unavailable = fetch_open_position(
+            bot.ex, symbol_full, expected_position_side=position_side,
+            _api_endpoint_prefix="partial_safety_positions:", _api_critical=True,
+        )
+        venue_amount = _position_contracts_abs(position)
+        tolerance = max(1e-12, requested_amount * 1e-9)
+        refreshed = getter(sym) if callable(getter) else None
+        physical_local_amount = (FuturesExitsMixin._safe_positive_float(refreshed.get("amount"), 0.0)
+                                 if isinstance(refreshed, dict) else 0.0)
+        try:
+            from bot_utils.close_fragments import pending_close_values
+            prior_filled, _prior_price, _prior_fee, prior_oid = pending_close_values(refreshed)
+            if prior_filled > 0:
+                _full_exit_priced_baseline(refreshed, prior_filled)
+                if not prior_oid:
+                    raise ValueError("prior full close has no causal order id")
+                physical_local_amount -= prior_filled
+        except (TypeError, ValueError, OverflowError):
+            physical_local_amount = 0.0
+        if (unavailable or venue_amount is None or venue_amount <= 0
+                or abs(venue_amount - requested_amount) > tolerance
+                or not same_position_generation(refreshed, current)
+                or not isinstance(refreshed, dict)
+                or physical_local_amount <= 0
+                or abs(physical_local_amount - requested_amount) > tolerance
+                or not partial_accounting_allows_protection(
+                    bot.state, sym, refreshed, bot_name=bot.BOT_NAME,
+                    mode_is_sim=False, is_futures=True)):
+            log_event(f"{action_label}: physical safety blocked: fresh position/ownership unverified", "ERROR")
+            return None, requested_amount, False
     client_order_id, close_amount, created_intent = (
         _ensure_futures_full_exit_intent(
             bot.state,
@@ -1551,14 +1605,9 @@ class FuturesExitsMixin:
         return amount if math.isfinite(amount) else None
 
     @classmethod
-    def _order_fill_price(cls, order: dict) -> float:
-        if not isinstance(order, dict):
-            return 0.0
-        for key in ("average", "price"):
-            price = cls._safe_positive_price(order.get(key))
-            if price > 0:
-                return price
-        return 0.0
+    def _order_fill_price(cls, order: dict, *, contract_size=None) -> float:
+        from bot_utils.futures_exits import _extract_fill_from_order
+        return _extract_fill_from_order(order, contract_size=contract_size) or 0.0
 
     @classmethod
     def _ticker_price(cls, ticker: dict) -> float:
@@ -1735,6 +1784,10 @@ class FuturesExitsMixin:
         )
 
         if not _offline_accounting_retry_due(d):
+            return False
+
+        from trading.cooldown_utils import replay_exit_cooldown
+        if not replay_exit_cooldown(self, sym, d):
             return False
 
         restore = {
@@ -2454,6 +2507,13 @@ class FuturesExitsMixin:
             update_many_if_current,
         )
 
+        if d.get("accounting_pending_partials") and (
+                d.get("accounting_pending") or d.get("accounting_already_booked")):
+            self._retry_pending_partial_accounting(sym, d)
+            live = self.state.get(sym)
+            if not isinstance(live, dict) or not same_position_generation(live, d):
+                return
+            d = live
         if d.get("entry_price_unverified") is True:
             from core.futures_bot_reconcile import _heal_futures_entry_price_basis
             if not _heal_futures_entry_price_basis(self, sym, d):
@@ -2653,8 +2713,13 @@ class FuturesExitsMixin:
         d = live
         if FuturesExitsMixin._claim_conflict_blocks_monitor(self, sym, d):
             return
-        if d.get("accounting_pending_partials"):
-            return
+        protection_only = bool(d.get("accounting_pending_partials"))
+        if protection_only:
+            from bot_utils.trade_state import partial_accounting_allows_protection
+            if not partial_accounting_allows_protection(
+                    self.state, sym, d, bot_name=self.BOT_NAME,
+                    mode_is_sim=getattr(self, "simulation", None), is_futures=True):
+                return
 
         symbol_full = f"{sym}/USDT:USDT"
 
@@ -2895,14 +2960,14 @@ class FuturesExitsMixin:
         partial_block_active = _partial_tp_block_active(self, sym, d)
         pending_partial_intent = _has_futures_partial_exit_intent(d)
         if (
-            pending_partial_intent
+            not protection_only and (pending_partial_intent
             or (
                 not sell_trigger
                 and activation > 0.0
                 and not d.get("partial_sold")
                 and not partial_block_active
                 and move_pct >= activation
-            )
+            ))
         ):
             from core.symbol_locks import close_lock
             partial_path_taken = False
@@ -3750,12 +3815,11 @@ class FuturesExitsMixin:
                         expected_position_side=pos_type,
                         expected_client_id=client_order_id,
                         expected_amount=partial_amount,
+                        contract_size=d.get("entry_contract_size") or d.get("contract_size"),
                     )
+                    actual_filled = FuturesExitsMixin._safe_nonnegative_amount(order.get("filled"))
                 except Exception:
-                    fallback_fill = FuturesExitsMixin._order_fill_price(order)
-                    if fallback_fill > 0:
-                        fill_price = fallback_fill
-                        fill_src = "order"
+                    fill_src = "fallback"
                 if actual_filled <= 0 and exch_oid:
                     try:
                         import time as _t
@@ -3830,7 +3894,11 @@ class FuturesExitsMixin:
                             actual_filled = FuturesExitsMixin._safe_nonnegative_amount(
                                 (refreshed or {}).get("filled"))
                             if actual_filled > 0:
-                                fallback_fill = FuturesExitsMixin._order_fill_price(refreshed or {})
+                                from bot_utils.futures_order import futures_contract_size_or_none
+                                fallback_fill = FuturesExitsMixin._order_fill_price(
+                                    refreshed or {}, contract_size=(
+                                        d.get("entry_contract_size") or d.get("contract_size")
+                                        or futures_contract_size_or_none(self.ex, symbol_full)))
                                 if fallback_fill > 0:
                                     fill_price = fallback_fill
                                     fill_src = "fetch_order"
@@ -4378,13 +4446,11 @@ class FuturesExitsMixin:
                         expected_position_side=pos_type,
                         expected_client_id=d.get(_FULL_EXIT_CLIENT_ID),
                         expected_amount=close_amount,
+                        contract_size=d.get("entry_contract_size") or d.get("contract_size"),
                     )
                     fill_price_known = _fill_src in {"order", "fetch_order", "trades"}
                 except Exception:
-                    fallback_fill = FuturesExitsMixin._order_fill_price(order)
-                    if fallback_fill > 0:
-                        fill_price = fallback_fill
-                        fill_price_known = True
+                    fill_price_known = False
                 close_fee = 0.0
             except Exception as e:
                 if is_no_position_error(e):
@@ -4673,6 +4739,8 @@ class FuturesExitsMixin:
         elif funding_history_resolved:
             pending_close["entry_funding_window_unverified"] = False
             pending_close["accounting_pending_funding_unverified"] = False
+        from trading.cooldown_utils import exit_cooldown_fields
+        pending_close.update(exit_cooldown_fields(self, reason, profit_usdt, sell_time))
         if not self.simulation:
             pending_close.update(_futures_full_exit_clear_fields())
         from bot_utils.trade_state import (
@@ -4800,22 +4868,12 @@ class FuturesExitsMixin:
   # (SL / trailing / break-even)  outcome-gated via the shared classifier
         # so a losing trailing/BE close also blocks immediate re-entry, not just
         # an exact "Stop-Loss".
-        from trading.cooldown_utils import should_cooldown_after_exit
-        if should_cooldown_after_exit(reason, profit_usdt):
-            try:
-                from trading.cooldown_utils import set_cooldown
-                with self._cooldown_lock:
-                    set_cooldown(self.cool, sym,
-                                  int(self.C("COOLDOWN_AFTER_SL", 120)),
-                                  self.COOLDOWN_FILE)
-            except Exception as e:
-                self._log_error(f"cooldown set {sym}", e)
-
   # State removal  the close was already CONFIRMED flat at the top of
         # this method, so booking + removal here are unconditional.
         # Scope by bot: FUTURES + CROSS share futures_state; an unscoped delete
         # would wipe the OTHER bot's dashboard row for the same base coin.
         cleanup_row = dict(d)
+        cleanup_row.update(pending_close)
         cleanup_row.update({
             "accounting_already_booked": True,
             "accounting_booked_sell_time": sell_time,

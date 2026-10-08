@@ -526,6 +526,13 @@ def claim_recovery_metadata(
         metadata = {
             key: extra[key] for key in ownership_flags if key in extra
         }
+        from bot_utils.state_persist import _normalized_exit_recovery_fields
+
+        try:
+            metadata.update(_normalized_exit_recovery_fields(extra))
+        except ValueError:
+            recovered[symbol] = {"claim_recovery_invalid": True}
+            continue
         quality_score = _entry_quality_score_or_none(
             extra.get("entry_quality_score")
         )

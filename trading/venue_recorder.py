@@ -2824,11 +2824,30 @@ class VenueRecorder:
             quote_volume_sources[symbol] = quote_volume_source
             candidates.append((quote_volume or 0.0, symbol, ticker))
         candidates.sort(reverse=True)
+        ticker_times = {}
+        ticker_clock_flags = set()
+        stale_ticker_symbols = set()
+        for _volume, symbol, ticker in candidates:
+            value = self._finite_number_or_none(ticker.get("timestamp"))
+            if value is None or value <= 0 or not value.is_integer():
+                ticker_times[symbol] = None
+                ticker_clock_flags.add("invalid_exchange_timestamp")
+                stale_ticker_symbols.add(symbol)
+                continue
+            timestamp = int(value)
+            ticker_times[symbol] = timestamp
+            if timestamp > ended + MAX_EXCHANGE_FUTURE_SKEW_MS:
+                ticker_clock_flags.add("future_exchange_timestamp")
+                stale_ticker_symbols.add(symbol)
+            elif timestamp < ended - MAX_PARTITION_CLOCK_AGE_MS:
+                ticker_clock_flags.add("stale_exchange_timestamp")
+                stale_ticker_symbols.add(symbol)
         volume_universe = [
             symbol
             for _volume, symbol, _ticker in candidates
             if not self._is_noncrypto_swap(symbol)
             and self._market_row(markets, symbol).get("active") is not False
+            and symbol not in stale_ticker_symbols
         ]
         priority_universe = self._priority_symbols(commit=False)
         next_universe = list(
@@ -2906,6 +2925,8 @@ class VenueRecorder:
                 fair_raw = ticker.get("mark")
             markets_payload[market_id] = {
                 "symbol": symbol,
+                "exchange_timestamp_ms": ticker_times.get(symbol),
+                "price_stale": symbol in stale_ticker_symbols,
                 "spot_symbol": spot_symbol or None,
                 "spot_available": spot_available,
                 "last": last_price,
@@ -2921,7 +2942,7 @@ class VenueRecorder:
                 "universe_member": symbol in next_universe,
                 "capture_priority": symbol in priority_universe,
             }
-        overview_flags = []
+        overview_flags = sorted(ticker_clock_flags)
         if invalid_tickers_payload:
             overview_flags.append("invalid_tickers_payload")
         if invalid_ticker_identity:
@@ -2937,6 +2958,9 @@ class VenueRecorder:
             overview_flags.append("future_exchange_timestamp")
         elif latest_timestamp < ended - MAX_PARTITION_CLOCK_AGE_MS:
             overview_flags.append("stale_exchange_timestamp")
+        # Per-ticker and aggregate checks can report the same clock defect.
+        # Preserve each reason once, as required by the durable event contract.
+        overview_flags = sorted(set(overview_flags))
         if overview_flags:
             self._record_api_failure(endpoint, reservation)
         coverage = {
@@ -4511,7 +4535,7 @@ class VenueRecorder:
                                     "last_interruption_wall_ts"
                                 )
                                 latest_interruption_wall_ts = (
-                                    time.time()
+                                    _capture_now_ms() / 1000.0
                                     + MAX_EXCHANGE_FUTURE_SKEW_MS / 1000.0
                                 )
                                 valid_interruption = (

@@ -608,6 +608,14 @@ class TrendFuturesBot(FuturesBot):
 
     def _handle_exit_recovery_gate(self, base: str, d: dict) -> bool:
         """Handle recovery/conflict state before any FUTREND exit action."""
+        if d.get("accounting_pending_partials") and (
+                d.get("accounting_pending") or d.get("accounting_already_booked")):
+            self._retry_pending_partial_accounting(base, d)
+            fresh = self.state.get(base)
+            from bot_utils.trade_state import same_position_generation
+            if not isinstance(fresh, dict) or not same_position_generation(fresh, d):
+                return True
+            d = fresh
         if d.get("accounting_already_booked"):
             from core.symbol_locks import close_lock
             try:
@@ -708,19 +716,57 @@ class TrendFuturesBot(FuturesBot):
             return True
         self._retry_pending_partial_accounting(base, d)
         d_live = self.state.get(base) or d
-        return bool(d_live.get("accounting_pending_partials"))
+        if not d_live.get("accounting_pending_partials"):
+            return False
+        from bot_utils.trade_state import partial_accounting_allows_protection
+        return not partial_accounting_allows_protection(
+            self.state, base, d_live, bot_name=self.BOT_NAME,
+            mode_is_sim=self.simulation, is_futures=True,
+        )
 
     def _maybe_blacklist_bad_symbol(self, base: str, reason: str,
                                     profit_usdt: float, move_pct: float,
-                                    log_event=None) -> None:
+                                    log_event=None, recovery_row=None) -> bool:
         profit = self._finite_float_or_none(profit_usdt)
         if profit is None or profit >= 0:
-            return
+            return True
         if str(self.C("BAD_SYMBOL_FILTER", True)).strip().lower() not in (
                 "1", "true", "yes", "on"):
-            return
+            return True
         try:
             from core.database import add_to_blacklist, get_recent_trades
+            from bot_utils.trade_state import update_many_if_current
+
+            def apply_decision(payload):
+                if recovery_row is None:
+                    add_to_blacklist(base, self.BOT_NAME, **payload)
+                    return True
+                import hashlib
+                import json
+                if recovery_row.get("accounting_pending_blacklist_checked") is True:
+                    return True
+                stored = recovery_row.get("accounting_pending_blacklist_decision")
+                if stored is None:
+                    identity = [self.BOT_NAME, base, self.simulation,
+                                recovery_row.get("entry_id"), recovery_row.get("buy_time"),
+                                recovery_row.get("accounting_pending_sell_time")]
+                    stored = dict(payload, event_key=hashlib.sha256(
+                        json.dumps(identity, separators=(",", ":")).encode("utf-8")).hexdigest())
+                    if update_many_if_current(self.state, base,
+                            {"accounting_pending_blacklist_decision": stored}, recovery_row) is not True:
+                        return False
+                if not isinstance(stored, dict):
+                    return False
+                add_to_blacklist(base, self.BOT_NAME, **stored)
+                return update_many_if_current(self.state, base,
+                    {"accounting_pending_blacklist_checked": True}, recovery_row) is True
+
+            if recovery_row is not None:
+                if recovery_row.get("accounting_pending_blacklist_checked") is True:
+                    return True
+                stored = recovery_row.get("accounting_pending_blacklist_decision")
+                if stored is not None:
+                    return apply_decision(stored)
             r = str(reason or "").lower()
             single_stop_pct = self._f("SINGLE_STOP_MIN_LOSS_PCT", 5.0)
             if not 0.0 <= single_stop_pct <= 99.0:
@@ -732,16 +778,14 @@ class TrendFuturesBot(FuturesBot):
             if (move is not None and "stop-loss" in r
                     and move <= -abs(single_stop_pct)
                     and single_stop_hours > 0):
-                add_to_blacklist(
-                    base, self.BOT_NAME, profit, hours=single_stop_hours,
-                    reason=f"futrend single stop {move:.2f}%",
-                    incremental=True,
-                )
+                if not apply_decision(dict(loss_usdt=profit, hours=single_stop_hours,
+                        reason=f"futrend single stop {move:.2f}%", incremental=True)):
+                    return False
                 if log_event:
                     log_event(f"[{self.BOT_NAME}] {base}: bad-symbol pause "
                               f"{single_stop_hours}h after {move:.2f}% stop",
                               "WARN")
-                return
+                return True
 
             loss_count_min = max(1, self._i("BAD_SYMBOL_LOSS_COUNT", 2))
             lookback_days = max(1, self._i("BAD_SYMBOL_LOOKBACK_DAYS", 1))
@@ -754,8 +798,9 @@ class TrendFuturesBot(FuturesBot):
             if not 0 <= hours <= 87_600:
                 hours = 24
             if hours <= 0:
-                return
-            recent = get_recent_trades(self.BOT_NAME, limit=40, days=lookback_days)
+                return True
+            recent = get_recent_trades(self.BOT_NAME, limit=40, days=lookback_days,
+                                       mode_is_sim=self.simulation)
             losses = []
             for t in recent:
                 if str(t.get("symbol", "")).upper() != base.upper():
@@ -765,19 +810,21 @@ class TrendFuturesBot(FuturesBot):
                     losses.append(pnl)
             total_loss = abs(sum(losses))
             if len(losses) >= loss_count_min or total_loss >= total_loss_min:
-                add_to_blacklist(
-                    base, self.BOT_NAME, total_loss or abs(profit),
-                    hours=hours,
+                if not apply_decision(dict(
+                    loss_usdt=total_loss or abs(profit), hours=hours,
                     reason=(f"futrend repeated damage: {len(losses)} losses, "
                             f"-{total_loss:.2f} USDT/{lookback_days}d"),
                     incremental=False,
-                )
+                )):
+                    return False
                 if log_event:
                     log_event(f"[{self.BOT_NAME}] {base}: bad-symbol pause "
                               f"{hours}h ({len(losses)} losses, -{total_loss:.2f} "
                               f"USDT)", "WARN")
+            return True
         except Exception as e:
             self._log_error(f"trend bad-symbol filter {base}", e)
+            return False
 
     def _build_universe(self) -> Dict[str, str]:
         """{base: full_symbol} for the top-N liquid crypto perps, excluding
@@ -1719,10 +1766,27 @@ class TrendFuturesBot(FuturesBot):
                                 break
                         actual_margin, _ = filled_margin_usdt(
                             amount, cs, landed_fill, eff_lev, margin)
+                        landed_fee_verified = False
+                        landed_fee = 0.0
+                        try:
+                            raw_fee = extract_or_estimate_futures_fee(
+                                self.ex, landed, full, landed_fill,
+                                amount=amount, contract_size=cs,
+                            )
+                            if isinstance(raw_fee, bool):
+                                raise ValueError("boolean recovered entry fee")
+                            landed_fee = float(raw_fee)
+                            if not math.isfinite(landed_fee):
+                                raise ValueError("nonfinite recovered entry fee")
+                            landed_fee_verified = True
+                        except Exception as fee_exc:
+                            self._log_error(f"trend recovered entry fee {base}", fee_exc)
                         tracked = self._record_open(
                             base, landed_fill, actual_margin,
                             eff_lev, amount,
-                            0.0, provisional=not landed_price_verified,
+                            landed_fee, provisional=(
+                                not landed_price_verified or not landed_fee_verified
+                            ),
                             lev_cap=lev_cap, mm_rate=mm,
                             entry_shadow=shadow,
                             entry_id=entry_id,
@@ -2212,6 +2276,8 @@ class TrendFuturesBot(FuturesBot):
                 base,
                 row,
                 {"entry_id": expected_entry_id.strip()},
+                finalize_entry=not entry_inflight,
+                create_if_absent=self.simulation or entry_inflight,
             )
         if stored is True and getattr(self, "simulation", None) is False:
             wakeup = getattr(self, "_reconcile_wakeup_event", None)
@@ -2387,6 +2453,16 @@ class TrendFuturesBot(FuturesBot):
         )
 
         if not _offline_accounting_retry_due(d):
+            return False
+
+        from trading.cooldown_utils import replay_exit_cooldown
+        if not replay_exit_cooldown(self, base, d):
+            return False
+        if self._maybe_blacklist_bad_symbol(
+                base, d.get("accounting_pending_reason") or d.get("accounting_booked_reason") or "",
+                d.get("accounting_pending_profit_usdt", 0.0),
+                d.get("accounting_pending_profit_pct", 0.0),
+                log_event=log_event, recovery_row=d) is False:
             return False
 
         restore = {
@@ -2731,17 +2807,11 @@ class TrendFuturesBot(FuturesBot):
                         expected_position_side=pos_type,
                         expected_client_id=d.get("full_exit_client_order_id"),
                         expected_amount=close_amount,
+                        contract_size=cs,
                     )
                     fill_price_known = _fill_src in {"order", "fetch_order", "trades"}
                 except Exception:
-                    for _k in ("average", "price"):
-                        _v = order.get(_k)
-                        if _v:
-                            _fv = _positive_float(_v, 0.0)
-                            if _fv > 0:
-                                close_price = _fv
-                                fill_price_known = True
-                                break
+                    fill_price_known = False
             if not live_close_already_verified:
                 from core.futures_bot_exits import _verify_full_exit_coverage
 
@@ -2887,6 +2957,8 @@ class TrendFuturesBot(FuturesBot):
                 "accounting_pending_entry_quality_reasons": d.get(
                     "entry_quality_reasons"),
             }
+            from trading.cooldown_utils import exit_cooldown_fields
+            pending_close.update(exit_cooldown_fields(self, reason, profit_usdt, sell_time))
             if funding_resolution_pending:
                 pending_close["accounting_pending_funding_unverified"] = True
             elif funding_history_resolved:
@@ -2968,11 +3040,8 @@ class TrendFuturesBot(FuturesBot):
 
         # Persist every re-entry barrier before state/claim cleanup exposes the
         # symbol to the concurrent scanner again.
-        self._set_stop_cooldown(base, reason, profit_usdt, log_event=log_event)
-        self._maybe_blacklist_bad_symbol(base, reason, profit_usdt, move,
-                                         log_event=log_event)
-
         cleanup_row = dict(d)
+        cleanup_row.update(pending_close)
         cleanup_row.update({
             "accounting_already_booked": True,
             "accounting_booked_sell_time": sell_time,
@@ -3446,7 +3515,8 @@ class TrendFuturesBot(FuturesBot):
 
             activation = self._f("ACTIVATION_PROFIT", 0.0)
             partial_pct = self._f("PARTIAL_SELL_PCT", 0.0)
-            if (activation > 0 and partial_pct > 0 and not d.get("partial_sold")
+            if (not d.get("accounting_pending_partials")
+                    and activation > 0 and partial_pct > 0 and not d.get("partial_sold")
                     and move >= activation):
                 from core.symbol_locks import close_lock
                 with close_lock(base, bot_name=self.BOT_NAME) as got:

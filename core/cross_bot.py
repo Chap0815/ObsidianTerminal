@@ -135,7 +135,8 @@ def _funding_refresh_active(bot, base: str, expires_at: float) -> bool:
     )
 
 
-def _encode_rebalance_state(slot: int, recent_returns, crash_flat: bool) -> str:
+def _encode_rebalance_state(slot: int, recent_returns, crash_flat: bool,
+                            applied_manual_token: Optional[float] = None) -> str:
     if isinstance(slot, bool) or not isinstance(slot, int) or slot < -1:
         raise ValueError("rebalance slot must be an integer >= -1")
     if not isinstance(recent_returns, list) or len(recent_returns) > 50:
@@ -148,8 +149,7 @@ def _encode_rebalance_state(slot: int, recent_returns, crash_flat: bool) -> str:
     )
     if not isinstance(crash_flat, bool):
         raise ValueError("crash_flat must be boolean")
-    return json.dumps(
-        {
+    payload = {
             "crash_flat": crash_flat,
             "history_b64": base64.b64encode(
                 struct.pack(f">{len(history)}d", *history),
@@ -157,7 +157,14 @@ def _encode_rebalance_state(slot: int, recent_returns, crash_flat: bool) -> str:
             "history_count": len(history),
             "schema": _REBALANCE_STATE_SCHEMA,
             "slot": slot,
-        },
+        }
+    if applied_manual_token is not None:
+        rebalance_token = _force_rebalance_token(applied_manual_token)
+        if rebalance_token is None:
+            raise ValueError("invalid applied manual rebalance token")
+        payload["applied_manual_token"] = rebalance_token
+    return json.dumps(
+        payload,
         allow_nan=False,
         separators=(",", ":"),
         sort_keys=True,
@@ -183,10 +190,12 @@ def _decode_rebalance_state(raw: str) -> tuple[int, List[float], bool]:
         )
     except json.JSONDecodeError as exc:
         raise ValueError("rebalance state is not valid JSON") from exc
-    if not isinstance(payload, dict) or set(payload) != {
+    if not isinstance(payload, dict) or (set(payload) - {"applied_manual_token"}) != {
         "crash_flat", "history_b64", "history_count", "schema", "slot",
     }:
         raise ValueError("rebalance state has an invalid shape")
+    if "applied_manual_token" in payload and _force_rebalance_token(payload["applied_manual_token"]) is None:
+        raise ValueError("rebalance state manual token is invalid")
     if (
         isinstance(payload["schema"], bool)
         or payload["schema"] != _REBALANCE_STATE_SCHEMA
@@ -1627,6 +1636,7 @@ class CrossBot(FuturesBot):
             raw = get_param_text(self.BOT_NAME, _REBALANCE_STATE_PARAM, "")
             if raw:
                 slot, recent, crash_flat = _decode_rebalance_state(raw)
+                self._force_token_applied = json.loads(raw).get("applied_manual_token")
             else:
                 legacy = get_param(self.BOT_NAME, "REBALANCE_SLOT", -1)
                 if isinstance(legacy, bool):
@@ -1678,6 +1688,7 @@ class CrossBot(FuturesBot):
             slot,
             getattr(self, "_recent_rebalance_returns", []),
             getattr(self, "_cross_crash_flat", False),
+            getattr(self, "_force_token_applied", None),
         )
         try:
             from core.database import set_param
@@ -2123,6 +2134,7 @@ class CrossBot(FuturesBot):
                 and not state_persist_pending
                 and not state_load_error
                 and risk_snapshot_ok
+                and getattr(self, "_rebalance_outcome", "") != "deferred"
             ),
             "component": "cross_scan",
             "consecutive_errors": errors,
@@ -2138,6 +2150,9 @@ class CrossBot(FuturesBot):
             "crash_reentry_ready": crash_reentry_ready,
             "last_operation": str(getattr(
                 self, "_cross_scan_last_operation", "") or ""),
+            "rebalance_outcome": str(getattr(self, "_rebalance_outcome", "") or ""),
+            "rebalance_deferred_reason": str(getattr(self, "_rebalance_deferred_reason", "") or ""),
+            "manual_rebalance_pending": getattr(self, "_force_token_pending", None) is not None,
             "last_error": str(getattr(
                 self, "_cross_scan_last_error", "") or ""),
             "last_error_wall_ts": getattr(
@@ -2217,12 +2232,17 @@ class CrossBot(FuturesBot):
         # Seed the manual-force token with the CURRENT stored value so a stale
         # button press from a PREVIOUS run doesn't fire a rebalance on boot.
         try:
-            from core.database import get_param as _gp
+            from core.database import get_param as _gp, get_param_text
             self._force_token_seen = _force_rebalance_token(
                 _gp(self.BOT_NAME, "FORCE_REBALANCE", 0)
             )
+            pending = get_param_text(self.BOT_NAME, "FORCE_REBALANCE_PENDING", "")
+            self._force_token_pending = (
+                _force_rebalance_token(pending) if pending != "" else None
+            )
         except Exception:
             self._force_token_seen = None
+            self._force_token_pending = None
         POLL_SEC = 30
         while not self._shutdown_event.is_set():
             operation = "poll"
@@ -2231,24 +2251,33 @@ class CrossBot(FuturesBot):
                 if forced and not CrossBot._load_rebalance_state(self):
                     raise RuntimeError("cross rebalance state unavailable")
                 now = time.monotonic()
-                rebal_ready = forced or (now - self._last_rebalance_attempt) >= 290.0
+                rebal_ready = (
+                    getattr(self, "_force_token_new", False)
+                    or (now - self._last_rebalance_attempt) >= 290.0
+                )
                 if (forced or self._due_for_rebalance()) and rebal_ready:
                     # Manual force runs immediately; automatic (slot/empty)
                     # attempts are throttled so a crash-flat empty book doesn't
                     # re-fetch the whole universe on every 30s poll.
                     self._last_rebalance_attempt = now
+                    self._force_token_new = False
                     if forced:
                         log_event(f"[{self.BOT_NAME}] manual rebalance requested "
                                   f"- rebalancing now", "SCAN")
                     operation = "rebalance"
                     completed = self._rebalance_tick()
-                    if completed is not True:
+                    if completed is not True and getattr(self, "_rebalance_outcome", "") == "deferred":
+                        self._cross_scan_last_operation = "rebalance_deferred"
+                    elif completed is not True:
                         self._record_cross_scan_failure(
                             operation,
                             RuntimeError("rebalance incomplete"),
                             redact=redact,
                         )
                     else:
+                        if forced:
+                            CrossBot._ack_force_rebalance(self)
+                        self._rebalance_outcome = "applied"
                         self._record_cross_scan_success(operation)
                 elif (self._should_topup()
                       and (now - self._last_topup_attempt) >= 290.0):
@@ -2276,7 +2305,7 @@ class CrossBot(FuturesBot):
                 return
 
     def _consume_force_rebalance(self) -> bool:
-        """True once when the launcher's persisted manual token changes.
+        """Keep a manual request pending until its rebalance completes.
 
         Compare identity rather than ordering: the launcher currently uses an
         epoch timestamp, and an OS clock correction must not make every later
@@ -2291,23 +2320,47 @@ class CrossBot(FuturesBot):
             return False
         if generation is None:
             return False
+        pending = getattr(self, "_force_token_pending", None)
+        if pending is not None and pending == getattr(self, "_force_token_applied", None):
+            CrossBot._retry_rebalance_state_persistence(self)
+            if getattr(self, "_rebalance_state_persist_pending", None) is None:
+                CrossBot._ack_force_rebalance(self)
+            return False
         seen = getattr(self, "_force_token_seen", None)
         if seen is None:
             self._force_token_seen = generation
             return False
-        if generation != seen:
-            self._force_token_seen = generation
-            return True
-        return False
+        if generation != seen and generation != pending:
+            from core.database import set_param
+            set_param(self.BOT_NAME, "FORCE_REBALANCE_PENDING", generation,
+                      reason="manual rebalance pending")
+            self._force_token_pending = generation
+            self._force_token_new = True
+        return getattr(self, "_force_token_pending", None) is not None
+
+    def _ack_force_rebalance(self) -> None:
+        from core.database import set_param
+        pending = getattr(self, "_force_token_pending", None)
+        if pending is None:
+            return
+        set_param(self.BOT_NAME, "FORCE_REBALANCE_PENDING", "",
+                  reason="manual rebalance applied")
+        self._force_token_seen = pending
+        self._force_token_pending = None
 
     def _rebalance_tick(self) -> bool:
         from core.logger import log_event, log_struct
         from trading.risk_manager import is_bot_paused
 
+        self._rebalance_outcome = "incomplete"
+        self._rebalance_deferred_reason = ""
+
         if self.safe_mode is not None and self.safe_mode.is_active():
             log_event(f"[{self.BOT_NAME}] SAFE_MODE - rebalance skipped "
                       f"({self.safe_mode.reason()})", "WAIT")
-            return True
+            self._rebalance_outcome = "deferred"
+            self._rebalance_deferred_reason = "safe_mode"
+            return False
         if getattr(self, "_cross_risk_snapshot_ok", True) is not True:
             log_event(
                 f"[{self.BOT_NAME}] rebalance skipped - account risk snapshot "
@@ -2319,12 +2372,16 @@ class CrossBot(FuturesBot):
             self.BOT_NAME, exchange=self.ex, simulation=self.simulation)
         if paused:
             log_event(f"[{self.BOT_NAME}] paused: {why}", "WAIT")
-            return True
+            self._rebalance_outcome = "deferred"
+            self._rebalance_deferred_reason = str(why or "risk_pause")[:300]
+            return False
 
         params = self._xsec_params()
         prices, sym_map = self._fetch_universe_prices(params.lookback_hours)
         if self._shutdown_event.is_set():
-            return True
+            self._rebalance_outcome = "deferred"
+            self._rebalance_deferred_reason = "shutdown"
+            return False
         if not prices:
             log_event(f"[{self.BOT_NAME}] no universe data - rebalance skipped "
                       f"(book held)", "WARN")
@@ -2437,7 +2494,10 @@ class CrossBot(FuturesBot):
         self._neutrality_settle_until = time.monotonic() + 120.0
         # Mark this slot consumed ONLY now that a book was actually applied, so
         # a restart inside the same slot resumes instead of re-rebalancing.
+        self._force_token_applied = getattr(self, "_force_token_pending", None)
         self._mark_rebalanced()
+        if getattr(self, "_rebalance_state_persist_pending", None) is not None:
+            return False
 
         # 4. Telegram summary - ONE message per rebalance (not per leg: a 12-leg
         #    book would otherwise fire 12 opens + N closes = spam). CROSS sent
@@ -3951,6 +4011,8 @@ class CrossBot(FuturesBot):
             base,
             state_row,
             {"entry_id": entry_id},
+            finalize_entry=True,
+            create_if_absent=self.simulation,
         )
         if tracked is None:
             log_event(
@@ -4524,17 +4586,11 @@ class CrossBot(FuturesBot):
                         expected_position_side=pos_type,
                         expected_client_id=d.get("full_exit_client_order_id"),
                         expected_amount=close_amount,
+                        contract_size=d.get("entry_contract_size") or d.get("contract_size"),
                     )
                     fill_price_known = _fill_src in {"order", "fetch_order", "trades"}
                 except Exception:
-                    for _k in ("average", "price"):
-                        _v = order.get(_k)
-                        if _v:
-                            _fv = CrossBot._safe_positive_price(_v)
-                            if _fv > 0:
-                                close_price = _fv
-                                fill_price_known = True
-                                break
+                    fill_price_known = False
                 raw_cs = d.get("contract_size")
                 cs = 0.0 if isinstance(raw_cs, bool) else CrossBot._safe_float(
                     self, raw_cs, 0.0,

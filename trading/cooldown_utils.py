@@ -695,6 +695,64 @@ def set_cooldown(cool: dict, symbol: str, minutes: int,
         return _persist_with_retry_locked(cooldown_file, cool)
 
 
+def set_cooldown_until(cool: dict, symbol: str, expiry_iso: str,
+                       cooldown_file: str) -> bool:
+    """Replay a physical close's original deadline without extending it."""
+    if not isinstance(cool, dict) or not _is_valid_cooldown_symbol(symbol):
+        return False
+    if isinstance(cool, CooldownState) and not cool.source_valid:
+        return False
+    try:
+        expiry = datetime.fromisoformat(expiry_iso)
+        if expiry.tzinfo is not None:
+            expiry = expiry.astimezone(timezone.utc).replace(tzinfo=None)
+        if expiry <= _utcnow():
+            return True
+        with _COOLDOWN_LOCK:
+            existing = cool.get(symbol)
+            if existing is not None:
+                previous = datetime.fromisoformat(existing)
+                if previous.tzinfo is not None:
+                    previous = previous.astimezone(timezone.utc).replace(tzinfo=None)
+                expiry = max(expiry, previous)
+            cool[symbol] = expiry.isoformat()
+            return _persist_with_retry_locked(cooldown_file, cool)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def exit_cooldown_fields(owner, reason: str, profit_usdt: float,
+                         sell_time: str) -> dict:
+    """Put the stop barrier in the same durable WAL as close accounting."""
+    if not should_cooldown_after_exit(reason, profit_usdt):
+        return {}
+    minutes = _normalize_cooldown_minutes(owner.C("COOLDOWN_AFTER_SL", 120))
+    if minutes is None:
+        minutes = 120
+    closed_at = datetime.fromisoformat(sell_time)
+    if closed_at.tzinfo is not None:
+        closed_at = closed_at.astimezone(timezone.utc).replace(tzinfo=None)
+    return {"accounting_pending_cooldown_until":
+            (closed_at + timedelta(minutes=minutes)).isoformat()}
+
+
+def replay_exit_cooldown(owner, symbol: str, row: dict) -> bool:
+    deadline = row.get("accounting_pending_cooldown_until")
+    if not deadline:
+        # Recover old WALs written before the deadline field existed.
+        reason = row.get("accounting_pending_reason") or row.get("accounting_booked_reason")
+        profit = row.get("accounting_pending_profit_usdt")
+        sell_time = row.get("accounting_pending_sell_time") or row.get("accounting_booked_sell_time")
+        if reason is None or profit is None or not sell_time:
+            return True
+        deadline = exit_cooldown_fields(owner, reason, profit, sell_time).get(
+            "accounting_pending_cooldown_until")
+    if not deadline:
+        return True
+    with owner._cooldown_lock:
+        return set_cooldown_until(owner.cool, symbol, deadline, owner.COOLDOWN_FILE)
+
+
 def check_in_cooldown(cool: dict, symbol: str) -> bool:
     """READ-ONLY cooldown check. Mutiert nicht, schreibt nicht.
     Hot-Path-Aufrufe (Buy-Loop) sollten DIES verwenden, nicht is_in_cooldown."""
@@ -845,21 +903,17 @@ def _note_cooldown_cleanup_error(
 
 
 def _fsync_cooldown_directory(path: Path) -> None:
+    if os.name == "nt":
+        from bot_utils.atomic_publish import _sync_directory
+
+        _sync_directory(path)
+        return
     try:
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
         directory_fd = os.open(str(path), flags)
     except AttributeError:
         return
     except OSError as exc:
-        if os.name == "nt":
-            if isinstance(exc, PermissionError):
-                return
-            if (
-                isinstance(exc, FileNotFoundError)
-                and path == Path(path.anchor)
-                and path.is_dir()
-            ):
-                return
         raise
     primary_error: BaseException | None = None
     try:
@@ -891,21 +945,19 @@ def _same_cooldown_temp_generation(
 
 
 def _fsync_cooldown_parent_chain(path: Path) -> None:
-    current = path
-    while True:
-        _fsync_cooldown_directory(current)
-        if current == current.parent:
-            return
-        current = current.parent
+    from bot_utils.atomic_publish import sync_directory_chain
+
+    sync_directory_chain(path, sync_directory=_fsync_cooldown_directory)
 
 
 def _atomic_write_json(path: str, data: dict) -> None:
     """Crash-durable exact-generation JSON publish with Windows retries."""
     directory = Path(os.path.dirname(path) or ".").absolute()
-    os.makedirs(directory, exist_ok=True)
-    # Retry every parent barrier, including entries created by an earlier
-    # failed attempt.  Existence alone does not prove rename durability.
-    _fsync_cooldown_parent_chain(directory)
+    from bot_utils.atomic_publish import prepare_publication_directory
+
+    prepare_publication_directory(
+        directory, sync_directory=_fsync_cooldown_directory,
+    )
     fd, tmp_name = tempfile.mkstemp(
         prefix=f"{os.path.basename(path)}.tmp.",
         dir=str(directory),

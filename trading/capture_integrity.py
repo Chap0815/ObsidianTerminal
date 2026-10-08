@@ -1688,7 +1688,11 @@ def validate_capture_day(
 def _atomic_create(path: Path, payload: dict) -> None:
     if _path_has_links(path):
         raise RuntimeError("capture integrity report path is linked")
-    path.parent.mkdir(parents=True, exist_ok=True)
+    from bot_utils.atomic_publish import prepare_publication_directory
+
+    prepare_publication_directory(
+        path.parent, sync_directory=_fsync_parent_directory
+    )
     if _path_has_links(path):
         raise RuntimeError("capture integrity report path is linked")
     encoded = json.dumps(
@@ -1740,25 +1744,9 @@ def _atomic_create(path: Path, payload: dict) -> None:
 
 
 def _fsync_parent_directory(path: Path) -> None:
-    try:
-        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-        directory_fd = os.open(path, flags)
-    except AttributeError:
-        return
-    except OSError as exc:
-        # CPython on Windows cannot open directories through os.open and
-        # reports EACCES/PermissionError.  Keep that platform limitation as a
-        # best-effort fallback, but never hide real POSIX I/O/open failures.
-        if os.name == "nt" and isinstance(exc, PermissionError):
-            return
-        raise
-    try:
-        os.fsync(directory_fd)
-    finally:
-        try:
-            os.close(directory_fd)
-        except OSError:
-            pass
+    from bot_utils.atomic_publish import _sync_directory
+
+    _sync_directory(path)
 
 
 def _verify_sealed_report(

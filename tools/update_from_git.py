@@ -957,7 +957,7 @@ def _running_bot_processes() -> list[str]:
     current = os.getpid()
     root_text = str(ROOT).replace("\\", "/").lower()
     from launcher.config.settings import BOT_META
-    from core.process_identity import cmdline_bot_match_kind
+    from core.process_identity import bot_process_scope
     out: list[str] = []
     scan_incomplete = False
     saw_current_pid = False
@@ -999,32 +999,14 @@ def _running_bot_processes() -> list[str]:
                 if not raw_cmdline and python_like:
                     scan_incomplete = True
                     continue
-                cmdline = " ".join(raw_cmdline)
-                proc_cwd = str(raw_cwd or "")
+                scope = bot_process_scope(raw_cmdline, ROOT, BOT_META, raw_cwd)
             except Exception:
                 scan_incomplete = True
                 continue
-            norm = cmdline.lower().replace("\\", "/")
-            cwd_norm = proc_cwd.lower().replace("\\", "/")
-            match_kinds = {
-                cmdline_bot_match_kind(bot_name, cmdline)
-                for bot_name in BOT_META
-            }
-            module_match = "module" in match_kinds
-            script_match = "script" in match_kinds
-            scoped_script_match = (
-                (root_text in norm or cwd_norm == root_text)
-                and script_match
-            )
-            if (
-                python_like
-                and raw_cwd is None
-                and root_text not in norm
-                and script_match
-            ):
+            if python_like and scope == "unknown":
                 scan_incomplete = True
                 continue
-            if python_like and (module_match or scoped_script_match):
+            if python_like and scope == "root":
                 out.append(f"bot process (pid {pid})")
     except Exception:
         scan_incomplete = True
@@ -1035,107 +1017,95 @@ def _running_bot_processes() -> list[str]:
     return out
 
 
-def _running_bot_processes_via_cim() -> list[str]:
-    root = str(ROOT).replace("\\", "/").lower().replace("'", "''")
-    from launcher.config.settings import BOT_META
-    module_markers = []
-    script_markers = []
-    for meta in BOT_META.values():
-        module = str(meta.get("module") or "").lower()
-        script = str(meta.get("script") or "").replace("\\", "/").lower()
-        if module:
-            module_markers.append(module)
-        if script:
-            script_markers.append(script)
-            script_markers.append(Path(script).name.lower())
-    escaped_modules = [marker.replace("'", "''") for marker in module_markers]
-    escaped_scripts = [marker.replace("'", "''") for marker in script_markers]
-    module_checks = " -or ".join(
-        "$norm -match "
-        f"'(?:^|\\s)-m\\s+\"?{re.escape(marker)}\"?(?=\\s|$)'"
-        for marker in escaped_modules
-    ) or "$false"
-    script_checks = " -or ".join(
-        "$norm -match "
-        f"'(?:^|[/\\s\"]){re.escape(marker)}(?=$|[\\s\"])'"
-        for marker in escaped_scripts
-    ) or "$false"
+def _cim_python_process_rows(role: str, *, include_creation: bool = False):
+    """Project bounded CIM evidence; interpret targets with the shared argv parser."""
+    from core.process_identity import commandline_argv
+
+    creation_property = ",CreationDate" if include_creation else ""
+    creation_output = (
+        "$created=([datetime]$_.CreationDate).ToUniversalTime(); "
+        "$origin=[datetime]::SpecifyKind([datetime]'1970-01-01',[DateTimeKind]::Utc); "
+        "$epoch=($created-$origin).TotalSeconds; "
+        "'|' + $epoch.ToString('R',[Globalization.CultureInfo]::InvariantCulture)"
+        if include_creation else "''"
+    )
     script = (
-        "$ErrorActionPreference='Stop'; "
-        "$ProgressPreference='SilentlyContinue'; "
-        f"$root='{root}'; "
-        f"$current={os.getpid()}; "
-        "$scanPid=$PID; "
+        "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; "
+        f"$current={os.getpid()}; $scanPid=$PID; "
         "$all=@(Get-CimInstance -ClassName Win32_Process "
-        "-Property ProcessId,ParentProcessId,Name,CommandLine); "
-        "$capturePid=[int](($all | Where-Object { "
-        "$_.ProcessId -eq $scanPid } | Select-Object -First 1).ParentProcessId); "
+        f"-Property ProcessId,ParentProcessId,Name,CommandLine{creation_property}); "
+        "$capturePid=[int](($all | Where-Object { $_.ProcessId -eq $scanPid } | "
+        "Select-Object -First 1).ParentProcessId); "
         "if (-not ($all.ProcessId -contains $current) -or "
-        "-not ($all.ProcessId -contains $scanPid) -or "
-        "$capturePid -le 0 -or -not ($all.ProcessId -contains $capturePid)) { "
-        "throw 'bot process scan missing process-table anchor' }; "
-        "$all | Where-Object { $_.ProcessId -gt 0 -and "
-        "$_.ProcessId -ne $current -and $_.ProcessId -ne $scanPid -and "
-        "$_.ProcessId -ne $capturePid } | "
-        "ForEach-Object { "
-        "$name=[string]$_.Name; $line=[string]$_.CommandLine; "
-        "$nameLow=$name.ToLower(); "
-        "$pythonLike=($nameLow -match '^python(?:w|[0-9.]*)?\\.exe$'); "
-        "if (-not $name) { "
-        "'bot process scan unknown (pid ' + $_.ProcessId + ')' "
-        "} elseif ($pythonLike -and [string]::IsNullOrWhiteSpace($line)) { "
-        "'bot process scan unknown (pid ' + $_.ProcessId + ')' "
-        "} elseif ($pythonLike -and "
-        "-not [string]::IsNullOrWhiteSpace($line)) { "
-        "$norm=$line.ToLower().Replace('\\','/'); "
-        f"if (({module_checks}) -or "
-        f"($norm.Contains($root) -and ({script_checks}))) {{ "
-        "'bot process (pid ' + $_.ProcessId + ')' } } }; "
-        "'bot process scan ok (count ' + $all.Count + ')'"
+        "-not ($all.ProcessId -contains $scanPid) -or $capturePid -le 0 -or "
+        "-not ($all.ProcessId -contains $capturePid)) { "
+        "throw 'process scan missing process-table anchor' }; "
+        "$all | Where-Object { $_.ProcessId -gt 0 -and $_.ProcessId -ne $current "
+        "-and $_.ProcessId -ne $scanPid -and $_.ProcessId -ne $capturePid } | "
+        "ForEach-Object { $name=[string]$_.Name; $line=[string]$_.CommandLine; "
+        "$pythonLike=($name.ToLower() -match '^python(?:w|[0-9.]*)?\\.exe$'); "
+        "if (-not $name -or ($pythonLike -and [string]::IsNullOrWhiteSpace($line))) { "
+        "'process scan unknown (pid ' + $_.ProcessId + ')' "
+        "} elseif ($pythonLike) { "
+        "$encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($line)); "
+        f"$creation=$({creation_output}); "
+        "'python pid ' + $_.ProcessId + ' cmd ' + $encoded + $creation } }; "
+        "'process scan ok (count ' + $all.Count + ')'"
     )
     try:
-        r = _run_cim_process_scan(script)
+        result = _run_cim_process_scan(script)
     except Exception as exc:
-        raise RuntimeError("bot process scan unavailable via CIM") from exc
-    if r.returncode != 0:
-        raise RuntimeError(
-            "bot process scan unavailable via CIM "
-            f"(returncode {r.returncode})"
-        )
-    if (r.stderr or "").strip():
-        raise RuntimeError("bot process scan unavailable via CIM")
-    out: list[str] = []
-    seen: set[int] = set()
-    current = os.getpid()
-    lines = [line.strip() for line in (r.stdout or "").splitlines() if line.strip()]
-    sentinel = (
-        re.fullmatch(
-            r"bot process scan ok \(count ([1-9][0-9]*)\)",
-            lines[-1],
-        )
-        if lines
-        else None
-    )
+        raise RuntimeError(f"{role} process scan unavailable via CIM") from exc
+    if result.returncode != 0 or (result.stderr or "").strip():
+        raise RuntimeError(f"{role} process scan unavailable via CIM (returncode {result.returncode})")
+    lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+    sentinel = re.fullmatch(r"process scan ok \(count ([1-9][0-9]*)\)", lines[-1]) if lines else None
     if sentinel is None or int(sentinel.group(1)) < 3:
-        raise RuntimeError("bot process scan returned malformed CIM output")
+        raise RuntimeError(f"{role} process scan returned malformed CIM output")
+    out = []
+    seen = {}
+    pattern = r"python pid ([1-9][0-9]*) cmd ([A-Za-z0-9+/]+={0,2})"
+    if include_creation:
+        pattern += r"\|([0-9]+(?:\.[0-9]+)?)"
     for text in lines[:-1]:
-        if re.fullmatch(
-            r"bot process scan unknown \(pid [1-9][0-9]*\)", text
-        ):
-            raise RuntimeError("bot process scan returned incomplete CIM output")
-        match = re.fullmatch(r"bot process \(pid ([1-9][0-9]*)\)", text)
+        if re.fullmatch(r"process scan unknown \(pid [1-9][0-9]*\)", text):
+            raise RuntimeError(f"{role} process scan returned incomplete CIM output")
+        match = re.fullmatch(pattern, text)
         if match is None:
-            raise RuntimeError(
-                "bot process scan returned malformed CIM output"
-            )
+            raise RuntimeError(f"{role} process scan returned malformed CIM output")
         pid = int(match.group(1))
-        if pid == current:
-            raise RuntimeError(
-                "bot process scan returned malformed CIM output"
-            )
-        if pid not in seen:
-            seen.add(pid)
-            out.append(text)
+        if pid == os.getpid() or pid > 0xFFFFFFFF:
+            raise RuntimeError(f"{role} process scan returned malformed CIM output")
+        try:
+            commandline = base64.b64decode(match.group(2), validate=True).decode("utf-16-le")
+            argv = commandline_argv(commandline)
+            created = float(match.group(3)) if include_creation else None
+            if not argv or (include_creation and not 0 < created < float("inf")):
+                raise ValueError("invalid process identity")
+        except (ValueError, UnicodeError) as exc:
+            raise RuntimeError(f"{role} process scan returned malformed CIM output") from exc
+        identity = (argv, created)
+        if pid in seen:
+            if seen[pid] != identity:
+                raise RuntimeError(f"{role} process scan returned conflicting CIM identities")
+            continue
+        seen[pid] = identity
+        out.append((pid, argv, created))
+    return out
+
+
+def _running_bot_processes_via_cim() -> list[str]:
+    from core.process_identity import bot_process_scope
+    from launcher.config.settings import BOT_META
+
+    rows = _cim_python_process_rows("bot")
+    out = []
+    for pid, argv, _created in rows:
+        scope = bot_process_scope(argv, ROOT, BOT_META)
+        if scope == "unknown":
+            raise RuntimeError(f"bot process root scope unavailable for pid {pid}")
+        if scope == "root":
+            out.append(f"bot process (pid {pid})")
     return out
 
 
@@ -1341,36 +1311,14 @@ def _running_launchers_via_cim() -> list[str]:
 DashboardTarget = tuple[int, str, float]
 
 
-def _dashboard_scope_matches(
-    raw_name: object,
-    raw_exe: object,
-    raw_cmdline: object,
-    raw_cwd: object,
-) -> bool:
-    name = str(raw_name or "").lower()
-    exe_name = Path(str(raw_exe or "")).name.lower()
-    cmd_exe_name = ""
-    if isinstance(raw_cmdline, (list, tuple)) and raw_cmdline:
-        cmd_exe_name = Path(str(raw_cmdline[0])).name.lower()
-    python_like = any(
-        re.fullmatch(r"python(?:w|[0-9.]*)?\.exe", value)
-        for value in (name, exe_name, cmd_exe_name)
-    )
-    if not python_like or not isinstance(raw_cmdline, (list, tuple)):
-        return False
-    commandline = " ".join(str(value) for value in raw_cmdline)
-    normalized = commandline.replace("\\", "/").lower()
-    if "streamlit" not in normalized or "tools/dashboard.py" not in normalized:
-        return False
-    root_cwd = str(ROOT).replace("\\", "/").lower().rstrip("/")
-    root_command = root_cwd + "/"
-    cwd_normalized = str(raw_cwd or "").replace("\\", "/").lower()
-    if raw_cwd is None:
-        return root_command in normalized
-    return root_command in normalized or cwd_normalized.rstrip("/") == root_cwd
+def _dashboard_scope_matches(raw_name, raw_exe, raw_cmdline, raw_cwd) -> bool:
+    from core.process_identity import dashboard_process_scope
+
+    return dashboard_process_scope(raw_cmdline, ROOT, raw_cwd) == "root"
 
 
 def _running_dashboard_processes() -> list[DashboardTarget]:
+    from core.process_identity import dashboard_process_scope
     try:
         import psutil  # type: ignore
     except Exception:
@@ -1417,21 +1365,16 @@ def _running_dashboard_processes() -> list[DashboardTarget]:
                 if not raw_cmdline and python_like:
                     scan_incomplete = True
                     continue
-                cmdline = " ".join(raw_cmdline)
-                proc_cwd = str(raw_cwd or "")
+                scope = dashboard_process_scope(raw_cmdline, ROOT, raw_cwd)
             except Exception:
                 scan_incomplete = True
                 continue
-            norm = cmdline.replace("\\", "/").lower()
-            cwd_norm = proc_cwd.replace("\\", "/").lower()
             if not python_like:
                 continue
-            if "streamlit" not in norm or "tools/dashboard.py" not in norm:
-                continue
-            if raw_cwd is None and root_command not in norm:
+            if scope == "unknown":
                 scan_incomplete = True
                 continue
-            if root_command not in norm and cwd_norm.rstrip("/") != root_cwd:
+            if scope != "root":
                 continue
             if not create_time > 0.0:
                 scan_incomplete = True
@@ -1621,102 +1564,16 @@ def _running_tool_processes_via_cim() -> list[str]:
 
 
 def _running_dashboard_processes_via_cim() -> list[DashboardTarget]:
-    root = (
-        str(ROOT).replace("\\", "/").lower().rstrip("/") + "/"
-    ).replace("'", "''")
-    script = (
-        "$ErrorActionPreference='Stop'; "
-        "$ProgressPreference='SilentlyContinue'; "
-        f"$root='{root}'; "
-        f"$current={os.getpid()}; "
-        "$scanPid=$PID; "
-        "$all=@(Get-CimInstance -ClassName Win32_Process "
-        "-Property ProcessId,ParentProcessId,Name,CommandLine,CreationDate); "
-        "$capturePid=[int](($all | Where-Object { "
-        "$_.ProcessId -eq $scanPid } | Select-Object -First 1).ParentProcessId); "
-        "if (-not ($all.ProcessId -contains $current) -or "
-        "-not ($all.ProcessId -contains $scanPid) -or "
-        "$capturePid -le 0 -or -not ($all.ProcessId -contains $capturePid)) { "
-        "throw 'runtime process scan missing process-table anchor' }; "
-        "$all | Where-Object { $_.ProcessId -gt 0 -and "
-        "$_.ProcessId -ne $current -and $_.ProcessId -ne $scanPid -and "
-        "$_.ProcessId -ne $capturePid } | "
-        "ForEach-Object { "
-        "$name=[string]$_.Name; $line=[string]$_.CommandLine; "
-        "$nameLow=$name.ToLower(); "
-        "$pythonLike=($nameLow -match '^python(?:w|[0-9.]*)?\\.exe$'); "
-        "if (-not $name) { "
-        "'runtime process scan unknown (pid ' + $_.ProcessId + ')' "
-        "} elseif ($pythonLike -and [string]::IsNullOrWhiteSpace($line)) { "
-        "'runtime process scan unknown (pid ' + $_.ProcessId + ')' "
-        "} elseif ($pythonLike -and "
-        "-not [string]::IsNullOrWhiteSpace($line)) { "
-        "$norm=$line.ToLower().Replace('\\','/'); "
-        "if ($norm.Contains('streamlit') -and "
-        "$norm.Contains('tools/dashboard.py')) { "
-        "if ($norm.Contains($root)) { "
-        "$created=([datetime]$_.CreationDate).ToUniversalTime(); "
-        "$epoch=($created-[datetime]'1970-01-01Z').TotalSeconds; "
-        "([string]$_.ProcessId + '|' + "
-        "$epoch.ToString('R',[Globalization.CultureInfo]::InvariantCulture)) } "
-        "else { 'runtime process scan unknown (pid ' + "
-        "$_.ProcessId + ')' } } } }; "
-        "'runtime process scan ok (count ' + $all.Count + ')'"
-    )
-    try:
-        r = _run_cim_process_scan(script)
-    except Exception as exc:
-        raise RuntimeError("dashboard scan unavailable via CIM") from exc
-    if r.returncode != 0:
-        raise RuntimeError(
-            "dashboard scan unavailable via CIM "
-            f"(returncode {r.returncode})"
-        )
-    if (r.stderr or "").strip():
-        raise RuntimeError("dashboard scan unavailable via CIM")
-    out: list[DashboardTarget] = []
-    seen: set[int] = set()
-    current = os.getpid()
-    lines = [
-        line.strip()
-        for line in (r.stdout or "").splitlines()
-        if line.strip()
-    ]
-    sentinel = (
-        re.fullmatch(
-            r"runtime process scan ok \(count ([1-9][0-9]*)\)",
-            lines[-1],
-        )
-        if lines
-        else None
-    )
-    if sentinel is None or int(sentinel.group(1)) < 3:
-        raise RuntimeError("dashboard scan returned malformed CIM output")
-    for text in lines[:-1]:
-        if re.fullmatch(
-            r"runtime process scan unknown \(pid [1-9][0-9]*\)",
-            text,
-        ):
-            raise RuntimeError(
-                "dashboard scan returned incomplete CIM output"
-            )
-        match = re.fullmatch(
-            r"([1-9][0-9]*)\|([0-9]+(?:\.[0-9]+)?)",
-            text,
-        )
-        if match is None:
-            raise RuntimeError(
-                "dashboard scan returned malformed CIM output"
-            )
-        pid = int(match.group(1))
-        create_time = float(match.group(2))
-        if pid == current:
-            raise RuntimeError(
-                "dashboard scan returned malformed CIM output"
-            )
-        if pid not in seen:
-            seen.add(pid)
-            out.append((pid, f"dashboard pid {pid}", create_time))
+    from core.process_identity import dashboard_process_scope
+
+    rows = _cim_python_process_rows("dashboard", include_creation=True)
+    out = []
+    for pid, argv, created in rows:
+        scope = dashboard_process_scope(argv, ROOT)
+        if scope == "unknown":
+            raise RuntimeError(f"dashboard process root scope unavailable for pid {pid}")
+        if scope == "root":
+            out.append((pid, f"dashboard pid {pid}", created))
     return out
 
 

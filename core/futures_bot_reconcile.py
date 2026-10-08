@@ -1623,6 +1623,7 @@ def _record_futures_external_partial(bot, sym: str, state_row: dict,
         "funding_paid": funding_partial,
         "fees_usdt": entry_fee + close_fee,
         "is_partial": True,
+        "entry_id": state_row.get("entry_id"),
         "exchange_order_id": (
             f"external-partial:{bot.BOT_NAME}:{sym}:"
             f"{state_row.get('buy_time', '')}:"

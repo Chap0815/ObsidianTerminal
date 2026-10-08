@@ -301,7 +301,7 @@ class ExitsMixin:
                 except Exception:
                     pass
 
-    def _retry_pending_partial_accounting(self, sym: str, d: dict) -> None:
+    def _retry_pending_partial_accounting(self, sym: str, d: dict, *, already_locked: bool = False) -> None:
         if d.get("entry_price_unverified"):
             return
         from bot_utils.trade_state import (
@@ -322,11 +322,13 @@ class ExitsMixin:
         from core.logger import log_event
         from core.symbol_locks import close_lock
 
-        with close_lock(
+        from contextlib import nullcontext
+        lock = nullcontext(True) if already_locked else close_lock(
             sym,
             timeout=2.0,
             bot_name=getattr(self, "BOT_NAME", "SPOT"),
-        ) as got:
+        )
+        with lock as got:
             if not got:
                 return
             live = self.state.get(sym)
@@ -448,6 +450,10 @@ class ExitsMixin:
         )
 
         if not _spot_accounting_retry_due(d):
+            return False
+
+        from trading.cooldown_utils import replay_exit_cooldown
+        if not replay_exit_cooldown(self, sym, d):
             return False
 
         restore = {
@@ -1087,6 +1093,14 @@ class ExitsMixin:
         from core.logger import log_event
 
         from bot_utils.spot_exits import service_spot_entry_basis
+        if d.get("accounting_pending_partials") and (
+                d.get("accounting_pending") or d.get("accounting_already_booked")):
+            self._retry_pending_partial_accounting(sym, d)
+            live = self.state.get(sym)
+            from bot_utils.trade_state import same_position_generation
+            if not isinstance(live, dict) or not same_position_generation(live, d):
+                return
+            d = live
         if not service_spot_entry_basis(self, sym, d):
             return
         if d.get("accounting_already_booked"):
@@ -1202,8 +1216,14 @@ class ExitsMixin:
         ):
             return
         d = live
-        if d.get("accounting_pending_partials"):
-            return
+        ledger_pending = bool(d.get("accounting_pending_partials"))
+        protection_only = ledger_pending or d.get("entry_fee_finalization_pending") is True
+        if ledger_pending:
+            from bot_utils.trade_state import partial_accounting_allows_protection
+            if not partial_accounting_allows_protection(
+                    self.state, sym, d, bot_name=self.BOT_NAME,
+                    mode_is_sim=self.simulation, is_futures=False):
+                return
 
         buy = _positive_finite(d.get("buy"))
         curr = _positive_finite(curr)
@@ -1301,7 +1321,7 @@ class ExitsMixin:
         # Partial Take-Profit
         activation_profit = float(self.C("ACTIVATION_PROFIT"))
         partial_block_active = _partial_tp_block_active(self, sym, d)
-        if (activation_profit > 0.0
+        if (not protection_only and activation_profit > 0.0
                 and not d.get("partial_sold")
                 and not partial_block_active
                 and prof >= activation_profit):
@@ -2042,6 +2062,12 @@ class ExitsMixin:
             log_event(f"{sym}: full sell deferred while another sell intent is pending", "WARN")
             return
 
+        if d.get("entry_fee_finalization_pending") is True:
+            from bot_utils.trade_state import update_many_if_current
+            if update_many_if_current(self.state, sym, {"entry_price_unverified": True}, d) is not True:
+                return
+            d = self.state.get(sym)
+
         if not self.simulation and d.get("entry_price_unverified"):
             from bot_utils.spot_exits import recover_spot_entry_basis, spot_entry_close_amount
             recover_spot_entry_basis(self, sym, d, already_locked=True)
@@ -2484,6 +2510,8 @@ class ExitsMixin:
                 "accounting_pending_mae_pct": mae_pct,
                 "accounting_pending_giveback_pct": giveback_pct,
             }
+            from trading.cooldown_utils import exit_cooldown_fields
+            pending_close.update(exit_cooldown_fields(self, reason, profit_usdt, sell_time))
             try:
                 pending_persisted = update_many_if_current(
                     self.state,
@@ -2561,21 +2589,8 @@ class ExitsMixin:
         # shared claim.  The scanner does not hold this close lock while it
         # evaluates a candidate, so cleanup-first creates a real window in
         # which the just-stopped symbol can be claimed again.
-        from trading.cooldown_utils import should_cooldown_after_exit
-        if should_cooldown_after_exit(reason, profit_usdt):
-            try:
-                from trading.cooldown_utils import set_cooldown as _scd
-                with self._cooldown_lock:
-                    _scd(
-                        self.cool,
-                        sym,
-                        int(self.C("COOLDOWN_AFTER_SL", 120)),
-                        self.COOLDOWN_FILE,
-                    )
-            except Exception as exc:
-                self._log_error(f"spot post-exit cooldown {sym}", exc)
-
         cleanup_row = dict(d)
+        cleanup_row.update(pending_close)
         cleanup_row.update({
             "accounting_already_booked": True,
             "accounting_booked_sell_time": sell_time,

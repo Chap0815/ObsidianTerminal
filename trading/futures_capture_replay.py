@@ -296,8 +296,22 @@ def _normalized_funding(raw_rows) -> list[list[float | int]]:
             or not math.isfinite(rate)
         ):
             raise ValueError("funding evidence must be finite")
-        by_timestamp[int(timestamp_number)] = rate
-    rows = [[timestamp, by_timestamp[timestamp]] for timestamp in sorted(by_timestamp)]
+        values = [rate]
+        if len(raw) >= 3 and raw[2] is not None:
+            if isinstance(raw[2], bool):
+                raise ValueError("funding settlement mark must be numeric")
+            try:
+                mark = float(raw[2])
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("funding settlement mark must be numeric") from exc
+            if not math.isfinite(mark) or mark <= 0.0:
+                raise ValueError("funding settlement mark must be finite and positive")
+            values.append(mark)
+        timestamp = int(timestamp_number)
+        if timestamp in by_timestamp and by_timestamp[timestamp] != values:
+            raise ValueError("conflicting funding settlement evidence")
+        by_timestamp[timestamp] = values
+    rows = [[timestamp, *by_timestamp[timestamp]] for timestamp in sorted(by_timestamp)]
     if len(rows) < 2:
         raise ValueError("funding history requires at least two settlements")
     if any(
@@ -839,6 +853,7 @@ def load_replay_dataset(dataset_root: str | Path) -> ReplayDataset:
             (
                 datetime.fromtimestamp(row[0] / 1000.0, tz=timezone.utc),
                 row[1],
+                row[2] if len(row) >= 3 else None,
             )
             for row in normalized
         )
@@ -892,8 +907,11 @@ def _indicator_panel(rows, timeframe: str) -> tuple[list[datetime], list[dict]]:
     return times, values
 
 
-def _asof(times: list[datetime], values: list[dict], when: datetime) -> dict | None:
+def _asof(times: list[datetime], values: list[dict], when: datetime,
+          *, max_age: timedelta | None = None) -> dict | None:
     index = bisect.bisect_right(times, when) - 1
+    if index >= 0 and max_age is not None and when - times[index] >= max_age:
+        return None
     return values[index] if index >= 0 else None
 
 
@@ -998,7 +1016,8 @@ def build_capture_replay_index(
             last = market.last
             change = (last / old_market.last - 1.0) * 100.0
             tf_values = {
-                timeframe: _asof(*panels[timeframe], when)
+                timeframe: _asof(*panels[timeframe], when,
+                                 max_age=timedelta(milliseconds=_TIMEFRAME_MS[timeframe]))
                 for timeframe in _TIMEFRAME_MS
             }
             one = tf_values["1h"]
@@ -1070,7 +1089,7 @@ def build_capture_replay_index(
         "causality": {
             "snapshot_selector": "latest received_time <= scan_time",
             "change_24h": "latest received snapshots at scan and scan-24h",
-            "indicators": "native candle close <= scan_time",
+            "indicators": "native candle close <= scan_time; age < one timeframe interval",
             "historical_universe": True,
             "future_ticker_access": False,
         },

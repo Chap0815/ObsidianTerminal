@@ -1,12 +1,14 @@
 {
   "advisories": [],
-  "requirements_lock_sha256": "5152d6783e41094c70040286984e4b05ca54e4d01f0ce473716c05acf8541153",
-  "retrieved_at_utc": "2026-09-25T05:18:48.618228+00:00",
+  "requirements_lock_sha256": "c02dd786e936a43d6a7685e410398623f876bdd72bf2f361fb7b0c722afdae1b",
+  "retrieved_at_utc": "2026-10-07T16:07:59.822141+00:00",
   "safety_floors": {
     "aiohttp": "3.14.3",
     "anyio": "4.14.2",
     "cryptography": "50.0.1",
-    "gitpython": "3.1.61"
+    "gitpython": "3.2.0",
+    "multidict": "6.9.1",
+    "urllib3": "2.8.0"
   },
   "schema_version": 1,
   "source": "https://api.osv.dev/v1/querybatch"

@@ -414,6 +414,8 @@ def evaluate_momentum_panel(
     for timestamp in timestamps:
         if (timestamp - origin) % holding_ms:
             continue
+        if timestamp + hour_ms + holding_ms > timestamps[-1]:
+            break  # fixed dataset end right-censors the whole research horizon
         invested = any((
             previous_cross_weights,
             previous_hysteresis_weights,
@@ -443,20 +445,19 @@ def evaluate_momentum_panel(
                 timestamp not in rows
                 or previous not in rows
                 or tsmom_previous not in rows
-                or entry_timestamp not in rows
-                or exit_timestamp not in rows
             ):
                 continue
             current_price = rows[timestamp][1]
             past_price = rows[previous][1]
             tsmom_past_price = rows[tsmom_previous][1]
-            entry_price = rows[entry_timestamp][0]
-            future_price = rows[exit_timestamp][0]
             cross_momentum = _finite(current_price / past_price - 1.0)
             time_momentum = _finite(current_price / tsmom_past_price - 1.0)
-            forward_return = _finite(future_price / entry_price - 1.0)
-            if None in {cross_momentum, time_momentum, forward_return}:
+            if None in {cross_momentum, time_momentum}:
                 continue
+            forward_return = (
+                _finite(rows[exit_timestamp][0] / rows[entry_timestamp][0] - 1.0)
+                if entry_timestamp in rows and exit_timestamp in rows else None
+            )
             trailing_notional = 0.0
             for offset in range(24):
                 point = rows.get(timestamp - offset * hour_ms)
@@ -479,6 +480,8 @@ def evaluate_momentum_panel(
             if invested:
                 skipped_invested_windows += 1
             continue
+        if any(row[4] is None for row in eligible):
+            raise ValueError("selected historical universe has incomplete future outcomes")
         by_momentum = sorted(eligible, key=lambda row: row[2])
         shorts = by_momentum[:basket]
         longs = by_momentum[-basket:]
@@ -513,7 +516,7 @@ def evaluate_momentum_panel(
         btc_rows = [
             row
             for row in eligible
-            if str(row[0]).upper().split("/")[0].split("_")[0].startswith("BTC")
+            if str(row[0]).upper().split("/")[0].rsplit(":", 1)[-1].split("_")[0] == "BTC"
         ]
         # Keep every reported variant on one unit of gross capital. The hedge
         # therefore allocates 0.5 gross long and 0.5 gross short instead of

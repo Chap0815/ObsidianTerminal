@@ -22,7 +22,9 @@ from launcher.core.positions import (
     refresh_positions_with_live_prices,
     refresh_spot_positions_with_live_prices,
 )
-from launcher.ui.components.widgets import safe_geometry
+from launcher.ui.components.widgets import (
+    safe_geometry, keyboard_button, AdaptiveActionRow,
+)
 from launcher.ui.concurrency import CriticalWorkerRegistry
 from launcher.ui.logging_panel import log_to_card
 from launcher.ui.theme import force_dark_titlebar
@@ -65,6 +67,18 @@ def _post_ui_lifecycle(app, callback, *, delay_ms: int = 0) -> bool:
     if callable(post):
         return post(callback, delay_ms=delay_ms) is True
     return _post_ui(app, callback, delay_ms=delay_ms)
+
+
+def _price_refresh_note(rows) -> str:
+    if not rows:
+        return " No positions to refresh"
+    live = sum(1 for row in rows if row.get("price_source") == "live"
+               and row.get("price_stale") is False)
+    if live == len(rows):
+        return " Prices refreshed live"
+    if live:
+        return f" {live}/{len(rows)} prices refreshed live; others stored or unavailable"
+    return " No fresh prices; using stored or unavailable values"
 
 
 def _start_critical_worker(
@@ -276,7 +290,7 @@ def show_state_read_error_dialog(app, title: str, detail: str) -> None:
         justify="left",
         wraplength=440,
     ).pack(padx=24, pady=(0, 16), anchor="w")
-    ctk.CTkButton(
+    keyboard_button(
         dlg, text="OK", height=34, width=100,
         font=ctk.CTkFont(FONT_BODY, 12, "bold"),
         fg_color=COLORS["danger"],
@@ -418,7 +432,13 @@ def show_spot_stop_dialog(app, name: str, positions: list) -> None:
     force_dark_titlebar(dlg)
     safe_geometry(dlg, 620, dlg_height, parent=app)
 
-    ctk.CTkLabel(dlg, text=" Open Positions Detected",
+    btns = AdaptiveActionRow(dlg, fg_color="transparent")
+    btns.pack(side="bottom", fill="x", padx=12, pady=8)
+    body = ctk.CTkScrollableFrame(dlg, fg_color="transparent",
+                                  scrollbar_button_color=COLORS["border"])
+    body.pack(fill="both", expand=True, padx=8, pady=4)
+
+    ctk.CTkLabel(body, text=" Open Positions Detected",
                   font=ctk.CTkFont(FONT_BODY, 16, "bold"),
                   text_color=COLORS["warning"]
                   ).pack(pady=(20, 4), padx=24, anchor="w")
@@ -441,13 +461,13 @@ def show_spot_stop_dialog(app, name: str, positions: list) -> None:
     sim_mode = (modes == ["SIM"]) if modes else bool(app.config[name].get("SIMULATION", True))
 
     ctk.CTkLabel(
-        dlg,
+        body,
         text=f"The {name} bot has {len(positions)} open position(s) in {mode_lbl} mode.",
         font=ctk.CTkFont(FONT_BODY, 12, "bold"),
         text_color=mode_color, justify="left"
     ).pack(pady=(0, 12), padx=24, anchor="w")
 
-    pos_frame = ctk.CTkScrollableFrame(dlg, fg_color=COLORS["bg"], corner_radius=8,
+    pos_frame = ctk.CTkScrollableFrame(body, fg_color=COLORS["bg"], corner_radius=8,
                                 border_width=1, border_color=COLORS["border"],
                                 scrollbar_button_color=COLORS["border"])
     pos_frame.pack(fill="both", expand=True, padx=24, pady=(0, 12))
@@ -513,7 +533,7 @@ def show_spot_stop_dialog(app, name: str, positions: list) -> None:
         "This is irreversible and may have slippage!"
     )
 
-    ctk.CTkLabel(dlg, text=explanation,
+    ctk.CTkLabel(body, text=explanation,
                   font=ctk.CTkFont(FONT_BODY, 10, "bold"),
                   text_color=COLORS["text_subtle"],
                   justify="left").pack(padx=24, pady=(0, 4), anchor="w")
@@ -521,15 +541,13 @@ def show_spot_stop_dialog(app, name: str, positions: list) -> None:
     # "Prices as of last poll" note + on-demand refresh button.
     # The poller updates every 30s  these prices are never more than 30s old.
     price_note = ctk.CTkLabel(
-        dlg,
+        body,
         text=" Prices from last poll  click Refresh to refresh live",
         font=ctk.CTkFont(FONT_BODY, 9),
         text_color=COLORS["text_subtle"],
     )
     price_note.pack(padx=24, pady=(0, 8), anchor="w")
 
-    btns = ctk.CTkFrame(dlg, fg_color="transparent")
-    btns.pack(side="bottom", fill="x", padx=20, pady=16)
 
     def _close_all_and_stop():
         dlg.destroy()
@@ -589,7 +607,7 @@ def show_spot_stop_dialog(app, name: str, positions: list) -> None:
                     if not dlg.winfo_exists():
                         return
                     price_note.configure(
-                        text=" Prices refreshed live"
+                        text=_price_refresh_note(refreshed)
                     )
                     # Re-render pos_frame with new data
                     for widget in pos_frame.winfo_children():
@@ -678,7 +696,7 @@ def show_spot_stop_dialog(app, name: str, positions: list) -> None:
     close_button_pnl = (
         "PnL stale" if invalid_total else f"{total_pnl:+.2f} USDT"
     )
-    close_button = ctk.CTkButton(btns,
+    close_button = keyboard_button(btns,
         text=f" Close All & Stop ({close_button_pnl})",
         height=36, corner_radius=8, width=260,
         font=ctk.CTkFont(FONT_BODY, 12, "bold"),
@@ -688,7 +706,7 @@ def show_spot_stop_dialog(app, name: str, positions: list) -> None:
     )
     close_button.pack(side="right")
 
-    ctk.CTkButton(btns, text=" Stop only",
+    keyboard_button(btns, text=" Stop only",
         height=36, corner_radius=8, width=110,
         font=ctk.CTkFont(FONT_BODY, 12, "bold"),
         fg_color="transparent", hover_color=COLORS["panel_hover"],
@@ -697,7 +715,7 @@ def show_spot_stop_dialog(app, name: str, positions: list) -> None:
         command=_stop_only,
     ).pack(side="right", padx=(0, 8))
 
-    ctk.CTkButton(btns, text="Refresh",
+    keyboard_button(btns, text="Refresh",
         height=36, corner_radius=8, width=84,
         font=ctk.CTkFont(FONT_BODY, 12, "bold"),
         fg_color="transparent", hover_color=COLORS["panel_hover"],
@@ -706,7 +724,7 @@ def show_spot_stop_dialog(app, name: str, positions: list) -> None:
         command=_refresh_prices,
     ).pack(side="right", padx=(0, 4))
 
-    ctk.CTkButton(btns, text="Cancel",
+    keyboard_button(btns, text="Cancel",
         height=36, corner_radius=8, width=90,
         font=ctk.CTkFont(FONT_BODY, 12, "bold"),
         fg_color="transparent", hover_color=COLORS["panel_hover"],
@@ -744,7 +762,13 @@ def show_futures_stop_dialog(app, name: str, positions: list) -> None:
     force_dark_titlebar(dlg)
     safe_geometry(dlg, 620, dlg_height, parent=app)
 
-    ctk.CTkLabel(dlg, text=" Open Positions Detected",
+    btns = AdaptiveActionRow(dlg, fg_color="transparent")
+    btns.pack(side="bottom", fill="x", padx=12, pady=8)
+    body = ctk.CTkScrollableFrame(dlg, fg_color="transparent",
+                                  scrollbar_button_color=COLORS["border"])
+    body.pack(fill="both", expand=True, padx=8, pady=4)
+
+    ctk.CTkLabel(body, text=" Open Positions Detected",
                   font=ctk.CTkFont(FONT_BODY, 16, "bold"),
                   text_color=COLORS["warning"]
                   ).pack(pady=(20, 4), padx=24, anchor="w")
@@ -769,13 +793,13 @@ def show_futures_stop_dialog(app, name: str, positions: list) -> None:
         mode_color = COLORS["warning"] if sim_mode else COLORS["danger"]
 
     ctk.CTkLabel(
-        dlg,
+        body,
         text=f"The {label} bot has {len(positions)} open position(s) in {mode_lbl} mode.",
         font=ctk.CTkFont(FONT_BODY, 12, "bold"),
         text_color=mode_color, justify="left"
     ).pack(pady=(0, 12), padx=24, anchor="w")
 
-    pos_frame = ctk.CTkScrollableFrame(dlg, fg_color=COLORS["bg"], corner_radius=8,
+    pos_frame = ctk.CTkScrollableFrame(body, fg_color=COLORS["bg"], corner_radius=8,
                                 border_width=1, border_color=COLORS["border"],
                                 scrollbar_button_color=COLORS["border"])
     pos_frame.pack(fill="both", expand=True, padx=24, pady=(0, 12))
@@ -865,22 +889,20 @@ def show_futures_stop_dialog(app, name: str, positions: list) -> None:
             " LIVE MODE: closing will fire reduceOnly market orders on the\n"
             "exchange and lock in the current PnL. Slippage may apply!")
 
-    ctk.CTkLabel(dlg, text=explanation,
+    ctk.CTkLabel(body, text=explanation,
                   font=ctk.CTkFont(FONT_BODY, 10, "bold"),
                   text_color=COLORS["text_subtle"],
                   justify="left").pack(padx=24, pady=(0, 4), anchor="w")
 
     # Price-age note + on-demand live-refresh button.
     price_note_fut = ctk.CTkLabel(
-        dlg,
+        body,
         text=" Prices from last poll  click Refresh to refresh live",
         font=ctk.CTkFont(FONT_BODY, 9),
         text_color=COLORS["text_subtle"],
     )
     price_note_fut.pack(padx=24, pady=(0, 8), anchor="w")
 
-    btns = ctk.CTkFrame(dlg, fg_color="transparent")
-    btns.pack(side="bottom", fill="x", padx=20, pady=16)
 
     def _close_all_and_stop():
         dlg.destroy()
@@ -935,7 +957,7 @@ def show_futures_stop_dialog(app, name: str, positions: list) -> None:
                 try:
                     if not dlg.winfo_exists():
                         return
-                    price_note_fut.configure(text=" Prices refreshed live")
+                    price_note_fut.configure(text=_price_refresh_note(refreshed))
                     for widget in pos_frame.winfo_children():
                         widget.destroy()
                     h2 = ctk.CTkFrame(pos_frame, fg_color="transparent")
@@ -1064,7 +1086,7 @@ def show_futures_stop_dialog(app, name: str, positions: list) -> None:
     close_button_pnl = (
         "PnL stale" if invalid_total else f"{total_pnl:+.2f} USDT"
     )
-    close_button = ctk.CTkButton(btns,
+    close_button = keyboard_button(btns,
         text=f" Close All & Stop ({close_button_pnl})",
         height=36, corner_radius=8, width=260,
         font=ctk.CTkFont(FONT_BODY, 12, "bold"),
@@ -1074,7 +1096,7 @@ def show_futures_stop_dialog(app, name: str, positions: list) -> None:
     )
     close_button.pack(side="right")
 
-    ctk.CTkButton(btns, text=" Stop only",
+    keyboard_button(btns, text=" Stop only",
         height=36, corner_radius=8, width=110,
         font=ctk.CTkFont(FONT_BODY, 12, "bold"),
         fg_color="transparent", hover_color=COLORS["panel_hover"],
@@ -1083,7 +1105,7 @@ def show_futures_stop_dialog(app, name: str, positions: list) -> None:
         command=_stop_only,
     ).pack(side="right", padx=(0, 8))
 
-    ctk.CTkButton(btns, text="Refresh",
+    keyboard_button(btns, text="Refresh",
         height=36, corner_radius=8, width=84,
         font=ctk.CTkFont(FONT_BODY, 12, "bold"),
         fg_color="transparent", hover_color=COLORS["panel_hover"],
@@ -1092,7 +1114,7 @@ def show_futures_stop_dialog(app, name: str, positions: list) -> None:
         command=_refresh_prices_fut,
     ).pack(side="right", padx=(0, 4))
 
-    ctk.CTkButton(btns, text="Cancel",
+    keyboard_button(btns, text="Cancel",
         height=36, corner_radius=8, width=90,
         font=ctk.CTkFont(FONT_BODY, 12, "bold"),
         fg_color="transparent", hover_color=COLORS["panel_hover"],
@@ -1234,21 +1256,25 @@ def show_quit_no_positions_dialog(app) -> None:
     force_dark_titlebar(dlg)
     safe_geometry(dlg, 440, 220, parent=app)
 
-    ctk.CTkLabel(dlg, text="!",
+    row = AdaptiveActionRow(dlg, fg_color="transparent")
+    row.pack(side="bottom", fill="x", padx=12, pady=8)
+    body = ctk.CTkScrollableFrame(dlg, fg_color="transparent",
+                                  scrollbar_button_color=COLORS["border"])
+    body.pack(fill="both", expand=True, padx=8, pady=4)
+
+    ctk.CTkLabel(body, text="!",
                   font=ctk.CTkFont(app.mono_font, 28, "bold"),
                   text_color=COLORS["warning"]
                   ).pack(pady=(20, 4))
-    ctk.CTkLabel(dlg, text="Bots are still running.",
+    ctk.CTkLabel(body, text="Bots are still running.",
                   font=ctk.CTkFont(FONT_BODY, 14, "bold"),
                   text_color=COLORS["text"]
                   ).pack()
-    ctk.CTkLabel(dlg, text="No open positions. What do you want to do?",
+    ctk.CTkLabel(body, text="No open positions. What do you want to do?",
                   font=ctk.CTkFont(FONT_BODY, 12, "bold"),
                   text_color=COLORS["text_dim"]
                   ).pack(pady=(4, 16))
 
-    row = ctk.CTkFrame(dlg, fg_color="transparent")
-    row.pack()
 
     def stop_quit():
         dlg.destroy()
@@ -1263,13 +1289,13 @@ def show_quit_no_positions_dialog(app) -> None:
         dlg.destroy()
         app._shutdown_clean()
 
-    ctk.CTkButton(row, text="Stop & Quit",
+    keyboard_button(row, text="Stop & Quit",
                    fg_color=COLORS["danger"], hover_color="#dc2626",
                    text_color="#ffffff", width=180, height=36, corner_radius=8,
                    font=ctk.CTkFont(FONT_BODY, 13, "bold"),
                    command=stop_quit
                    ).pack(side="left", padx=6)
-    ctk.CTkButton(row, text="Keep Running in Background",
+    keyboard_button(row, text="Keep Running in Background",
                    fg_color="transparent", hover_color=COLORS["panel_hover"],
                    text_color=COLORS["text_dim"], width=220, height=36, corner_radius=8,
                    font=ctk.CTkFont(FONT_BODY, 12, "bold"),
@@ -1296,7 +1322,13 @@ def show_quit_with_positions_dialog(app, open_summary: dict) -> None:
     force_dark_titlebar(dlg)
     safe_geometry(dlg, 520, dlg_height, parent=app)
 
-    ctk.CTkLabel(dlg, text=" Open Positions Detected",
+    btns = AdaptiveActionRow(dlg, fg_color="transparent")
+    btns.pack(side="bottom", fill="x", padx=12, pady=8)
+    body = ctk.CTkScrollableFrame(dlg, fg_color="transparent",
+                                  scrollbar_button_color=COLORS["border"])
+    body.pack(fill="both", expand=True, padx=8, pady=4)
+
+    ctk.CTkLabel(body, text=" Open Positions Detected",
                   font=ctk.CTkFont(FONT_BODY, 16, "bold"),
                   text_color=COLORS["warning"]
                   ).pack(pady=(20, 6), padx=24, anchor="w")
@@ -1325,7 +1357,7 @@ def show_quit_with_positions_dialog(app, open_summary: dict) -> None:
         f"  {bot}: {_summary_count(data)} open position(s)"
         for bot, data in open_summary.items()
     )
-    ctk.CTkLabel(dlg, text=summary_text,
+    ctk.CTkLabel(body, text=summary_text,
                   font=ctk.CTkFont(app.mono_font, 11, "bold"),
                   text_color=COLORS["text"], justify="left"
                   ).pack(padx=24, pady=(0, 12), anchor="w")
@@ -1345,19 +1377,17 @@ def show_quit_with_positions_dialog(app, open_summary: dict) -> None:
         "All affected bots are in SIMULATION mode. Closing only updates\n"
         "the database  no real orders are sent."
     )
-    ctk.CTkLabel(dlg, text=warn_text,
+    ctk.CTkLabel(body, text=warn_text,
                   font=ctk.CTkFont(FONT_BODY, 10, "bold"),
                   text_color=(COLORS["danger"] if any_live else COLORS["text_subtle"]),
                   justify="left"
                   ).pack(padx=24, pady=(0, 16), anchor="w")
 
-    ctk.CTkLabel(dlg, text="What do you want to do?",
+    ctk.CTkLabel(body, text="What do you want to do?",
                   font=ctk.CTkFont(FONT_BODY, 12, "bold"),
                   text_color=COLORS["text_dim"]
                   ).pack(padx=24, pady=(0, 4), anchor="w")
 
-    btns = ctk.CTkFrame(dlg, fg_color="transparent")
-    btns.pack(side="bottom", fill="x", padx=20, pady=16)
 
     def close_all_and_quit():
         dlg.destroy()
@@ -1378,7 +1408,7 @@ def show_quit_with_positions_dialog(app, open_summary: dict) -> None:
         )
 
     action_color = COLORS["danger"] if any_live else COLORS["warning"]
-    ctk.CTkButton(btns,
+    keyboard_button(btns,
         text=" Close All & Quit",
         height=36, corner_radius=8, width=170,
         font=ctk.CTkFont(FONT_BODY, 12, "bold"),
@@ -1387,7 +1417,7 @@ def show_quit_with_positions_dialog(app, open_summary: dict) -> None:
         command=close_all_and_quit
     ).pack(side="right")
 
-    ctk.CTkButton(btns, text=" Stop without closing",
+    keyboard_button(btns, text=" Stop without closing",
         height=36, corner_radius=8, width=170,
         font=ctk.CTkFont(FONT_BODY, 12, "bold"),
         fg_color="transparent", hover_color=COLORS["panel_hover"],
@@ -1396,7 +1426,7 @@ def show_quit_with_positions_dialog(app, open_summary: dict) -> None:
         command=stop_no_close
     ).pack(side="right", padx=(0, 8))
 
-    ctk.CTkButton(btns, text="Cancel",
+    keyboard_button(btns, text="Cancel",
         height=36, corner_radius=8, width=90,
         font=ctk.CTkFont(FONT_BODY, 12, "bold"),
         fg_color="transparent", hover_color=COLORS["panel_hover"],

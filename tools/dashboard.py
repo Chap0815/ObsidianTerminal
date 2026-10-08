@@ -1307,6 +1307,7 @@ def aggregate_positions(trades_df: pd.DataFrame) -> pd.DataFrame:
         "buy_time": "",
         "sell_time": "",
         "profit_usdt": 0.0,
+        "invested_usdt": float("nan"),
         "is_partial": 0,
         "entry_id": "",
         "mode": "",
@@ -1338,6 +1339,7 @@ def aggregate_positions(trades_df: pd.DataFrame) -> pd.DataFrame:
             buy_time=("buy_time", "first"),
             sell_time=("_terminal_sell_text", "first"),
             profit_usdt=("profit_usdt", "sum"),
+            invested_usdt=("invested_usdt", lambda values: pd.to_numeric(values, errors="coerce").sum(min_count=len(values))),
             fills=("profit_usdt", "size"),
             partial_events=(
                 "is_partial",
@@ -1553,22 +1555,22 @@ def compute_metrics(trades_df: pd.DataFrame, history_df: pd.DataFrame | None = N
     # Expectancy
     expectancy = avg_trade
 
-    # Sharpe & Sortino  basierend auf trade-PnL (per-trade returns)
-    if n_positions >= 3:
-        returns = pos_pnl.values
+    # Net campaign return on its complete capital basis, independent of sizing.
+    capital = pd.to_numeric(pos_df.get("invested_usdt", pd.Series(dtype=float)), errors="coerce")
+    if n_positions >= 3 and len(capital) == n_positions and np.isfinite(capital).all() and (capital > 0).all():
+        returns = pos_pnl.values / capital.values
         std = np.std(returns, ddof=1)
-        sharpe = (np.mean(returns) / std * math.sqrt(n_positions)) if std > 0 else 0.0
-        downside = returns[returns < 0]
-        d_std = np.std(downside, ddof=1) if len(downside) >= 2 else 0
+        sharpe = (np.mean(returns) / std * math.sqrt(n_positions)) if std > 0 else None
+        d_std = math.hypot(*(min(float(value), 0.0) for value in returns)) / math.sqrt(n_positions)
         sortino = (
-            (np.mean(returns) / d_std * math.sqrt(n_positions)) if d_std > 0 else 0.0
+            (np.mean(returns) / d_std * math.sqrt(n_positions)) if d_std > 0 else None
         )
     else:
-        sharpe = sortino = 0.0
+        sharpe = sortino = None
 
     # Max Drawdown  auf der kumulativen Equity-Curve
-    sorted_positions = pos_df.sort_values("sell_time")
-    equity = sorted_positions["profit_usdt"].cumsum().values
+    sorted_fills = trades_df.sort_values("sell_time")
+    equity = sorted_fills["profit_usdt"].cumsum().values
     if len(equity) > 0:
         peak = np.maximum(0.0, np.maximum.accumulate(equity))
         drawdown = peak - equity  # in USDT
@@ -2630,15 +2632,15 @@ if selected_view == "Performance":
 
         rc1, rc2, rc3, rc4 = st.columns(4)
         with rc1:
-            sharpe = m.get("sharpe", 0)
+            sharpe = m.get("sharpe")
             color = (
-                "#22c55e" if sharpe >= 1.0 else "#f59e0b" if sharpe >= 0 else "#ef4444"
+                "#94a3b8" if sharpe is None else "#22c55e" if sharpe >= 1.0 else "#f59e0b" if sharpe >= 0 else "#ef4444"
             )
             st.markdown(
                 _kpi_card(
                     "SHARPE RATIO",
-                    f"{sharpe:.2f}",
-                    "risk-adjusted return",
+                    "N/A" if sharpe is None else f"{sharpe:.2f}",
+                    "net campaign returns · Sharpe-t",
                     color,
                     value_fmt="",
                     suffix="",
@@ -2647,9 +2649,9 @@ if selected_view == "Performance":
                 unsafe_allow_html=True,
             )
         with rc2:
-            sortino = m.get("sortino", 0)
+            sortino = m.get("sortino")
             color = (
-                "#22c55e"
+                "#94a3b8" if sortino is None else "#22c55e"
                 if sortino >= 1.5
                 else "#f59e0b"
                 if sortino >= 0
@@ -2658,7 +2660,7 @@ if selected_view == "Performance":
             st.markdown(
                 _kpi_card(
                     "SORTINO RATIO",
-                    f"{sortino:.2f}",
+                    "N/A" if sortino is None else f"{sortino:.2f}",
                     "downside-adjusted",
                     color,
                     value_fmt="",
@@ -2995,7 +2997,9 @@ if selected_view == "Bots":
     comp_df_fmt["Profit Factor"] = comp_df_fmt["Profit Factor"].apply(
         lambda v: "inf" if v >= 999 else f"{v:.2f}"
     )
-    comp_df_fmt["Sharpe"] = comp_df_fmt["Sharpe"].apply(lambda v: f"{v:.2f}")
+    comp_df_fmt["Sharpe"] = comp_df_fmt["Sharpe"].apply(
+        lambda v: f"{v:.2f}" if v is not None and pd.notna(v) and math.isfinite(float(v)) else "unknown"
+    )
     comp_df_fmt["Max DD"] = comp_df_fmt["Max DD"].apply(lambda v: f"{v:.2f} USDT")
     comp_df_fmt["Best"] = comp_df_fmt["Best"].apply(lambda v: f"{v:+.2f}")
     comp_df_fmt["Worst"] = comp_df_fmt["Worst"].apply(lambda v: f"{v:+.2f}")
