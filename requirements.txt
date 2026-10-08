@@ -1,7 +1,7 @@
 #
-#  OBSIDIAN TRADING TERMINAL  -  Pinned dependencies for Python 3.13.16
+#  OBSIDIAN TRADING TERMINAL  -  Pinned dependencies for Python 3.12.10
 #
-# Alle Versionen sind untereinander kompatibel und liefern fr cp313
+# Alle Versionen sind untereinander kompatibel und liefern fr cp312
 # vorgebaute Wheels (kein C-Compiler ntig).
 #
 # HINWEIS  -  Indikatoren:
@@ -9,7 +9,7 @@
 #   bot_utils/indicators.py)  -  dort ist pandas-ta NICHT ntig. NUR das
 #   Backtest-Tool (tools/backtester.py) nutzt noch den ``df.ta``-Accessor,
 #   deshalb ist pandas-ta-classic unten als Tool-Abhngigkeit gelistet.
-#   numpy 2.2.6 + pandas 2.2.3 ist die getestete, stabile cp313-Kombination;
+#   numpy 2.2.6 + pandas 2.2.3 ist die getestete, stabile cp312-Kombination;
 #   pandas-ta-classic (der gepflegte Fork) bleibt damit kompatibel.
 #
 
