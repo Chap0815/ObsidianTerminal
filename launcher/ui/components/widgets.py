@@ -21,12 +21,8 @@ from launcher.core.metrics_service import query_db
 
 #  Resolution-safe geometry helper
 #
-# ctk interprets geometry strings ("WxH+x+y") in *scaled* units: it multiplies
-# them by the per-window scaling factor before handing them to Tk. winfo_screen*
-# return *physical* pixels. To clamp/center correctly we convert the physical
-# screen size into the same scaled units (divide by the window-scaling factor),
-# do all math there, then emit a scaled geometry string ctk will re-scale back
-# to physical. This avoids double-shrinking and works at any global scaling.
+# CTk scales geometry width/height, while +x+y offsets remain physical pixels.
+# winfo_screen*, root coordinates and actual widget dimensions are physical.
 
 _SCREEN_MARGIN = 80  # physical px kept free (taskbar + window chrome)
 
@@ -37,7 +33,10 @@ def enable_keyboard_activation(button) -> None:
     CTkButton delegates mouse bindings to its canvas but supplies no keyboard
     activation. Keep that implementation detail here; invoke() respects disabled.
     """
+    if getattr(button, "_keyboard_activation_enabled", False):
+        return
     target = button._canvas
+    button._keyboard_activation_enabled = True
     target.configure(takefocus=1)
     unfocused = {}
 
@@ -60,6 +59,122 @@ def enable_keyboard_activation(button) -> None:
     target.bind("<Return>", activate, add="+")
     target.bind("<space>", activate, add="+")
     button.bind("<Button-1>", lambda _event: target.focus_set(), add="+")
+
+
+def keyboard_button(*args, **kwargs):
+    """Construct the usual CTkButton with keyboard activation enabled once."""
+    button = ctk.CTkButton(*args, **kwargs)
+    enable_keyboard_activation(button)
+    if isinstance(button.master, AdaptiveActionRow):
+        # Only this button-only container owns geometry. A later optimizer
+        # action must not pack into a parent that already has grid children.
+        def pack_action(**options):
+            button.master.add_action(button, side=options.get("side", "left"))
+        button.pack = pack_action
+    return button
+
+
+def _action_columns(available_width: float, widths: list[float], gap: float = 8) -> int:
+    """Use logical widget units; actual frame widths must be unscaled first."""
+    if not widths:
+        return 1
+    return max(1, min(len(widths), int(available_width / (max(widths) + gap))))
+
+
+class AdaptiveActionRow(ctk.CTkScrollableFrame):
+    """Keep modal actions visible when widget scaling exceeds window scaling.
+
+    This frame contains buttons only. keyboard_button's local pack adapter
+    registers their order; buttons use grid. The action viewport is capped to
+    half the actual window height so even very large DPI/UI factors remain
+    scrollable, with keyboard focus bringing each action into view.
+    """
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("height", 36)
+        kwargs.setdefault("scrollbar_button_color", COLORS["border"])
+        super().__init__(*args, **kwargs)
+        self._action_specs = []
+        self._action_layout = None
+        self._action_after = None
+        self._action_grid_columns = 0
+        self.bind("<Configure>", self._schedule_actions, add="+")
+        self.winfo_toplevel().bind("<Configure>", self._window_resized, add="+")
+        self._schedule_actions()
+
+    def _window_resized(self, event):
+        if event.widget is self.winfo_toplevel():
+            self._action_layout = None
+            self._schedule_actions()
+
+    def add_action(self, button, *, side="left"):
+        self._action_specs = [spec for spec in self._action_specs
+                              if spec[0].winfo_exists() and spec[0] is not button]
+        spec = (button, float(button.cget("width")),
+                float(button.cget("height")), side)
+        self._action_specs.append(spec)
+        if getattr(button, "_action_focus_owner", None) is not self:
+            button._canvas.bind("<FocusIn>", lambda event: self._reveal_action(button), add="+")
+            button._action_focus_owner = self
+        self._action_layout = None
+        self._schedule_actions()
+
+    def _reveal_action(self, button):
+        region = self._parent_canvas.bbox("all")
+        if not region or region[3] <= region[1]:
+            return
+        total = region[3] - region[1]
+        first, _last = self._parent_canvas.yview()
+        visible_top = first * total
+        visible_height = self._parent_canvas.winfo_height()
+        y = button.winfo_y()
+        bottom = y + button.winfo_height()
+        if y < visible_top:
+            self._parent_canvas.yview_moveto(max(0, y / total))
+        elif bottom > visible_top + visible_height:
+            self._parent_canvas.yview_moveto(max(0, (bottom - visible_height) / total))
+
+    def _schedule_actions(self, _event=None):
+        if self._action_after is None:
+            self._action_after = self.after_idle(self._layout_actions)
+
+    def _layout_actions(self):
+        self._action_after = None
+        self._action_specs = [spec for spec in self._action_specs
+                              if spec[0].winfo_exists()]
+        if not self._action_specs or self.winfo_width() <= 1:
+            return
+        ordered = ([spec for spec in self._action_specs if spec[3] != "right"]
+                   + list(reversed([spec for spec in self._action_specs
+                                    if spec[3] == "right"])))
+        scale = float(self._get_widget_scaling())
+        available = self.winfo_width() / scale
+        columns = _action_columns(available, [spec[1] for spec in ordered])
+        cell_width = max(1, available / columns - 8)
+        height_cap = max(1, self.winfo_toplevel().winfo_height() / (2 * scale))
+        signature = (columns, round(cell_width, 2), scale, round(height_cap, 2),
+                     tuple(spec[0] for spec in ordered))
+        if signature == self._action_layout:
+            return
+        self._action_layout = signature
+        for column in range(max(self._action_grid_columns, len(ordered))):
+            self.grid_columnconfigure(column, weight=1 if column < columns else 0,
+                                      minsize=0)
+        self._action_grid_columns = len(ordered)
+        row_heights = {}
+        for index, (button, desired_width, desired_height, _side) in enumerate(ordered):
+            width = min(desired_width, cell_width)
+            label = getattr(button, "_text_label", None)
+            height = desired_height
+            if label is not None:
+                label.configure(wraplength=max(1, int((width - 20) * scale))
+                                if width < desired_width else 0)
+                height = max(height, label.winfo_reqheight() / scale + 12)
+            button.configure(width=width, height=height)
+            button.grid(row=index // columns, column=index % columns,
+                        sticky="ew", padx=4, pady=4)
+            row_heights[index // columns] = max(row_heights.get(index // columns, 0), height + 8)
+        self.configure(height=min(sum(row_heights.values()), height_cap))
 
 
 def _window_scaling(win) -> float:
@@ -107,30 +222,25 @@ def safe_geometry(
     w = min(int(desired_w), max_w)
     h = min(int(desired_h), max_h)
 
-    # Position in scaled units. ctk scales +x+y too, so work in scaled units and
-    # only convert the parent's physical root coords down into scaled units.
-    scaled_sw = phys_sw / scaling
-    scaled_sh = phys_sh / scaling
-
-    x = int((scaled_sw - w) / 2)
-    y = int((scaled_sh - h) / 2)
+    phys_w, phys_h = w * scaling, h * scaling
+    x = int((phys_sw - phys_w) / 2)
+    y = int((phys_sh - phys_h) / 2)
 
     if center and parent is not None:
         try:
             parent.update_idletasks()
-            px = parent.winfo_rootx() / scaling
-            py = parent.winfo_rooty() / scaling
-            pw = parent.winfo_width() / scaling
-            ph = parent.winfo_height() / scaling
+            px = parent.winfo_rootx()
+            py = parent.winfo_rooty()
+            pw = parent.winfo_width()
+            ph = parent.winfo_height()
             if pw > 1 and ph > 1:
-                x = int(px + (pw - w) / 2)
-                y = int(py + (ph - h) / 2)
+                x = int(px + (pw - phys_w) / 2)
+                y = int(py + (ph - phys_h) / 2)
         except Exception:
             pass
 
-    # Clamp on-screen (scaled units), never negative.
-    x = max(0, min(x, int(scaled_sw - w)))
-    y = max(0, min(y, int(scaled_sh - h)))
+    x = max(0, min(x, int(phys_sw - phys_w)))
+    y = max(0, min(y, int(phys_sh - phys_h)))
 
     try:
         win.geometry(f"{w}x{h}+{x}+{y}")
@@ -145,16 +255,15 @@ def safe_geometry(
 def clamp_offset(
     win, x: int, y: int, w: int, h: int, margin: int = _SCREEN_MARGIN
 ) -> tuple[int, int]:
-    """Clamp a manual (+x+y) placement (scaled units) so a wh window stays fully
-    on-screen and never at a negative offset. Returns clamped (x, y)."""
+    """Clamp physical offsets for a window with logical width/height."""
     scaling = _window_scaling(win) or 1.0
     try:
-        scaled_sw = win.winfo_screenwidth() / scaling
-        scaled_sh = win.winfo_screenheight() / scaling
+        phys_sw = win.winfo_screenwidth()
+        phys_sh = win.winfo_screenheight()
     except Exception:
-        scaled_sw, scaled_sh = 1920 / scaling, 1080 / scaling
-    x = max(0, min(int(x), max(0, int(scaled_sw - w))))
-    y = max(0, min(int(y), max(0, int(scaled_sh - h))))
+        phys_sw, phys_sh = 1920, 1080
+    x = max(0, min(int(x), max(0, int(phys_sw - margin - w * scaling))))
+    y = max(0, min(int(y), max(0, int(phys_sh - margin - h * scaling))))
     return x, y
 
 
@@ -583,7 +692,7 @@ class ParamRow(ctk.CTkFrame):
         # Compact controls  buttons directly next to the value, NO
         # container box.
         # fmt: off - compact source form is guarded by the UI regression suite.
-        ctk.CTkButton(self, text="-", width=18, height=24,
+        keyboard_button(self, text="-", width=18, height=24,
                       font=ctk.CTkFont(FONT_BODY, 13, "bold"),
                       fg_color=COLORS["bg"], hover_color=COLORS["panel_hover"],
                       text_color=COLORS["text_dim"], corner_radius=4,
@@ -607,7 +716,7 @@ class ParamRow(ctk.CTkFrame):
         self.value_lbl.bind("<Button-1>", lambda e: self._open_edit())
         attach_tooltip(self.value_lbl, "Click to enter exact value", delay_ms=800)
 
-        ctk.CTkButton(
+        keyboard_button(
             self,
             text="+",
             width=18,
@@ -694,22 +803,28 @@ class ParamRow(ctk.CTkFrame):
         dlg.transient(root)
         safe_geometry(dlg, 280, 180, parent=root)
 
+        btns = AdaptiveActionRow(dlg, fg_color="transparent")
+        btns.pack(side="bottom", fill="x", padx=12, pady=8)
+        body = ctk.CTkScrollableFrame(dlg, fg_color="transparent",
+                                      scrollbar_button_color=COLORS["border"])
+        body.pack(fill="both", expand=True, padx=8, pady=4)
+
         ctk.CTkLabel(
-            dlg,
+            body,
             text="Enter value",
             font=ctk.CTkFont(FONT_BODY, 13, "bold"),
             text_color=COLORS["text"],
         ).pack(pady=(20, 4))
 
         ctk.CTkLabel(
-            dlg,
+            body,
             text=f"Range: {self.vmin:{self.fmt}} - {self.vmax:{self.fmt}}{self.unit}",
             font=ctk.CTkFont(FONT_BODY, 11, "bold"),
             text_color=COLORS["text_muted"],
         ).pack(pady=(0, 12))
 
         entry = ctk.CTkEntry(
-            dlg,
+            body,
             width=180,
             height=36,
             corner_radius=6,
@@ -719,13 +834,13 @@ class ParamRow(ctk.CTkFrame):
             text_color=COLORS["text"],
             justify="center",
         )
-        entry.pack()
+        entry.pack(fill="x", padx=12)
         entry.insert(0, f"{self.value:{self.fmt}}")
         entry.select_range(0, "end")
         entry.focus()
 
         err_lbl = ctk.CTkLabel(
-            dlg,
+            body,
             text="",
             font=ctk.CTkFont(FONT_BODY, 10, "bold"),
             text_color=COLORS["danger"],
@@ -757,10 +872,8 @@ class ParamRow(ctk.CTkFrame):
         def _cancel(*args):
             dlg.destroy()
 
-        btns = ctk.CTkFrame(dlg, fg_color="transparent")
-        btns.pack(pady=12)
 
-        ctk.CTkButton(
+        keyboard_button(
             btns,
             text="Apply",
             width=80,
@@ -773,7 +886,7 @@ class ParamRow(ctk.CTkFrame):
             command=_apply,
         ).pack(side="left", padx=4)
 
-        ctk.CTkButton(
+        keyboard_button(
             btns,
             text="Cancel",
             width=80,

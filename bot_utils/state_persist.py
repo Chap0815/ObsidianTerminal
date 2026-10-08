@@ -14,6 +14,7 @@ import copy
 import json
 import math
 import os
+import re
 import stat
 import threading
 import time
@@ -61,6 +62,8 @@ _POSITION_BOOLEAN_FIELDS = frozenset((
     "accounting_pending",
     "accounting_pending_mode_is_sim",
     "accounting_already_booked",
+    "accounting_pending_blacklist_checked",
+    "entry_fee_finalization_pending",
     "provisional",
     "adopted",
     "claim_conflict",
@@ -91,6 +94,63 @@ _PENDING_ACCOUNTING_FIELDS = frozenset((
     "unpriced_external_partials",
     "entry_basis_pending_closes",
 ))
+
+
+def _normalized_exit_recovery_fields(row: dict) -> dict:
+    """Validate durable exit barriers without trusting JSON truthiness/payloads."""
+    normalized = {}
+    for field in ("entry_fee_finalization_pending", "accounting_pending_blacklist_checked"):
+        if field in row:
+            if type(row[field]) is not bool:
+                raise ValueError(f"{field} must be boolean")
+            normalized[field] = row[field]
+
+    deadline_field = "accounting_pending_cooldown_until"
+    if deadline_field in row:
+        value = row[deadline_field]
+        if (not isinstance(value, str) or len(value) > 40 or not re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)?", value)):
+            raise ValueError(f"{deadline_field} must be an ISO datetime")
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                # Historical cooldown files and the exit WAL use naive UTC.
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            normalized[deadline_field] = parsed.astimezone(timezone.utc).isoformat()
+        except (ValueError, OverflowError) as exc:
+            raise ValueError(f"{deadline_field} is invalid") from exc
+
+    plan_field = "accounting_pending_blacklist_decision"
+    if plan_field in row:
+        plan = row[plan_field]
+        expected = {"loss_usdt", "hours", "reason", "incremental", "event_key"}
+        if not isinstance(plan, dict) or set(plan) != expected:
+            raise ValueError(f"{plan_field} has unexpected fields")
+        loss = plan["loss_usdt"]
+        if isinstance(loss, bool) or not isinstance(loss, (int, float)):
+            raise ValueError(f"{plan_field}.loss_usdt must be finite numeric")
+        try:
+            loss = float(loss)
+        except (ValueError, OverflowError) as exc:
+            raise ValueError(f"{plan_field}.loss_usdt must be finite numeric") from exc
+        if not math.isfinite(loss):
+            raise ValueError(f"{plan_field}.loss_usdt must be finite numeric")
+        hours = plan["hours"]
+        if type(hours) is not int or not 1 <= hours <= 87_600:
+            raise ValueError(f"{plan_field}.hours is invalid")
+        if type(plan["incremental"]) is not bool:
+            raise ValueError(f"{plan_field}.incremental must be boolean")
+        for key, limit in (("reason", 500), ("event_key", 128)):
+            value = plan[key]
+            if (not isinstance(value, str) or len(value) > limit
+                    or (key == "event_key" and not value.strip())
+                    or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+                raise ValueError(f"{plan_field}.{key} is invalid")
+        normalized[plan_field] = dict(plan)
+        normalized[plan_field]["loss_usdt"] = loss
+    if normalized.get("accounting_pending_blacklist_checked") is True and plan_field not in normalized:
+        raise ValueError("blacklist checked marker requires its durable decision")
+    return normalized
 
 
 def _normalized_entry_id_or_none(value) -> str | None:
@@ -407,6 +467,14 @@ def atomic_save_json(path: str, data) -> bool:
         _log_atomic_save_failure(path, exc)
         return False
     try:
+        from bot_utils.atomic_publish import prepare_publication_directory
+
+        prepare_publication_directory(os.path.dirname(os.path.abspath(path)))
+    except Exception as exc:
+        # A fallback must not convert an unconfirmed parent into a durable ACK.
+        _log_atomic_save_failure(path, exc)
+        return False
+    try:
         handle = open(tmp, "x", encoding="utf-8")
         temporary_owned = True
         write_primary: BaseException | None = None
@@ -720,6 +788,12 @@ def _validate_state(trades: dict,
         invalid_boolean = position_boolean_rejection_field(d)
         if invalid_boolean is not None:
             rejected.append(f"{sym}({invalid_boolean}-boolean)")
+            continue
+
+        try:
+            d.update(_normalized_exit_recovery_fields(d))
+        except ValueError:
+            rejected.append(f"{sym}(exit-recovery-fields)")
             continue
 
         invalid_pending = next(

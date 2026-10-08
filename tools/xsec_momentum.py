@@ -773,7 +773,7 @@ def load_panel(ex, coins, days=DEFAULT_DAYS):
     return panel
 
 
-def run(prices, L, reb, K, fee=FEE_ONE_WAY, fund_day=0.0):
+def run(prices, L, reb, K, fee=FEE_ONE_WAY, fund_day=0.0, *, exposure_filter="none", W=4, target=0.04):
     """L=lookback (h), reb=rebalance (h), K=Korbgre je Seite,
     fee=one-way Kosten, fund_day=Funding-Drag pro Tag auf dem Buch."""
     if not isinstance(prices, pd.DataFrame) or prices.empty:
@@ -802,16 +802,17 @@ def run(prices, L, reb, K, fee=FEE_ONE_WAY, fund_day=0.0):
             raise ValueError(f"{name} must be finite and non-negative")
     fee = float(fee)
     fund_day = float(fund_day)
+    _filter_exposure([], exposure_filter, W, target)
     n = len(prices)
     prev_long, prev_short = set(), set()
+    previous_ls_weights, previous_lo_weights = {}, {}
+    reference_returns = []
     ls_rets, lo_rets = [], []  # long-short (neutral) und long-only
     funding = fund_day * (reb / 24.0)  # Drag pro Hold-Periode
     i = L
     while i + reb < n:
         past = (prices.iloc[i] / prices.iloc[i - L] - 1).dropna()
         fwd_row = prices.iloc[i + reb] / prices.iloc[i] - 1
-        valid = past.index[fwd_row.reindex(past.index).notna()]
-        past = past.loc[valid]
         if len(past) < 2 * K + 2:
             i += reb
             continue
@@ -826,18 +827,27 @@ def run(prices, L, reb, K, fee=FEE_ONE_WAY, fund_day=0.0):
 
         ch_l = len(set(longs) ^ prev_long)
         ch_s = len(set(shorts) ^ prev_short)
-        cost = 0.5 * (ch_l / K) * fee + 0.5 * (ch_s / K) * fee
+        reference_cost = 0.5 * (ch_l / K) * fee + 0.5 * (ch_s / K) * fee
         prev_long, prev_short = set(longs), set(shorts)
-
-        ls_rets.append(0.5 * (long_ret - short_ret) - cost - funding)
-        lo_rets.append(long_ret - (ch_l / K) * fee)
+        exposure = _filter_exposure(reference_returns, exposure_filter, W, target)
+        ls_weights = {
+            **{symbol: exposure * 0.5 / K for symbol in longs},
+            **{symbol: -exposure * 0.5 / K for symbol in shorts},
+        }
+        lo_weights = {symbol: exposure / K for symbol in longs}
+        def turnover(previous, current):
+            return math.fsum(abs(current.get(symbol, 0.0) - previous.get(symbol, 0.0))
+                             for symbol in previous.keys() | current.keys())
+        cost = fee * turnover(previous_ls_weights, ls_weights)
+        lo_cost = fee * turnover(previous_lo_weights, lo_weights)
+        previous_ls_weights, previous_lo_weights = ls_weights, lo_weights
+        ls_rets.append(exposure * (0.5 * (long_ret - short_ret) - funding) - cost)
+        lo_rets.append(exposure * long_ret - lo_cost)
+        reference_returns.append(0.5 * (long_ret - short_ret) - reference_cost - funding)
         i += reb
     if ls_rets:
-        terminal_ls_cost = (
-            0.5 * (len(prev_long) / K) * fee
-            + 0.5 * (len(prev_short) / K) * fee
-        )
-        terminal_lo_cost = (len(prev_long) / K) * fee
+        terminal_ls_cost = fee * math.fsum(abs(value) for value in previous_ls_weights.values())
+        terminal_lo_cost = fee * math.fsum(abs(value) for value in previous_lo_weights.values())
         ls_rets[-1] -= terminal_ls_cost
         lo_rets[-1] -= terminal_lo_cost
     if any(
@@ -923,10 +933,30 @@ def equity_stats(rets):
     return ((eq - 1) * 100, mdd * 100, sh, len(rets))
 
 
+def _filter_exposure(past_returns, kind, W=4, target=0.04):
+    if kind not in ("none", "voltarget", "ownmom", "combo"):
+        raise ValueError("filter kind is invalid")
+    if isinstance(W, bool) or not isinstance(W, int) or W < 2:
+        raise ValueError("filter window must be an integer of at least two")
+    if isinstance(target, bool) or not isinstance(target, (int, float)) or not math.isfinite(target) or target < 0:
+        raise ValueError("filter target must be finite and non-negative")
+    if kind == "none" or len(past_returns) < W:
+        return 1.0
+    past = past_returns[-W:]
+    exposure = 1.0
+    if kind in ("voltarget", "combo"):
+        exposure = min(1.0, target / (statistics.stdev(past) or 1e-9))
+    if kind in ("ownmom", "combo") and statistics.mean(past) < 0:
+        return 0.0
+    return exposure
+
+
 def apply_filter(rets, kind, W=4, target=0.04):
-    """Crash-Filter als Exposure-Overlay  nutzt NUR vergangene Returns (kein
-    Look-Ahead). voltarget: Exposure ~ target/recent_vol (cap 1.0). ownmom:
-    flach wenn letzte W Rebalances im Schnitt negativ. combo: beide."""
+    """Analytical return overlay; excludes trades caused by exposure changes.
+
+    Use run(..., exposure_filter=kind) for net strategy returns with turnover.
+    This helper is retained for callers studying gross exposure scaling only.
+    """
     if kind not in ("none", "voltarget", "ownmom", "combo"):
         raise ValueError("filter kind is invalid")
     if isinstance(W, bool) or not isinstance(W, int) or W < 2:
@@ -1046,7 +1076,7 @@ def main(argv: list[str] | None = None) -> int:
     print("-" * 42)
     for kind in ("none", "voltarget", "ownmom", "combo"):
         try:
-            filtered = apply_filter(base, kind)
+            filtered = run(stable, L, reb, K, REAL_FEE, REAL_FUND, exposure_filter=kind)[0]
         except Exception as exc:
             print(f"Simulation failed: {_safe_exc(exc)}")
             return 1
@@ -1095,7 +1125,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         raw = raw_result[0]
         try:
-            filt = apply_filter(raw, "combo")
+            filt = run(te, *cfg, REAL_FEE, REAL_FUND, exposure_filter="combo")[0]
         except Exception as exc:
             print(f"Walk-forward failed: {_safe_exc(exc)}")
             return 1

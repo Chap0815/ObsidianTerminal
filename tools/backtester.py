@@ -15,6 +15,8 @@ sole place per-strategy defaults live and is what the CLI reads.
 
 import sys
 import os
+import base64
+import json
 import math
 import time as _time
 import statistics
@@ -33,7 +35,7 @@ guard_tool_entrypoint(__file__, __name__)
 
 import pandas as pd
 
-from config.exchange_config import get_spot_exchange_connection
+from config.exchange_config import get_spot_exchange_connection, get_public_futures_exchange_connection
 from core.clock import backtest_asof_ms
 from core.logger import log_event, log_separator
 from tools.ohlcv_cache import get_series
@@ -486,8 +488,11 @@ def filter_universe_by_history(history: dict, days: int, now_ms: int = None) -> 
     return kept
 
 
-def connect_exchange():
-    ex = get_spot_exchange_connection()
+def connect_exchange(strategy=None):
+    ex = (
+        get_public_futures_exchange_connection()
+        if strategy == "FUTURES" else get_spot_exchange_connection()
+    )
     ex.timeout = 30000
     for attempt in range(1, 4):
         try:
@@ -576,6 +581,7 @@ def precompute_index(history: dict) -> tuple:
             next_time = times[i + 1] if i + 1 < n else None
             lookup[t] = {
                 "price": closes[i],
+                "open": opens[i],
                 "high": highs[i],
                 "low": lows[i],
                 "next_open": next_open,
@@ -1575,6 +1581,18 @@ def simulate_fast(
                     if bar_low <= trail_level:
                         full_exits.append(("trailing", trail_level))
             if full_exits:
+                # A protective trigger crossed at the bar open cannot execute
+                # at the now-unavailable trigger price inside that price gap.
+                bar_open = tick.get("open")
+                if bar_open is not None:
+                    if not math.isfinite(float(bar_open)) or float(bar_open) <= 0:
+                        raise ValueError("invalid historical exit bar open")
+                    protective = {"liquidation_protection", "stoploss", "break_even", "trailing"}
+                    full_exits = [
+                        (name, max(float(bar_open), price) if side == "SHORT" else min(float(bar_open), price))
+                        if name in protective else (name, price)
+                        for name, price in full_exits
+                    ]
 
                 def _exit_pct(item, *, position_side=side, trade=d):
                     _reason, _price = item
@@ -2310,9 +2328,21 @@ def print_report(s, strategy, days, use_maker, params):
     log_separator("=", 70)
 
 
-def run_backtest(strategy, days=DEFAULT_DAYS, use_maker=False, params=None):
+def run_backtest(strategy, days=DEFAULT_DAYS, use_maker=False, params=None, dataset=None):
     days = _coerce_backtest_days(days)
-    params = params or {}
+    params = dict(params or {})
+    has_validation_scope = "validation_start_utc" in params or "validation_end_utc" in params
+    scope_start = params.pop("validation_start_utc", None)
+    scope_end = params.pop("validation_end_utc", None)
+    if has_validation_scope:
+        if dataset is None or type(scope_start) is not str or type(scope_end) is not str:
+            raise ValueError("validation bounds require a frozen dataset and UTC start/end")
+        try:
+            scope_start, scope_end = pd.Timestamp(scope_start), pd.Timestamp(scope_end)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("invalid validation time bounds") from exc
+        if pd.isna(scope_start) or pd.isna(scope_end) or scope_start.tzinfo is None or scope_end.tzinfo is None or scope_start > scope_end:
+            raise ValueError("validation bounds must be ordered timezone-aware timestamps")
     # This OHLCV loader has no historical settlement-mark evidence. Scalar
     # funding must not start a costly run that later cannot settle truthfully.
     if float(params.get("funding_rate_8h", 0.0) or 0.0) != 0.0:
@@ -2330,9 +2360,32 @@ def run_backtest(strategy, days=DEFAULT_DAYS, use_maker=False, params=None):
     print(
         f"Backtest {strategy} | {days} days | RT {calc_round_trip(use_maker, strategy) * 100:.2f}%\n"
     )
-    ex = connect_exchange()
+    if dataset is not None:
+        from tools.simulation_workspace import load_history_dataset, read_dataset_market_identity
+
+        history, manifest = load_history_dataset(dataset)
+        sources = [manifest.get("fingerprint_payload", {}).get("market_identity", {}), manifest.get("provenance", {})]
+        expected_exchange = next((source.get("exchange") or source.get("exchange_id") for source in sources if isinstance(source, dict) and (source.get("exchange") or source.get("exchange_id"))), None)
+        identity = read_dataset_market_identity(manifest, expected_exchange=expected_exchange)
+        if strategy == "FUTURES" and identity.get("market_type") != "linear_usdt_perpetual":
+            raise ValueError("FUTURES validation requires a perpetual dataset identity")
+        if scope_start is not None:
+            indexed, all_times = precompute_index(history)  # keep full signal warmup
+            selected_times = [timestamp for timestamp in all_times if scope_start <= timestamp <= scope_end]
+            if not selected_times or selected_times[0] != scope_start or selected_times[-1] != scope_end:
+                raise ValueError("validation boundaries are absent from the frozen dataset")
+            result = simulate_fast(indexed, selected_times, strategy, use_maker, params)
+            print(f"Validation simulation index: {scope_start.isoformat()} .. {scope_end.isoformat()} (inclusive)")
+        else:
+            result = simulate_strategy(history, strategy, use_maker=use_maker, params=params)
+        print_report(result, strategy, days, use_maker, params)
+        return result
+    ex = connect_exchange(strategy) if strategy == "FUTURES" else connect_exchange()
     print("Loading coins...")
-    coins = get_top_volume_coins(ex, days=days)
+    coins = (
+        get_top_futures_volume_coins(ex, days=days)
+        if strategy == "FUTURES" else get_top_volume_coins(ex, days=days)
+    )
     print(f"   {len(coins)} coins\n")
     print(f"Loading {days}-day history...")
     history = {}
@@ -2352,6 +2405,35 @@ def run_backtest(strategy, days=DEFAULT_DAYS, use_maker=False, params=None):
     s = simulate_strategy(history, strategy, use_maker=use_maker, params=params)
     print_report(s, strategy, days, use_maker, params)
     return s
+
+
+def _decode_validation_argument(token, *, parameters=False):
+    if not isinstance(token, str) or len(token) > 100_000:
+        raise ValueError("invalid validation argument")
+    try:
+        decoded = base64.b64decode(token, validate=True).decode("utf-8")
+        if not parameters:
+            if not decoded or "\x00" in decoded:
+                raise ValueError("invalid dataset path")
+            return decoded
+        def unique(pairs):
+            value = {}
+            for key, item in pairs:
+                if key in value:
+                    raise ValueError("duplicate parameter")
+                value[key] = item
+            return value
+        value = json.loads(decoded, object_pairs_hook=unique)
+    except (ValueError, UnicodeError) as exc:
+        raise ValueError("invalid validation argument") from exc
+    if not isinstance(value, dict) or any(
+        not isinstance(key, str) or not key or
+        not isinstance(item, (str, int, float, bool, type(None))) or
+        isinstance(item, (int, float)) and not math.isfinite(item)
+        for key, item in value.items()
+    ):
+        raise ValueError("invalid validation parameters")
+    return value
 
 
 if __name__ == "__main__":
@@ -2395,4 +2477,15 @@ if __name__ == "__main__":
         "breakeven_trigger": _a("--breakeven", 0.0),
         "funding_rate_8h": _a("--funding", 0.0),
     }
-    run_backtest(strat, days, use_maker=maker, params=p)
+    dataset = None
+    for flag, is_params in (("--params-b64", True), ("--dataset-b64", False)):
+        if flag in args:
+            try:
+                value = _decode_validation_argument(args[args.index(flag) + 1], parameters=is_params)
+            except (ValueError, IndexError) as exc:
+                raise SystemExit(f"invalid {flag}: {exc}") from exc
+            if is_params:
+                p = value
+            else:
+                dataset = value
+    run_backtest(strat, days, use_maker=maker, params=p, dataset=dataset)

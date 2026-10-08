@@ -1,5 +1,5 @@
 """
-tools/trend_leverage_check.py  Universe  Leverage deployment surface for trend-following.
+tools/trend_leverage_check.py  Universe / leverage research scenarios for trend-following.
 
 Maps {universe size 20/30/50}  {leverage 1..6} on the DAILY timeframe for the
 long/flat SMA-ensemble trend strategy, reporting per cell:
@@ -9,7 +9,9 @@ long/flat SMA-ensemble trend strategy, reporting per cell:
   trades/week
   B&H baseline
 
-Flags deployable cells: PortDD < 40% AND 0 liquidations.
+Flags scenario cells meeting PortDD < 40% AND 0 modeled liquidations.
+This Spot-price, close-only scenario does not authorize deployment and does
+not model intrabar liquidation, historical funding or actual venue execution.
 
 Run:
   python -m tools.trend_leverage_check          # 730d sweep
@@ -149,6 +151,9 @@ def backtest_lev(
     lev, cost, mm = checked["lev"], checked["cost"], checked["mm"]
     if lev <= 0.0 or not 0.0 <= cost < 1.0 or not 0.0 < mm < 1.0:
         raise ValueError("lev, cost, or mm is outside its valid range")
+    notional_cost = lev * cost
+    if notional_cost >= 1.0:
+        raise ValueError("leveraged execution cost exhausts equity")
     n = len(closes)
     eq = peak = 1.0
     maxdd = 0.0
@@ -159,11 +164,11 @@ def backtest_lev(
     for i in range(1, n):
         target = 1 if sig[i - 1] else 0
         if target == 1 and pos == 0:
-            eq *= 1 - cost
+            eq *= 1 - notional_cost
             entry = eq
             pos = 1
         elif target == 0 and pos == 1:
-            eq *= 1 - cost
+            eq *= 1 - notional_cost
             trades += 1
             entry = None
             pos = 0
@@ -330,10 +335,10 @@ def _run_sweep(
     weeks = days / 7.0
 
     print("=" * 100)
-    print("  TREND-FOLLOWING  UNIVERSE  LEVERAGE DEPLOYMENT SURFACE  (DAILY TIMEFRAME)")
+    print("  TREND-FOLLOWING  UNIVERSE / LEVERAGE RESEARCH SCENARIOS  (DAILY TIMEFRAME)")
     print(
         f"  {days}d | leverage: {', '.join(f'{lev:g}x' for lev in LEVERAGES)} | "
-        f"cost {COST * 100:.2f}%/switch | deployment gate: PortDD < {DD_GATE:.0f}% AND 0 liquidations"
+        f"cost {COST * 100:.2f}%/switch | scenario criterion: PortDD < {DD_GATE:.0f}% AND 0 modeled liquidations"
     )
     print("=" * 100)
 
@@ -362,7 +367,7 @@ def _run_sweep(
 
     print()
 
-    best_cell = None  # (n, lev, port_ret) among deployable cells
+    best_cell = None  # (n, lev, port_ret) among cells meeting the scenario criterion
     evaluated = False
 
     for n in sweep_sizes:
@@ -382,7 +387,7 @@ def _run_sweep(
         print(f"  {label.upper()}  ({len(series)} coins, B&H avg {bh:+.1f}%)  ")
         print(
             f"  {'Lev':>4}  {'PortRet%':>9}  {'PortDD%':>8}  {'Liqs':>6}  "
-            f"{'Trd/wk':>8}  {'Deploy?':>8}"
+            f"{'Trd/wk':>8}  {'DD/liq?':>8}"
         )
         print("  " + "-" * 58)
 
@@ -394,7 +399,7 @@ def _run_sweep(
             port_ret = (port[-1] - 1) * 100.0
             port_dd = _max_dd(port)
             deployable = port_dd < DD_GATE and tot_liq == 0
-            flag = " <-- DEPLOY" if deployable else ""
+            flag = " <-- scenario DD/liq criterion" if deployable else ""
             print(
                 f"  {lev:>3g}x  {port_ret:>+8.1f}%  {port_dd:>7.1f}%  {tot_liq:>6}  "
                 f"{per_week:>8.1f}  {'YES' if deployable else 'no':>8}{flag}"
@@ -412,14 +417,15 @@ def _run_sweep(
     if best_cell:
         label, lev, ret, dd = best_cell
         print(
-            f"  CONCLUSION: Best risk-adjusted deployable cell = {label}, {lev:g}x leverage "
+            f"  CONCLUSION: Highest-return cell meeting scenario DD/liq criterion = {label}, {lev:g}x leverage "
             f"({ret:+.1f}% return, {dd:.1f}% PortDD, 0 liquidations)."
         )
     else:
         print(
-            "  CONCLUSION: No cell meets the deployment gate (PortDD<40% AND 0 liquidations) "
+            "  CONCLUSION: No cell meets the scenario criterion (PortDD<40% AND 0 modeled liquidations) "
             "across the tested universe sizes and leverages."
         )
+    print("  Research scenario only: Spot prices, close-only liquidation, no historical funding; no deployment authorization.")
 
     print(f"\n  Generated: {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}")
     print("=" * 100)

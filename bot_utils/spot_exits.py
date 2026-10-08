@@ -75,6 +75,10 @@ def spot_buy_basis(order: dict, *, quote_first: bool = False, exchange=None):
     if not isinstance(order, dict):
         return None
     filled = _positive_finite(order.get("filled"))
+    if order.get("filled") is not None and filled <= 0:
+        # An explicit zero/malformed fill is contrary evidence, not a missing
+        # field that a quote-first adapter may derive from executed cost/avg.
+        return None
     average = _positive_finite(order.get("average"))
     if average <= 0 and _positive_finite(order.get("price")) > 0:
         # CCXT can synthesize cost from requested price even on typeless ACKs.
@@ -83,7 +87,7 @@ def spot_buy_basis(order: dict, *, quote_first: bool = False, exchange=None):
         return None
     price = average
     cost = _positive_finite(order.get("cost"))
-    if quote_first and cost > 0 and price > 0:
+    if quote_first and order.get("filled") is None and cost > 0 and price > 0:
         filled = cost / price
     elif filled > 0 and price > 0:
         if cost > 0:
@@ -289,11 +293,18 @@ def _recover_spot_entry_basis_locked(bot, sym: str, row: dict) -> bool:
                    "initial_entry_fee": entry_fee, "fees_paid": entry_fee + exit_fees,
                    "spot_entry_initial_invested_usdt": invested,
                    "entry_price_unverified": False, "provisional": False,
+                   "entry_fee_finalization_pending": False,
                    "spot_entry_observed_amount": gross,
                    "spot_entry_order_id": order_id_text_or_none(recovered.get("id")),
                    "entry_basis_remaining_amount": remaining}
         if remaining <= tolerance:
             updates["verified_flat_pending_accounting"] = True
+        elif (raw and row.get("accounting_already_booked") is not True
+                and not row.get("accounting_pending")):
+            # A receipt may have exhausted only the unverified placeholder.
+            # Actual BUY evidence can reveal a physical rest; do not preserve
+            # that derived flat marker on this same, still-unbooked generation.
+            updates["verified_flat_pending_accounting"] = False
         if update_many_if_current(bot.state, sym, updates, row) is not True:
             return False
         row.update(updates)
@@ -912,6 +923,7 @@ def aggregate_spot_order_trades(
     amounts = []
     costs = []
     fees = []
+    final_fees_complete = True
     order_ids = set()
     unique_trades = []
     seen_trade_ids = {}
@@ -978,6 +990,20 @@ def aggregate_spot_order_trades(
 
         order_ids.update(_spot_order_ids(trade, trade=True))
         trade_fees = trade.get("fees")
+        fee_rows = trade_fees if isinstance(trade_fees, list) and trade_fees else [trade.get("fee")]
+        from trading.fee_utils import extract_fee_usdt_known
+        fee_known = extract_fee_usdt_known(trade)[1]
+        final_fees_complete = final_fees_complete and fee_known and all(
+            isinstance(item, dict)
+            and isinstance(item.get("currency"), str)
+            and bool(item["currency"].strip())
+            and item["currency"].strip() == item["currency"]
+            and item["currency"].isascii()
+            and item["currency"].isalnum()
+            and isinstance(item.get("cost"), (int, float, str))
+            and not isinstance(item.get("cost"), bool)
+            for item in fee_rows
+        )
         valid_trade_fees = (
             [dict(item) for item in trade_fees if isinstance(item, dict)]
             if isinstance(trade_fees, list) else []
@@ -1017,6 +1043,14 @@ def aggregate_spot_order_trades(
             recovered["average"] = total_cost / filled
     if fees:
         recovered["fees"] = fees
+    if final_fees_complete:
+        from trading.fee_utils import FinalSpotTradeFeeOrder
+        recovered = FinalSpotTradeFeeOrder(recovered)
+    else:
+        # A fee copied from the first execution is no complete order summary
+        # when another execution has missing/malformed fee evidence.
+        recovered.pop("fee", None)
+        recovered["fees"] = fees + [{"cost": None, "currency": None}]
     return recovered
 
 
@@ -1320,9 +1354,15 @@ def validate_spot_recovery_candidate(
         order,
         context="order recovery",
     )
+    from trading.fee_utils import FinalSpotTradeFeeOrder
+    # Keep final-fee provenance for accounting, while the strict shared
+    # identifier parser reads only a plain snapshot of this internal wrapper.
+    identity_order = (
+        dict.copy(order) if type(order) is FinalSpotTradeFeeOrder else order
+    )
     if (
-        _order_client_id_conflicts(order, client_order_id)
-        or not _order_client_id_matches(order, client_order_id)
+        _order_client_id_conflicts(identity_order, client_order_id)
+        or not _order_client_id_matches(identity_order, client_order_id)
     ):
         raise RuntimeError("spot order recovery client id conflict")
     requested_amount = _validated_expected_spot_amount(expected_amount)
@@ -2200,17 +2240,16 @@ def emergency_close_all_spot(*,
 
                 from bot_utils.trade_state import (
                     normalize_pending_accounting_items,
+                    partial_accounting_allows_protection,
                 )
                 if normalize_pending_accounting_items(
                     d.get("accounting_pending_partials")
                 ):
-                    failed.append(f"{sym}: partial exit accounting pending")
-                    log_event(
-                        f"Emergency: {sym} has pending partial accounting; "
-                        "keeping state for retry",
-                        "WARN",
-                    )
-                    continue
+                    if not partial_accounting_allows_protection(
+                            state, sym, d, bot_name=bot_name,
+                            mode_is_sim=simulation, is_futures=False):
+                        failed.append(f"{sym}: partial accounting WAL is not verified durable")
+                        continue
 
                 buy_price = _positive_finite(d.get("buy"))
                 amount = _positive_finite(d.get("amount"))
@@ -2424,11 +2463,15 @@ def emergency_close_all_spot(*,
                                         ownership_live
                                     )
                                     or has_pending_spot_exit_for_other_leg(ownership_live, "emergency")
-                                    or normalize_pending_accounting_items(
+                                    or (normalize_pending_accounting_items(
                                         ownership_live.get(
                                             "accounting_pending_partials"
                                         )
-                                    )
+                                    ) and not partial_accounting_allows_protection(
+                                        state, sym, ownership_live,
+                                        bot_name=bot_name,
+                                        mode_is_sim=simulation, is_futures=False,
+                                    ))
                                 ):
                                     failed.append(
                                         f"{sym}: close recovery pending"

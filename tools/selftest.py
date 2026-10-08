@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import tokenize
 from pathlib import Path
 
@@ -152,8 +153,13 @@ def main() -> int:
         return 1
 
     counter = _Counter()
+    args = [TESTS_DIR, "-q", "-p", "no:cacheprovider", "--no-header"]
+    if os.name == "nt":
+        # pytest clears its basetemp. Reserve a fresh, owned directory rather
+        # than selecting a reusable name that could contain unrelated data.
+        args.append("--basetemp=" + tempfile.mkdtemp(prefix="t_selftest_", dir="C:\\"))
     rc = pytest.main(
-        [TESTS_DIR, "-q", "-p", "no:cacheprovider", "--no-header"],
+        args,
         plugins=[counter],
     )
 

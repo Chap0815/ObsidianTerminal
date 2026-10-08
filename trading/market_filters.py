@@ -298,7 +298,7 @@ class BTCPriceUnavailable(Exception):
 
 #  F&G Circuit Breaker
 _FG_CIRCUIT_LOCK = threading.Lock()
-_FG_CIRCUIT = {"failures": 0, "open_until": 0.0, "last_value": 50}
+_FG_CIRCUIT = {"failures": 0, "open_until": 0.0, "last_value": None}
 _FG_FAILURE_THRESHOLD = 3
 _FG_OPEN_DURATION_SEC = 300
 
@@ -370,7 +370,9 @@ def get_btc_change(
                     close = float(raw_close)
                     if not math.isfinite(close) or close <= 0.0:
                         raise ValueError("BTC OHLCV returned an invalid close price")
-                return bars
+                from trading.ohlcv_validation import validate_recent_ohlcv
+                last_closed = validate_recent_ohlcv(bars, "1h")
+                return bars, last_closed
             except Exception:
                 if isinstance(reservation, ApiCallReservation):
                     record_api_error(
@@ -379,12 +381,10 @@ def get_btc_change(
                     )
                 raise
 
-        def _calc(bars):
+        def _calc(bars, last_closed):
             if not bars:
                 return None
-            # closed_only  measure to the last CLOSED candle (bars[-2]); a
-            # forming-candle wick must not trigger a crash-flatten/kill-switch.
-            end = len(bars) - (2 if closed_only else 1)
+            end = last_closed if closed_only else len(bars) - 1
             if end - hours < 0:
                 return None
             try:
@@ -403,8 +403,8 @@ def get_btc_change(
         primary_symbol = _btc_symbol_for(exchange)
         e_primary = None
         try:
-            bars = _fetch_bars(primary_symbol)
-            result = _calc(bars)
+            bars, last_closed = _fetch_bars(primary_symbol)
+            result = _calc(bars, last_closed)
             if result is None:
                 raise BTCPriceUnavailable(f"insufficient BTC history for {hours}h")
             return result
@@ -415,8 +415,8 @@ def get_btc_change(
             "BTC/USDT:USDT" if primary_symbol == "BTC/USDT" else "BTC/USDT"
         )
         try:
-            bars = _fetch_bars(fallback_symbol)
-            result = _calc(bars)
+            bars, last_closed = _fetch_bars(fallback_symbol)
+            result = _calc(bars, last_closed)
             if result is None:
                 raise BTCPriceUnavailable(f"insufficient BTC history for {hours}h")
             return result
@@ -593,18 +593,21 @@ def _fetch_fg_from_coinybubble() -> Optional[int]:
     return None
 
 
-def get_fear_greed() -> int:
+def get_fear_greed() -> Optional[int]:
     def fetch():
         now = time.monotonic()
         with _FG_CIRCUIT_LOCK:
             failures = _FG_CIRCUIT["failures"]
             open_until = _FG_CIRCUIT["open_until"]
-            last_value = _FG_CIRCUIT["last_value"]
 
         if failures >= _FG_FAILURE_THRESHOLD:
             if now < open_until:
-                normalized_last = _normalized_fear_greed(last_value)
-                return 50 if normalized_last is None else normalized_last
+                try:
+                    from core.database import get_cached_fear_greed
+
+                    return _normalized_fear_greed(get_cached_fear_greed(max_age_sec=24 * 3600))
+                except Exception:
+                    return None
             else:
                 with _FG_CIRCUIT_LOCK:
                     _FG_CIRCUIT["failures"] = _FG_FAILURE_THRESHOLD - 1
@@ -675,15 +678,15 @@ def get_fear_greed() -> int:
                     f"[Filter] F&G circuit breaker OPEN for {_FG_OPEN_DURATION_SEC}s",
                     "WARN",
                 )
-            last = _FG_CIRCUIT["last_value"]
-        normalized_last = _normalized_fear_greed(last)
-        return 50 if normalized_last is None else normalized_last
+        return None
 
     return _cached("fear_greed", fetch)
 
 
-def fg_label(value: int) -> str:
+def fg_label(value: Optional[int]) -> str:
     """Human-readable Fear & Greed label."""
+    if value is None:
+        return "Unknown"
     if value <= 25:
         return "Extreme Fear"
     if value <= 45:
@@ -896,9 +899,9 @@ def get_market_regime(exchange) -> dict:
 
             # Signal 3: sentiment, only as TIEBREAKER (extremes only)
             # F&G in normal Fear range (20-40) does NOT flip the regime alone
-            if fg >= 65:  # Greed
+            if fg is not None and fg >= 65:  # Greed
                 vote += 1
-            elif fg <= 20:  # Extreme Fear (capitulation)
+            elif fg is not None and fg <= 20:  # Extreme Fear (capitulation)
                 vote -= 1
 
             if vote >= 2:
@@ -933,7 +936,7 @@ def get_market_regime(exchange) -> dict:
                 "regime": "UNKNOWN",
                 "btc_24h": 0.0,
                 "btc_7d": 0.0,
-                "fear_greed": 50,
+                "fear_greed": None,
             }
 
     return _cached_for_exchange("regime", exchange, fetch)

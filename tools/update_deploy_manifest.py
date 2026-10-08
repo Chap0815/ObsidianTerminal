@@ -19,6 +19,7 @@ if __package__ in {None, ""}:
 from tools.release_requirements import (  # noqa: E402 - project-root bootstrap
     RELEASE_TOOL_FILES,
     REQUIRED_RELEASE_ITEMS,
+    is_release_root_file,
 )
 
 
@@ -346,6 +347,8 @@ def _skip(path: Path, root: Path) -> bool:
     rel = path.relative_to(root)
     rel_posix = rel.as_posix()
     rel_posix_lower = rel_posix.lower()
+    if len(rel.parts) == 1 and not is_release_root_file(rel.name):
+        return True
     excluded_dirs_lower = {part.lower() for part in EXCLUDED_DIRS}
     excluded_rel_lower = {item.lower() for item in EXCLUDED_REL_PATHS}
     excluded_names_lower = {item.lower() for item in EXCLUDED_NAMES}

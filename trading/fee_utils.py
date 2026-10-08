@@ -31,6 +31,14 @@ except ImportError:
 DISCOUNT_TOKEN_FALLBACK_RATE = DEFAULT_TAKER_FEE
 
 
+class FinalSpotTradeFeeOrder(dict):
+    """Internal authenticated trade aggregate with complete final fee rows.
+
+    A plain create/fetch-order payload, including a zero-fee ACK, never has
+    this provenance.  Only the validated trade aggregator constructs it.
+    """
+
+
 def _finite_float_or_none(value):
     if isinstance(value, bool):
         return None
@@ -196,7 +204,7 @@ def extract_or_estimate(order: dict, fill_price: float,
                         base_override: str = "") -> float:
     """Return a known exchange fee, otherwise estimate as fallback."""
     real, known = extract_fee_usdt_known(order, base_override)
-    if known and real != 0:
+    if known and (real != 0 or isinstance(order, FinalSpotTradeFeeOrder)):
         return real
     if _has_negative_fee_evidence(order):
         return real if known else 0.0
@@ -233,7 +241,7 @@ def extract_or_estimate_with_refetch(ex, order: dict, symbol_full: str,
     import time as _time
 
     real, known = extract_fee_usdt_known(order, base_override)
-    if known and real != 0:
+    if known and (real != 0 or isinstance(order, FinalSpotTradeFeeOrder)):
         return real
     if _has_negative_fee_evidence(order):
         return real if known else 0.0

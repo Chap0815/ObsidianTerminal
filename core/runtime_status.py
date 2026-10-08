@@ -5,10 +5,11 @@ import hashlib
 import json
 import math
 import os
+import stat
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from itertools import islice
+from itertools import chain, islice
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -335,19 +336,37 @@ def cleanup_runtime_status_temps(logs_root: str | os.PathLike[str] | None = None
             # identity. Real cleanup roots are always concrete ``Path`` values.
             root_boundary = None
         deadline = time.monotonic() + _STATUS_TEMP_CLEANUP_MAX_SCAN_SEC
-        candidates = root.glob("*/runtime_status*.tmp")
+        candidates = chain(
+            root.glob("*/runtime_status*.tmp"),
+            root.glob("*/.runtime_status.json.*.tmp"),
+        )
         for path in candidates:
             if time.monotonic() >= deadline:
                 break
             try:
                 target = path
                 if root_boundary is not None:
-                    target = path.resolve(strict=True)
+                    resolved = path.resolve(strict=True)
                     try:
-                        target.relative_to(root_boundary)
+                        resolved.relative_to(root_boundary)
                     except ValueError:
                         continue
-                if target.stat().st_mtime > cutoff:
+                    info = path.stat(follow_symlinks=False)
+                    if (path.is_symlink() or not stat.S_ISREG(info.st_mode)
+                            or getattr(info, "st_file_attributes", 0)
+                            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)):
+                        continue
+                    # Check the generation again before unlinking the entry;
+                    # never delete a resolved target of a temporary-looking link.
+                    latest = path.stat(follow_symlinks=False)
+                    if ((latest.st_dev, latest.st_ino) != (info.st_dev, info.st_ino)
+                            or not stat.S_ISREG(latest.st_mode)
+                            or getattr(latest, "st_file_attributes", 0)
+                            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)):
+                        continue
+                else:
+                    info = target.stat()
+                if info.st_mtime > cutoff:
                     continue
                 target.unlink()
                 removed += 1
@@ -576,7 +595,9 @@ def write_runtime_status(log_dir: str | os.PathLike[str],
         if process_run_id is not None and not isinstance(process_run_id, str):
             raise ValueError("runtime run id must be text")
         path = runtime_status_path(log_dir)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        from bot_utils.atomic_publish import prepare_publication_directory
+
+        prepare_publication_directory(path.parent)
         # Long-running bots pass the snapshot captured during startup so an
         # on-disk sync cannot make already-loaded code advertise a newer build.
         build = dict(build_info) if build_info is not None else get_build_info()

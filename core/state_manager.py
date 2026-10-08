@@ -533,16 +533,13 @@ class StateManager:
         "no such table: bot_open_positions" race against the bot's own init_db()
         on the first start.
         """
-        if db_path is None:
-            try:
-                from core.paths import DB_PATH_STR
-                db_path = DB_PATH_STR
-            except ImportError:
-                # Compute an absolute path from this file's own location so a
-                # chdir() during early boot can't relocate the DB.
-                _here = os.path.dirname(os.path.abspath(__file__))
-                _root = os.path.dirname(_here)
-                db_path = os.path.join(_root, "data", "trading_bot.db")
+        from core.database import DB_PATH
+        canonical_db = os.path.normcase(os.path.realpath(os.fspath(DB_PATH)))
+        if db_path is not None and (
+            os.path.normcase(os.path.realpath(os.fspath(db_path))) != canonical_db
+        ):
+            raise ValueError("StateManager requires the canonical core.database DB path")
+        db_path = os.fspath(DB_PATH)
         self.bot_name   = bot_name
         self.log_dir    = log_dir
         self.json_path  = _canonical_json_path(json_path)

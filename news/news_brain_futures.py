@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import math
 
-from trading.market_filters import get_fear_greed
+from trading.market_filters import get_fear_greed, fg_label
 from news.llm_utils import (
     llm_available,
     get_model_name,
@@ -23,7 +23,6 @@ from news.news_brain_core import (
     parse_confidence as _parse_conf,
     parse_last_result,
     parse_llm_json_object,
-    strip_thinking,
     is_valid_symbol,
 )
 from news.news_keywords import BEARISH_KEYWORDS, find_keyword_matches
@@ -189,9 +188,7 @@ def analyze_sentiment(
     regime_value = market_regime.get("regime", "NEUTRAL")
     if type(regime_value) is not str:
         regime_value = "NEUTRAL"
-    fg_label_value = market_regime.get("fg_label", "Neutral")
-    if type(fg_label_value) is not str:
-        fg_label_value = "Neutral"
+    fg_label_value = fg_label(fg)
 
     template = load_prompt_template(
         _PROMPT_FILE, _DEFAULT_FILE, fallback=_FALLBACK_PROMPT
@@ -271,7 +268,12 @@ def analyze_sentiment(
             if _jtext.startswith("json"):
                 _jtext = _jtext[4:].lstrip()
         try:
-            parsed = parse_llm_json_object(_jtext)
+            try:
+                parsed = parse_llm_json_object(_jtext)
+            except (_json.JSONDecodeError, ValueError):
+                direction, confidence = parse_direction_and_confidence(full_text)
+                parsed = {"direction": direction, "confidence": confidence, "rationale": full_text}
+                full_text = _json.dumps(parsed)
             direction = str(parsed.get("direction", "WAIT")).upper()
             if direction not in ("LONG", "SHORT", "WAIT"):
                 direction = "WAIT"
@@ -294,14 +296,14 @@ def analyze_sentiment(
                         context_brief=f"conf={confidence}, 24h={change}%",
                     )
                 except Exception as _bb_exc:
-                    # Challenge must never crash the main flow  fail-open.
-                    # Log type + message so the cause is diagnosable.
+                    from news.llm_utils import challenge_failure_verdict
+
+                    verdict = challenge_failure_verdict()
                     log_event(
                         f"[{symbol}] Bull/Bear skipped "
                         f"({type(_bb_exc).__name__}: {_bb_exc})",
                         "WARN",
                     )
-                    verdict = "PROCEED"
                 if verdict == "OVERRIDE_WAIT":
                     parsed["direction"] = "WAIT"
                     current_rationale = parsed.get("rationale")
@@ -335,10 +337,8 @@ def analyze_sentiment(
                 "INFO",
             )
             return full_text
-        except (_json.JSONDecodeError, ValueError):
-            # Old free-text prompt format  fall through to old parser
-            thinking, answer = strip_thinking(full_text)
-            return answer if answer else full_text
+        except Exception:
+            return _json.dumps({"direction": "WAIT", "confidence": "LOW", "rationale": "Decision validation or risk challenge failed"})
 
     except Exception as exc:
         # Log the exact reason so the user can diagnose keyword-fallback

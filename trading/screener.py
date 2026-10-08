@@ -569,15 +569,16 @@ def _is_noncrypto(symbol: str) -> bool:
     return symbol.split("/")[0].upper() in NONCRYPTO_BASES
 
 
-def _compute_indicators(bars) -> dict:
+def _compute_indicators(bars, *, last_index: int = -2) -> dict:
     """Pure indicator math  kein I/O, kein Logging. Wirft bei input errors.
 
     Look-Ahead / Repainting vermeiden:
     ``fetch_ohlcv`` liefert als letztes Element die AKTUELL LAUFENDE, noch
     nicht geschlossene Kerze. Auf ``iloc[-1]`` gerechnete Indikatoren wrden
     bis zum Kerzen-Close repainten". Alle Indikatoren werden daher konsistent
-    auf der letzten GESCHLOSSENEN Kerze (``LAST = -2``) gerechnet  passend zu
-    Volumen/Body.
+    auf der letzten GESCHLOSSENEN Kerze gerechnet, passend zu Volumen/Body.
+    Der Fetchpfad bestimmt ihren Index anhand des validierten Zeitrasters;
+    der pure Altvertrag verwendet -2, wenn kein expliziter Index vorliegt.
     """
     df = pd.DataFrame(
         bars, columns=["timestamp", "open", "high", "low", "close", "volume"]
@@ -586,7 +587,7 @@ def _compute_indicators(bars) -> dict:
     # Brauchen mindestens 2 Zeilen, damit eine geschlossene Kerze existiert.
     if len(df) < 2:
         return {}
-    LAST = -2  # letzte GESCHLOSSENE Kerze (fetch_ohlcv[-1] ist noch offen)
+    LAST = last_index
 
     rsi_raw = _ta_rsi(df["close"], length=14)
     if (
@@ -641,8 +642,9 @@ def _compute_indicators(bars) -> dict:
 
     try:
         if len(df) >= 22:
-            vol_curr = float(df["volume"].iloc[-2])
-            vol_avg20 = float(df["volume"].iloc[-22:-2].mean())
+            signal_index = LAST if LAST >= 0 else len(df) + LAST
+            vol_curr = float(df["volume"].iloc[signal_index])
+            vol_avg20 = float(df["volume"].iloc[max(0, signal_index - 20):signal_index].mean())
             if vol_avg20 > 0 and not pd.isna(vol_avg20) and not pd.isna(vol_curr):
                 vol_surge = vol_curr / vol_avg20
             else:
@@ -653,10 +655,10 @@ def _compute_indicators(bars) -> dict:
         vol_surge = 1.0
 
     try:
-        o = float(df["open"].iloc[-2])
-        h = float(df["high"].iloc[-2])
-        low = float(df["low"].iloc[-2])
-        c = float(df["close"].iloc[-2])
+        o = float(df["open"].iloc[LAST])
+        h = float(df["high"].iloc[LAST])
+        low = float(df["low"].iloc[LAST])
+        c = float(df["close"].iloc[LAST])
         if (
             not all(math.isfinite(value) for value in (o, h, low, c))
             or h <= low
@@ -818,6 +820,8 @@ def _safe_get_indicators(
         bars = exchange.fetch_ohlcv(
             symbol, timeframe=timeframe, limit=SCREENER_OHLCV_LIMIT
         )
+        from trading.ohlcv_validation import validate_recent_ohlcv
+        last_closed = validate_recent_ohlcv(bars, timeframe)
         if not isinstance(bars, list):
             raise TypeError("screener OHLCV returned no candle list")
         if any(
@@ -859,7 +863,7 @@ def _safe_get_indicators(
         return {}
 
     try:
-        return _compute_indicators(bars)
+        return _compute_indicators(bars, last_index=last_closed)
     except Exception as e:
         _symbol_failure_cache.set(
             cache_key, time.monotonic() + _SOFT_FAILURE_TTL

@@ -391,11 +391,100 @@ def _offline_trade_future_ceiling_ms() -> int | None:
     return milliseconds + 60_000 if milliseconds > 0 else None
 
 
+def _spot_consumed_sell_evidence(bot, pair: str, buy_time: str, state_row: dict | None):
+    """Campaign-scoped quantities already consumed by DB or durable receipts.
+
+    Synthetic external-partial IDs cannot identify a venue order; their booking
+    time is a conservative cutoff. Ambiguous legacy evidence stays unpriced.
+    """
+    from core.database import get_connection, metrics_bot_name_for_mode
+
+    mode = getattr(bot, "simulation", None)
+    if not isinstance(mode, bool):
+        raise ValueError("unknown reconciliation accounting mode")
+    row = state_row or {}
+    entry_id = row.get("entry_id")
+    if entry_id is not None and order_id_text_or_none(entry_id) != entry_id:
+        raise ValueError("invalid reconciliation entry identity")
+    db_bot = metrics_bot_name_for_mode(bot.BOT_NAME, mode)
+    rows = get_connection().execute(
+        """SELECT exchange_order_id, invested_usdt, buy_price, sell_time
+           FROM trades WHERE bot_name=? AND symbol=? AND buy_time=?
+             AND COALESCE(is_futures,0)=0 AND COALESCE(is_partial,0)=1
+             AND COALESCE(entry_id,'')=? ORDER BY id LIMIT 1001""",
+        (db_bot, pair.split("/", 1)[0], buy_time, entry_id or ""),
+    ).fetchall()
+    if len(rows) > 1000:
+        raise ValueError("partial accounting evidence exceeds bounded window")
+    consumed = {}
+    cutoff = 0
+    consumed_events = {}
+
+    def add(oid, quantity, sell_time):
+        nonlocal cutoff
+        oid = order_id_text_or_none(oid)
+        quantity = _positive_float_or_none(quantity)
+        if quantity is None:
+            raise ValueError("partial accounting quantity is unknown")
+        if _entry_trade_boundary_ms(sell_time) is None:
+            raise ValueError("partial accounting event time is unknown")
+        if oid and not oid.startswith("external-partial:"):
+            identity = (oid, sell_time)
+            previous_event = consumed_events.get(identity)
+            if previous_event is not None:
+                if not math.isclose(previous_event, quantity, rel_tol=1e-9, abs_tol=1e-12):
+                    raise ValueError("partial accounting event quantity conflicts")
+                return
+            consumed_events[identity] = quantity
+            previous = consumed.get(oid, 0.0)
+            consumed[oid] = previous + quantity
+            if not math.isfinite(consumed[oid]):
+                raise ValueError("partial accounting quantity overflow")
+        else:
+            timestamp = _entry_trade_boundary_ms(sell_time)
+            if timestamp is None:
+                raise ValueError("partial accounting execution identity is unknown")
+            cutoff = max(cutoff, timestamp)
+
+    for item in rows:
+        basis = _positive_float_or_none(item["buy_price"])
+        invested = _positive_float_or_none(item["invested_usdt"])
+        if basis is None or invested is None:
+            raise ValueError("partial accounting basis is unknown")
+        add(item["exchange_order_id"], invested / basis, item["sell_time"])
+    pending = row.get("accounting_pending_partials") or []
+    if isinstance(pending, dict):
+        pending = [pending]
+    if not isinstance(pending, list):
+        raise ValueError("partial accounting receipt container is invalid")
+    for item in pending:
+        if (not isinstance(item, dict) or item.get("entry_id") != entry_id
+                or item.get("buy_time") != buy_time
+                or item.get("symbol") != pair.split("/", 1)[0]
+                or item.get("bot_name") != bot.BOT_NAME
+                or item.get("mode_is_sim") is not mode):
+            raise ValueError("partial accounting receipt belongs to another campaign")
+        basis = _positive_float_or_none(item.get("buy_price"))
+        invested = _positive_float_or_none(item.get("invested_usdt"))
+        if basis is None or invested is None:
+            raise ValueError("partial accounting receipt has no quantity basis")
+        add(item.get("exchange_order_id"), invested / basis, item.get("sell_time"))
+    receipts = row.get("entry_basis_pending_closes") or []
+    if not isinstance(receipts, list):
+        raise ValueError("entry-basis close receipts are invalid")
+    for receipt in receipts:
+        if not isinstance(receipt, dict) or receipt.get("entry_id") != entry_id:
+            raise ValueError("entry-basis close receipt campaign is invalid")
+        add(receipt.get("exchange_order_id"), receipt.get("filled"), receipt.get("sell_time"))
+    return consumed, cutoff
+
+
 def _aggregate_spot_sell_trades(
     bot,
     pair: str,
     target_amount: float,
     buy_time: str,
+    state_row: dict | None = None,
 ) -> tuple[float, float, str]:
     try:
         target = max(0.0, float(target_amount or 0.0))
@@ -482,13 +571,43 @@ def _aggregate_spot_sell_trades(
         if timestamp_ms is None or timestamp_ms < boundary_ms:
             continue
         eligible_trades.append((timestamp_ms, trade))
-    eligible_trades.sort(key=lambda item: item[0], reverse=True)
+    try:
+        consumed, consumed_cutoff = _spot_consumed_sell_evidence(
+            bot, pair, buy_time, state_row,
+        )
+        # Consume oldest fills of an already booked order before selecting any
+        # new residual. Missing prior fills cannot make a later cumulative
+        # observation look like a completely new execution.
+        from bot_utils.spot_exits import _spot_order_ids
+
+        unconsumed = []
+        needs_order_identity = bool(consumed)
+        for timestamp, trade in sorted(eligible_trades, key=lambda item: item[0]):
+            if _trade_side(trade) != "sell":
+                continue
+            if timestamp <= consumed_cutoff:
+                continue
+            ids = _spot_order_ids(trade, trade=True)
+            if len(ids) > 1 or (needs_order_identity and len(ids) != 1):
+                raise ValueError("external sell has no unique execution order")
+            oid = next(iter(ids), "")
+            amount = _trade_amount(trade)
+            already = min(amount, consumed.get(oid, 0.0))
+            consumed[oid] = max(0.0, consumed.get(oid, 0.0) - already)
+            if amount > already:
+                unconsumed.append((timestamp, trade, amount - already))
+        if any(value > 1e-12 for oid, value in consumed.items()
+               if any(oid in _spot_order_ids(t, trade=True) for _ts, t in eligible_trades)):
+            raise ValueError("booked order's prior execution window is incomplete")
+    except Exception:
+        return 0.0, 0.0, "unavailable"
+    unconsumed.sort(key=lambda item: item[0], reverse=True)
 
     qty = 0.0
     notional = 0.0
     fee_usdt = 0.0
     fees_known = True
-    for _timestamp_ms, t in eligible_trades:
+    for _timestamp_ms, t, available_amount in unconsumed:
         if _trade_side(t) != "sell":
             continue
         amt = _trade_amount(t)
@@ -496,7 +615,7 @@ def _aggregate_spot_sell_trades(
         if amt <= 0 or price <= 0:
             _record_fetch_error()
             return 0.0, 0.0, "unavailable"
-        take = min(amt, max(0.0, target - qty))
+        take = min(available_amount, max(0.0, target - qty))
         if take <= 0:
             break
         try:
@@ -611,6 +730,7 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict, *, _basis_replay=
                     amount,
                     allow_ticker=False,
                     buy_time=buy_time,
+                    state_row=state_row,
                 )
             )
 
@@ -807,10 +927,10 @@ def _record_spot_offline_close(bot, sym: str, state_row: dict, *, _basis_replay=
 
 def _find_spot_external_close_price(bot, sym: str, amount: float = 0.0,
                                     allow_ticker: bool = True,
-                                    buy_time: str = "") -> tuple[float, float, str]:
+                                    buy_time: str = "", state_row: dict | None = None) -> tuple[float, float, str]:
     pair = f"{sym}/USDT"
     price, fee, source = _aggregate_spot_sell_trades(
-        bot, pair, amount, buy_time
+        bot, pair, amount, buy_time, state_row=state_row,
     )
     if price > 0:
         return price, fee, source
@@ -1018,12 +1138,14 @@ def _state_from_spot_db_position(pos: dict, exch_amt: float) -> dict | None:
         "spot_entry_client_order_id", "spot_entry_order_id", "spot_entry_observed_amount",
         "spot_entry_requested_amount", "spot_entry_quote_budget", "spot_entry_quote_first",
         "spot_entry_initial_invested_usdt",
+        "entry_fee_finalization_pending",
         "verified_flat_pending_accounting", "verified_flat_reason", "verified_flat_time", "verified_flat_at",
         "accounting_pending", "accounting_already_booked", "accounting_pending_mode_is_sim",
         "accounting_pending_sell_price", "accounting_pending_sell_time",
         "accounting_pending_exchange_order_id", "accounting_pending_profit_pct",
         "accounting_pending_profit_usdt", "accounting_pending_invested_usdt",
         "accounting_pending_fees_usdt", "accounting_pending_reason",
+        "accounting_pending_cooldown_until",
         "full_exit_client_order_id", "full_exit_requested_amount", "full_exit_outcome_uncertain",
         "partial_exit_client_order_id", "partial_exit_requested_amount", "partial_exit_outcome_uncertain",
         "emergency_exit_client_order_id", "emergency_exit_requested_amount", "emergency_exit_outcome_uncertain",
@@ -1041,6 +1163,28 @@ def _state_from_spot_db_position(pos: dict, exch_amt: float) -> dict | None:
                 restored[key] = normalize_pending_accounting_items(extra[key])
             else:
                 restored[key] = extra[key]
+    if adopted_amount < db_amount and not basis_pending:
+        from core.clock import now_utc
+        from bot_utils.state_persist import is_canonical_position_symbol
+        sym = pos.get("symbol")
+        if not is_canonical_position_symbol(sym):
+            return None
+        restored["unpriced_external_partials"] = _append_unpriced_partial(
+            restored,
+            {
+                "symbol": sym,
+                "sold_amount": db_amount - adopted_amount,
+                "remaining_amount": adopted_amount,
+                "buy_price": buy_price,
+                "buy_time": restored["buy_time"],
+                "invested_usdt": invested_total - invested_usdt,
+                "detected_at": now_utc().strftime("%Y-%m-%d %H:%M:%S"),
+                "reason": "External balance shrink during state recovery (price unavailable)",
+                "is_futures": False,
+                "is_partial": True,
+            },
+        )
+        restored["partial_sold"] = True
     return restored
 
 
@@ -1103,6 +1247,7 @@ def _record_spot_external_partial(bot, sym: str, state_row: dict,
         sold_amount,
         allow_ticker=False,
         buy_time=state_row.get("buy_time", ""),
+        state_row=state_row,
     )
     if close_price <= 0:
         from core.clock import now_utc

@@ -592,7 +592,15 @@ def _check_config(bot_name: str | None,
                   bot_meta: dict) -> list[CheckIssue]:
     issues: list[CheckIssue] = []
     targets = [bot_name] if bot_name else list(bot_meta)
-    visible = set((cfg.get("UI") or {}).get("VISIBLE_BOTS") or [])
+    ui = cfg.get("UI", {})
+    if not isinstance(ui, dict):
+        return [_issue("error", "config_ui_invalid", "UI config section must be an object")]
+    raw_visible = ui.get("VISIBLE_BOTS", [])
+    if (not isinstance(raw_visible, list)
+            or any(not isinstance(name, str) or name not in bot_meta for name in raw_visible)):
+        return [_issue("error", "config_visible_bots_invalid",
+                       "UI.VISIBLE_BOTS must be a list of known bot names")]
+    visible = set(raw_visible)
 
     for name in targets:
         section = cfg.get(name)
@@ -1343,7 +1351,7 @@ def run_pre_start_checks(bot_name: str | None = None,
     if bot_name and bot_name not in BOT_META:
         issues.append(_issue("error", "unknown_bot", f"unknown bot: {bot_name}"))
         return issues
-    if cfg:
+    if not cfg_issues:
         issues.extend(_check_config(bot_name, cfg, BOT_META))
         issues.extend(_check_state_and_claims(bot_name, cfg, BOT_META))
     for name in ([bot_name] if bot_name else list(BOT_META)):

@@ -39,7 +39,9 @@ from launcher.tool_processes import (
     stop_tool_processes,
     tool_root_xoption,
 )
-from launcher.ui.components.widgets import safe_geometry
+from launcher.ui.components.widgets import (
+    safe_geometry, keyboard_button, AdaptiveActionRow,
+)
 from launcher.ui.logging_panel import classify_severity
 from launcher.ui.theme import force_dark_titlebar
 
@@ -668,8 +670,8 @@ def open_backtest_dialog(app) -> None:
         tool_name="backtest",
         description=(
             "Run a historical backtest using your current parameters.\n"
-            "Useful after editing the AI prompt to see how the new\n"
-            "decision logic would have performed on past data."
+            "Models historical price signals and trading costs.\n"
+            "AI prompts and contemporaneous news are not replayed."
         ),
     )
 
@@ -911,7 +913,7 @@ def open_heatmap_dialog(app) -> None:
     # Close button
     btns = ctk.CTkFrame(dlg, fg_color="transparent")
     btns.pack(side="bottom", fill="x", padx=20, pady=12)
-    ctk.CTkButton(btns, text="Close",
+    keyboard_button(btns, text="Close",
                    height=34, corner_radius=8, width=110,
                    font=ctk.CTkFont(FONT_BODY, 12, "bold"),
                    fg_color="transparent", hover_color=COLORS["panel_hover"],
@@ -937,11 +939,9 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
     dlg.transient(app)
     force_dark_titlebar(dlg)
     # minsize clamped so a short screen can't force it taller than usable area.
-    safe_geometry(dlg, 620, 580, parent=app)
+    width, height = safe_geometry(dlg, 620, 580, parent=app)
     try:
-        sh = dlg.winfo_screenheight()
-        dlg.minsize(min(600, dlg.winfo_screenwidth() - 80),
-                    min(560, sh - 80))
+        dlg.minsize(min(600, width), min(560, height))
     except Exception:
         pass
 
@@ -954,19 +954,24 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
         "stopping_proc": None,
     }
 
+    # Reserve wrapping actions before any content consumes the window height.
+    btns = AdaptiveActionRow(dlg, fg_color="transparent")
+    btns.pack(side="bottom", fill="x", padx=20, pady=16)
+
+    #  PHASE 1: scrollable configuration and introduction
+    config_frame = ctk.CTkScrollableFrame(dlg, fg_color="transparent",
+                                        scrollbar_button_color=COLORS["border"])
+    config_frame.pack(fill="both", expand=True, padx=24)
+
     #  Header 
-    ctk.CTkLabel(dlg, text=title,
+    ctk.CTkLabel(config_frame, text=title,
                   font=ctk.CTkFont(FONT_BODY, 16, "bold"),
                   text_color=COLORS["text"]
                   ).pack(pady=(20, 4), padx=24, anchor="w")
-    ctk.CTkLabel(dlg, text=description,
+    ctk.CTkLabel(config_frame, text=description,
                   font=ctk.CTkFont(FONT_BODY, 11, "bold"),
                   text_color=COLORS["text_muted"], justify="left", wraplength=460
                   ).pack(pady=(0, 16), padx=24, anchor="w")
-
-    #  PHASE 1: config frame 
-    config_frame = ctk.CTkFrame(dlg, fg_color="transparent")
-    config_frame.pack(fill="both", expand=True, padx=24)
 
     # Always defined (used by _start_run); the pickers are only shown for
     # tools that actually need a strategy/timeframe. The self-test runs the
@@ -1150,15 +1155,12 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
     status_lbl.pack(pady=(0, 4), padx=24, anchor="w")
 
     #  Bottom buttons (state-dependent) 
-    btns = ctk.CTkFrame(dlg, fg_color="transparent")
-    btns.pack(side="bottom", fill="x", padx=20, pady=16)
-
-    run_btn = ctk.CTkButton(btns, text=f" {title}",
+    run_btn = keyboard_button(btns, text=f" {title}",
                                height=36, corner_radius=8, width=180,
                                font=ctk.CTkFont(FONT_BODY, 12, "bold"),
                                fg_color=accent, hover_color=COLORS["panel_hover"],
                                text_color="#ffffff")
-    cancel_btn = ctk.CTkButton(btns, text="Cancel",
+    cancel_btn = keyboard_button(btns, text="Cancel",
                                    height=36, corner_radius=8, width=100,
                                    font=ctk.CTkFont(FONT_BODY, 12, "bold"),
                                    fg_color="transparent", hover_color=COLORS["panel_hover"],
@@ -1279,7 +1281,7 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
             return False
 
         try:
-            apply_btn = ctk.CTkButton(
+            apply_btn = keyboard_button(
                 btns,
                 text=f" Apply best config to {cfg.get('strategy', '?')}",
                 height=36, corner_radius=8, width=260,
@@ -1404,7 +1406,7 @@ def run_tool_dialog(app, title: str, tool_name: str, description: str) -> None:
         status_lbl.configure(text_color=COLORS["success"])
 
     if tool_name == "optimizer":
-        import_promotion_btn = ctk.CTkButton(
+        import_promotion_btn = keyboard_button(
             btns,
             text="Load promotion artifact",
             height=36,

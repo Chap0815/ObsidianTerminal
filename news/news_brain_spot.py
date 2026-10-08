@@ -15,6 +15,7 @@ from news.llm_utils import (
     keyword_fallback,
     get_model_name,
     bull_bear_challenge,
+    challenge_failure_verdict,
     generate_with_timeout,
 )
 from news.news_brain_core import (
@@ -23,7 +24,6 @@ from news.news_brain_core import (
     parse_last_result,
     parse_confidence as _parse_conf,
     parse_llm_json_object,
-    strip_thinking,
     is_valid_symbol,
 )
 
@@ -116,6 +116,11 @@ def analyze_sentiment(
     if type(reflection) is not str:
         reflection = ""
 
+    from trading.market_filters import get_fear_greed, fg_label as describe_fg
+
+    fg = get_fear_greed()
+    fg_known = type(fg) in (int, float) and math.isfinite(fg) and 0 <= fg <= 100
+    fg_label = describe_fg(fg) if fg_known else "unknown"
     fill_data = {
         "symbol": symbol,
         "change": change_value,
@@ -126,6 +131,8 @@ def analyze_sentiment(
         "regime": regime_value,
         "btc_24h": btc_24h,
         "btc_7d": btc_7d,
+        "fg": fg if fg_known else "unknown",
+        "fg_label": fg_label,
         # Fields required by user's detailed spot.txt prompt
         "as_of": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "vol_24h_usdt": 0.0,
@@ -153,7 +160,12 @@ def analyze_sentiment(
             if _text.startswith("json"):
                 _text = _text[4:].lstrip()
         try:
-            parsed = parse_llm_json_object(_text)
+            try:
+                parsed = parse_llm_json_object(_text)
+            except (_json.JSONDecodeError, ValueError):
+                direction, confidence = parse_direction_and_confidence(full_text)
+                parsed = {"direction": direction, "confidence": confidence, "rationale": full_text}
+                full_text = _json.dumps(parsed)
             steelman = parsed.get("steelman", "")
             if steelman:
                 log_event(f"[{symbol}] Steelman: {steelman}", "INFO")
@@ -170,11 +182,11 @@ def analyze_sentiment(
                         confidence=_conf,  # PERF: skip if LOW
                     )
                 except Exception as _bb_exc:
+                    verdict = challenge_failure_verdict()
                     log_event(
                         f"[{symbol}] Bull/Bear skipped ({type(_bb_exc).__name__})",
                         "WARN",
                     )
-                    verdict = "PROCEED"
                 if verdict == "OVERRIDE_WAIT":
                     parsed["direction"] = "WAIT"
                     _r = parsed.get("rationale", "")
@@ -195,9 +207,8 @@ def analyze_sentiment(
                 "INFO",
             )
             return full_text
-        except (_json.JSONDecodeError, ValueError):
-            thinking, answer = strip_thinking(full_text)
-            return answer if answer else full_text
+        except Exception:
+            return _json.dumps({"direction": "WAIT", "confidence": "LOW", "rationale": "Decision validation or risk challenge failed"})
 
     except Exception as exc:
         try:

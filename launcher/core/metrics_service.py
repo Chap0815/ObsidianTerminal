@@ -29,6 +29,7 @@ from pathlib import Path
 import requests as _req
 
 from bot_utils.config import _read_config_json
+from core.constants import MARKET_REGIME_EVIDENCE_MAX_AGE_SECONDS
 from bot_utils.order_utils import explicit_trade_symbol_matches
 from bot_utils.pnl_view import (
     futures_unrealized_from_row,
@@ -138,13 +139,14 @@ def query_db(sql: str, params: tuple = ()) -> list:
     conn = None
     primary_error: BaseException | None = None
     try:
-        uri_path = Path(DB_PATH).resolve().as_posix()
+        uri_path = Path(DB_PATH).resolve().as_uri()
         conn = sqlite3.connect(
-            f"file:{uri_path}?mode=ro",
+            f"{uri_path}?mode=ro",
             uri=True,
             timeout=20.0,
         )
         conn.execute("PRAGMA busy_timeout=20000")
+        conn.execute("PRAGMA query_only=ON")
         return conn.execute(sql, params).fetchall()
     except Exception as exc:
         converted = MetricsDbReadError(str(exc))
@@ -164,14 +166,15 @@ def query_db_dict(sql: str, params: tuple = ()) -> list[dict]:
     conn = None
     primary_error: BaseException | None = None
     try:
-        uri_path = Path(DB_PATH).resolve().as_posix()
+        uri_path = Path(DB_PATH).resolve().as_uri()
         conn = sqlite3.connect(
-            f"file:{uri_path}?mode=ro",
+            f"{uri_path}?mode=ro",
             uri=True,
             timeout=20.0,
         )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=20000")
+        conn.execute("PRAGMA query_only=ON")
         return [dict(row) for row in conn.execute(sql, params).fetchall()]
     except Exception as exc:
         converted = MetricsDbReadError(str(exc))
@@ -225,14 +228,15 @@ def _open_metrics_snapshot() -> sqlite3.Connection | None:
         return None
     conn = None
     try:
-        uri_path = Path(DB_PATH).resolve().as_posix()
+        uri_path = Path(DB_PATH).resolve().as_uri()
         conn = sqlite3.connect(
-            f"file:{uri_path}?mode=ro",
+            f"{uri_path}?mode=ro",
             uri=True,
             timeout=20.0,
         )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=20000")
+        conn.execute("PRAGMA query_only=ON")
         conn.execute("BEGIN")
         return conn
     except Exception as exc:
@@ -625,19 +629,19 @@ def _get_market_info_with_query(query):
     directly from alternative.me). The regime itself comes only from real
     scan rows (not CACHED_FG rows), so phase and btc_24h stay accurate.
     """
-    latest_plausible = (
-        _metrics_now_utc_naive() + timedelta(minutes=5)
-    ).strftime("%Y-%m-%d %H:%M:%S")
+    now = _metrics_now_utc_naive()
+    latest_plausible = (now + timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+    oldest_regime = (now - timedelta(seconds=MARKET_REGIME_EVIDENCE_MAX_AGE_SECONDS)
+                     ).strftime("%Y-%m-%d %H:%M:%S")
+    oldest_fg = (now - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
     # Regime + BTC from last real scan (not a CACHED_FG row)
     rows = query(
         "SELECT regime, btc_24h, fear_greed, timestamp "
         "FROM market_regime "
         "WHERE regime != 'CACHED_FG' AND btc_24h IS NOT NULL "
-        "AND timestamp <= ? ORDER BY timestamp DESC LIMIT 25",
-        (latest_plausible,),
+        "AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp DESC LIMIT 25",
+        (oldest_regime, latest_plausible),
     )
-    if not rows:
-        return None
 
     market_row = None
     for candidate in rows:
@@ -655,6 +659,8 @@ def _get_market_info_with_query(query):
             parsed_ts = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
             if parsed_ts.strftime("%Y-%m-%d %H:%M:%S") != ts:
                 continue
+            if not -300 <= (now - parsed_ts).total_seconds() <= MARKET_REGIME_EVIDENCE_MAX_AGE_SECONDS:
+                continue
             fg_fallback = (
                 raw_fg
                 if type(raw_fg) is int and 0 <= raw_fg <= 100
@@ -664,32 +670,34 @@ def _get_market_info_with_query(query):
             break
         except (TypeError, ValueError):
             continue
-    if market_row is None:
-        return None
-    regime, btc_24h, fg_fallback, ts = market_row
+    regime, btc_24h, fg_fallback, ts = market_row or (None, None, None, None)
 
     # Most current F&G from ANY market_regime row (incl. CACHED_FG)
     try:
         fg_rows = query(
-            "SELECT fear_greed FROM market_regime "
-            "WHERE fear_greed IS NOT NULL AND timestamp <= ? "
+            "SELECT fear_greed, timestamp FROM market_regime "
+            "WHERE fear_greed IS NOT NULL AND timestamp >= ? AND timestamp <= ? "
             "ORDER BY timestamp DESC LIMIT 25",
-            (latest_plausible,),
+            (oldest_fg, latest_plausible),
         )
-        fg = next(
-            (
-                row[0]
-                for row in fg_rows
-                if row and type(row[0]) is int and 0 <= row[0] <= 100
-            ),
-            fg_fallback,
-        )
+        fg = fg_fallback
+        for row in fg_rows:
+            if not row or len(row) != 2 or type(row[0]) is not int or not 0 <= row[0] <= 100:
+                continue
+            try:
+                parsed = datetime.strptime(row[1], "%Y-%m-%d %H:%M:%S")
+                if (parsed.strftime("%Y-%m-%d %H:%M:%S") == row[1]
+                        and -300 <= (now - parsed).total_seconds() <= 86400):
+                    fg = row[0]
+                    break
+            except (TypeError, ValueError):
+                continue
     except MetricsDbReadError:
         raise
     except Exception:
         fg = fg_fallback
 
-    if fg is None:
+    if market_row is None and fg is None:
         return None
 
     return {"regime": regime, "btc_24h": btc_24h, "fg": fg, "timestamp": ts}
@@ -717,7 +725,7 @@ def get_futures_state_count(bot_name: str = None,
         rows = query_db_dict("SELECT * FROM futures_state")
     # Counting persisted rows does not require an execution price. A separate
     # provisional claim must not hide the counts of the other bot cards.
-    return sum(1 for row in rows if is_futures_state_fresh(row))
+    return len(rows)
 
 
 def get_futures_state_counts(
@@ -742,8 +750,6 @@ def get_futures_state_counts(
     )
     result = {bot: 0 for bot in bot_modes}
     for row in rows:
-        if not is_futures_state_fresh(row):
-            continue
         bot_key = row.get("bot_name")
         if not isinstance(bot_key, str):
             continue
@@ -942,7 +948,8 @@ def _exchange_display_name() -> str:
 def _get_exchange_status_with_query(query) -> dict:
     """Determine exchange connection status.
 
-    Primary source: ``api_rate_global``  written on EVERY bot API call.
+    The API ledger records reservations, not acknowledged responses. Report
+    request activity without presenting it as verified connectivity.
 
     IMPORTANT: ``database.py`` writes timestamps in UTC (``_utcnow()``).
     The comparison must also use UTC, not local time  otherwise users in
@@ -967,15 +974,22 @@ def _get_exchange_status_with_query(query) -> dict:
 
     #  Primary: api_rate_global (written every scan cycle) 
     rows = query(
-        "SELECT called_at FROM api_rate_global WHERE called_at <= ? "
-        "ORDER BY called_at DESC LIMIT 1",
+        "SELECT called_at, ok FROM api_rate_global WHERE called_at <= ? "
+        "ORDER BY called_at DESC, id DESC LIMIT 1",
         (latest_plausible,),
     )
     if rows:
         try:
             delta = _delta_sec(rows[0][0])
             if delta < 300:
-                return {"active": True,  "label": f"{exch}  Active"}
+                failed = len(rows[0]) > 1 and rows[0][1] == 0
+                return {
+                    "active": False,
+                    "unverified": True,
+                    "label": f"{exch}  " + (
+                        "Request failed" if failed else "Requests (unverified)"
+                    ),
+                }
             if delta < 1800:
                 return {"active": False, "label": f"{exch}  Idle ({int(delta/60)}m)"}
             return {"active": False, "label": f"{exch}  Inactive"}
@@ -993,7 +1007,11 @@ def _get_exchange_status_with_query(query) -> dict:
     try:
         delta = _delta_sec(rows[0][0])
         if delta < 600:
-            return {"active": True,  "label": f"{exch}  Active"}
+            return {
+                "active": False,
+                "unverified": True,
+                "label": f"{exch}  Recent market data",
+            }
         if delta < 1800:
             return {"active": False, "label": f"{exch}  Idle ({int(delta/60)}m)"}
         return {"active": False, "label": f"{exch}  Inactive"}
@@ -1091,7 +1109,7 @@ def get_unrealized_pnl_futures(bot_name: str = None,
     total = 0.0
     for row in rows:
         if not is_futures_state_fresh(row):
-            continue
+            raise MetricsMarketDataError("unverified stale futures prices")
         pnl, _pct = futures_unrealized_from_row(row)
         total += pnl
     return float(total)
@@ -1121,7 +1139,7 @@ def get_unrealized_pnl_futures_batch(
     result = {bot: 0.0 for bot in bot_modes}
     for row in rows:
         if not is_futures_state_fresh(row):
-            continue
+            raise MetricsMarketDataError("unverified stale futures prices")
         bot_key = row.get("bot_name")
         if not isinstance(bot_key, str):
             continue
@@ -1134,6 +1152,8 @@ def get_unrealized_pnl_futures_batch(
 def get_unrealized_pnl_spots(
     requests: Mapping[str | None, tuple[str, bool | None]],
     exchange=None,
+    *,
+    per_bot_errors: dict[str | None, str] | None = None,
 ) -> dict[str | None, float]:
     """Price several spot states with one union ticker batch.
 
@@ -1143,59 +1163,58 @@ def get_unrealized_pnl_spots(
          ``fetch_ticker()`` call.
       3. Attribute shared prices independently to each bot's positions.
     """
-    trades_by_bot: dict[str, dict] = {}
+    # With an error sink, healthy bots remain independently priceable. The
+    # compatibility/default call still raises on any unknown position basis.
+    trades_by_bot: dict[str | None, dict] = {}
+
+    def fail(bot_name, message):
+        if per_bot_errors is None:
+            raise MetricsMarketDataError(message)
+        per_bot_errors[bot_name] = message
+
     for bot_name, request in requests.items():
+        if per_bot_errors is not None:
+            per_bot_errors.pop(bot_name, None)
         try:
+            if not isinstance(request, (tuple, list)) or len(request) != 2:
+                raise ValueError("invalid spot metrics request")
             log_dir, mode_is_sim = request
-        except (TypeError, ValueError):
-            trades_by_bot[bot_name] = {}
-            continue
-        state_path = _spot_state_file(log_dir, bot_name, mode_is_sim)
-        if not os.path.exists(state_path):
-            trades_by_bot[bot_name] = {}
-            continue
-        try:
-            trades = _read_metrics_json(state_path)
+            _require_verified_entry_basis(_metrics_bot_keys(bot_name or "SPOT", mode_is_sim))
+            state_path = _spot_state_file(log_dir, bot_name, mode_is_sim)
+            trades = _read_metrics_json(state_path) if os.path.exists(state_path) else {}
             if not isinstance(trades, dict):
                 raise ValueError("spot metrics state must be a JSON object")
+            holdings = {}
+            for symbol, row in trades.items():
+                if not isinstance(symbol, str) or not symbol.strip() or not isinstance(row, dict):
+                    raise ValueError("invalid spot holding identity or row")
+                for flag in ("entry_price_unverified", "verified_flat_pending_accounting"):
+                    if flag in row and row[flag] is not False:
+                        raise ValueError(f"{flag}: position basis or accounting unverified")
+                if str(row.get("state", "OPEN")).strip().upper() in {"CLOSED", "FLAT"}:
+                    continue
+                buy = _finite_float_or_none(_state_value_prefer_key(row, "buy_price", "buy"))
+                amount = _finite_float_or_none(row.get("amount"))
+                if buy is None or buy <= 0 or amount is None or amount <= 0:
+                    raise ValueError("invalid spot holding entry price or amount")
+                holdings[symbol] = (buy, amount)
+        except MetricsDbReadError:
+            raise
         except Exception as exc:
-            raise MetricsMarketDataError(
-                f"{bot_name or 'SPOT'} state read failed: {exc}"
-            ) from exc
-        trades_by_bot[bot_name] = trades
-        if any(isinstance(row, dict) and "entry_price_unverified" in row
-               and (type(row["entry_price_unverified"]) is not bool or row["entry_price_unverified"])
-               for row in trades.values()):
-            raise MetricsMarketDataError(f"{bot_name or 'SPOT'} entry execution basis is unverified")
-        if any(isinstance(row, dict) and row.get("verified_flat_pending_accounting") is True
-               for row in trades.values()):
-            raise MetricsMarketDataError(f"{bot_name or 'SPOT'} verified flat accounting is pending")
+            fail(bot_name, f"{bot_name or 'SPOT'} position metrics unavailable: {exc}")
+            continue
+        trades_by_bot[bot_name] = holdings
 
-    _require_verified_entry_basis(
-        key for bot_name, request in requests.items()
-        if isinstance(request, (tuple, list)) and len(request) == 2
-        for key in _metrics_bot_keys(bot_name or "SPOT", request[1])
-    )
-
-    result = {bot_name: 0.0 for bot_name in requests}
-    symbols = sorted({
-        symbol
-        for trades in trades_by_bot.values()
-        for symbol, trade in trades.items()
-        if (
-            isinstance(symbol, str)
-            and symbol
-            and isinstance(trade, dict)
-            and (_finite_float_or_none(
-                _state_value_prefer_key(trade, "buy_price", "buy")
-            ) or 0.0) > 0.0
-            and (_finite_float_or_none(trade.get("amount")) or 0.0) > 0.0
-        )
-    })
+    result = {bot_name: 0.0 for bot_name in trades_by_bot}
+    symbols = sorted({symbol for holdings in trades_by_bot.values() for symbol in holdings})
     if not symbols:
         return result
     if exchange is None:
-        raise MetricsMarketDataError("spot price unavailable: no exchange")
+        for bot_name, holdings in trades_by_bot.items():
+            if holdings:
+                fail(bot_name, "spot price unavailable: no exchange")
+                result.pop(bot_name, None)
+        return result
 
     #  Step 1: batch ticker fetch 
     price_map: dict = {}  # sym  current price (float)
@@ -1309,30 +1328,15 @@ def get_unrealized_pnl_spots(
         except Exception:
             pass  # price unavailable  position contributes 0
 
-    missing_prices = [symbol for symbol in symbols if symbol not in price_map]
-    if missing_prices:
-        raise MetricsMarketDataError(
-            "spot price unavailable: " + ", ".join(missing_prices)
-        )
-
     #  Step 3: compute PnL independently per bot.
-    for bot_name, trades in trades_by_bot.items():
-        total = 0.0
-        for sym, d in trades.items():
-            try:
-                # trades.json may use the legacy schema ("buy") or the
-                # StateManager schema ("buy_price"). Accept both.
-                buy_raw = _state_value_prefer_key(d, "buy_price", "buy")
-                buy = _finite_float_or_none(buy_raw)
-                amount = _finite_float_or_none(d.get("amount"))
-                if buy is None or amount is None or buy <= 0 or amount <= 0:
-                    continue
-                curr = price_map.get(sym, 0.0)
-                if curr > 0:
-                    total += spot_unrealized_pnl(buy, curr, amount)
-            except Exception:
-                pass
-        result[bot_name] = round(total, 2)
+    for bot_name, holdings in trades_by_bot.items():
+        missing = [symbol for symbol in holdings if symbol not in price_map]
+        if missing:
+            fail(bot_name, "spot price unavailable: " + ", ".join(missing))
+            result.pop(bot_name, None)
+            continue
+        result[bot_name] = round(sum(spot_unrealized_pnl(buy, price_map[symbol], amount)
+                                    for symbol, (buy, amount) in holdings.items()), 2)
     return result
 
 

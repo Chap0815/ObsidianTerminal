@@ -414,21 +414,47 @@ def fetch_realized_funding(ex,
 _FUNDING_SETTLEMENT_SEC = 8 * 3600
 
 
-def count_funding_settlements(open_sec: float, close_sec: float) -> int:
+def count_funding_settlements(open_sec: float, close_sec: float, *,
+                             interval_sec: float = _FUNDING_SETTLEMENT_SEC,
+                             anchor_sec: float = 0.0) -> int:
     """Number of 8h funding settlements (00:00/08:00/16:00 UTC) crossed in the
     half-open interval (open_sec, close_sec]. Shared by the live estimator and
     the backtester so both use identical discrete-settlement semantics  a hold
     that crosses no boundary pays 0, no continuous proration."""
     opened = _finite_float_or_none(open_sec)
     closed = _finite_float_or_none(close_sec)
+    interval = _finite_float_or_none(interval_sec)
+    anchor = _finite_float_or_none(anchor_sec)
+    if interval is None or interval <= 0 or anchor is None:
+        raise ValueError("invalid funding schedule")
     if opened is None or closed is None or closed <= opened:
         return 0
-    next_settle = (
-        int(opened) // _FUNDING_SETTLEMENT_SEC + 1
-    ) * _FUNDING_SETTLEMENT_SEC
+    next_settle = anchor + (math.floor((opened - anchor) / interval) + 1) * interval
     if next_settle > closed:
         return 0
-    return int((closed - next_settle) // _FUNDING_SETTLEMENT_SEC) + 1
+    return int((closed - next_settle) // interval) + 1
+
+
+def _verified_funding_schedule(row: dict) -> tuple[float, float] | None:
+    """Use explicit SDK interval and settlement timestamp; never guess 8h."""
+    raw = row.get("interval")
+    if not isinstance(raw, str) or len(raw) < 2 or raw[-1] not in "mh":
+        return None
+    amount = _finite_float_or_none(raw[:-1])
+    seconds = amount * (3600 if raw[-1] == "h" else 60) if amount is not None else 0
+    if not 300 <= seconds <= 86_400:
+        return None
+    anchors = []
+    for field in ("fundingTimestamp", "nextFundingTimestamp"):
+        if row.get(field) is None:
+            continue
+        value = _finite_float_or_none(row[field])
+        if value is None or value <= 0 or not value.is_integer():
+            return None
+        anchors.append(value / 1000.0)
+    if not anchors or any(abs((a - anchors[0]) / seconds - round((a - anchors[0]) / seconds)) > 1e-8 for a in anchors[1:]):
+        return None
+    return seconds, anchors[0]
 
 
 #  Estimation fallback 
@@ -442,8 +468,9 @@ def estimate_funding_paid(ex,
                             until_time_str: str | None = None) -> Optional[float]:
     """Estimate funding when history API returns empty.
 
-    Funding settles at 00:00 / 08:00 / 16:00 UTC on most exchanges.
-    Position held within one settlement window: returns 0.0 (correct).
+    Requires the SDK's explicit interval and settlement timestamp. Unknown
+    schedules remain unknown, even for short holds; no fixed eight-hour guess.
+    Position held within one verified settlement window: returns 0.0.
     Position that crossed N settlements:  notional  rate  N.
     """
     if not isinstance(symbol_full, str) or not symbol_full.strip():
@@ -476,15 +503,12 @@ def estimate_funding_paid(ex,
     if ts_close == ts_open:
         return 0.0
 
-    n_settlements = count_funding_settlements(ts_open, ts_close)
-    if n_settlements == 0:
-        return 0.0
-
     fallback = _finite_float_or_none(fallback_state_value)
     known_fallback = (
         fallback if fallback is not None and fallback != 0.0 else None
     )
     funding_rate_dec = None
+    schedule = None
     try:
         from config.exchange_config import safe_fetch_funding_rate
         fr = safe_fetch_funding_rate(
@@ -493,13 +517,19 @@ def estimate_funding_paid(ex,
             endpoint="estimate_funding_rate",
         )
         if isinstance(fr, dict):
+            schedule = _verified_funding_schedule(fr)
             parsed_rate = _finite_float_or_none(fr.get("fundingRate"))
             if parsed_rate is not None:
                 funding_rate_dec = parsed_rate
     except Exception:
         pass
-    if funding_rate_dec is None:
+    if funding_rate_dec is None or schedule is None:
         return known_fallback
+    n_settlements = count_funding_settlements(
+        ts_open, ts_close, interval_sec=schedule[0], anchor_sec=schedule[1]
+    )
+    if n_settlements == 0:
+        return 0.0
     # Epsilon comparison  exchanges occasionally return microscopic rates
     # like 1e-13; below 1e-9 is effectively zero.
     if abs(funding_rate_dec) < 1e-9:
