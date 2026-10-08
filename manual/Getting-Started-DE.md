@@ -15,7 +15,7 @@ Alle fünf öffentlichen Bot-Defaults sind SIM. LIVE ist eine bewusste Entscheid
    cd ObsidianTerminal
    ```
 
-2. Starte `install.bat`. Der Installer bevorzugt Python 3.12, akzeptiert 3.10–3.12 und empfiehlt 3.12.10. Fehlendes Python kann über Windows Package Manager installiert werden. Beachte einen möglichen Hinweis, das Installationsfenster danach neu zu öffnen.
+2. Starte `install.bat`. Der Installer benötigt Python 3.12 ab Patch 10 und empfiehlt 3.12.10. Fehlendes Python kann über Windows Package Manager installiert werden. Beachte einen möglichen Hinweis, das Installationsfenster danach neu zu öffnen.
 3. Prüfe das Ergebnis. Fehler bei erforderlichen Paketen oder Importen müssen behoben werden. Der Installer richtet eine Projektumgebung mit den festgelegten Abhängigkeiten ein.
 4. Ollama ist optional; du kannst seine Installation ablehnen. Ist Ollama bereits erreichbar, kann der Installer das konfigurierte Modell herunterladen. Dafür können mehrere Gigabyte erforderlich sein. Für die Standardstrategien mit deaktivierter KI ist das nicht nötig.
 5. Starte `OBSIDIAN.vbs`. `start_launcher.bat` ist eine Alternative, wenn du Startmeldungen zur Diagnose sehen möchtest.

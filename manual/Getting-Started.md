@@ -9,7 +9,7 @@ Start with simulation. LIVE mode places real exchange orders and is an explicit 
 ## Before installing
 
 - Use a Windows computer with a graphical desktop and a reliable internet connection. Keep the machine awake while bots are expected to monitor positions.
-- The source installer accepts Python 3.10–3.12 and recommends Python 3.12.10. Python 3.13 or newer is outside its accepted range. Git is needed for Git-based updates.
+- The source installer requires Python 3.12 starting at patch 10 and recommends Python 3.12.10. Other Python series are outside its accepted range. Git is needed for Git-based updates.
 - Allow disk space for dependencies and growing local logs/database files. Optional AI models and research capture require substantially more storage and memory; neither is required for standard trading simulation.
 - Use the official source at [github.com/Chap0815/ObsidianTerminal](https://github.com/Chap0815/ObsidianTerminal). Do not import another user's configuration or credentials.
 

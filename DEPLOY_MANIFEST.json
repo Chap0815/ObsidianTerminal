@@ -1,6 +1,6 @@
 {
-  "build_id": "d5edab03449fc6ea",
-  "created_at": "2026-10-08 12:44:55",
+  "build_id": "9f813efb32081848",
+  "created_at": "2026-10-08 13:18:20",
   "source": "update_deploy_manifest.py",
   "file_count": 225,
   "files": [
@@ -246,7 +246,7 @@
     },
     {
       "path": "config/dependency_advisory_policy.json",
-      "sha256": "724a0631c328f5d69e1c9d09f6c9e0fcc74bf3da8afcc4df86ca1b248ee73b49",
+      "sha256": "9ca7565c74601abc6d38df572f092a8c1a6729e3f4f504cf42496cff5e6b220d",
       "bytes": 430
     },
     {
@@ -406,13 +406,13 @@
     },
     {
       "path": "install.bat",
-      "sha256": "55a220aff82897960e2e749313c9c51761ebba2daaef3a53ab80c69cd0b1e151",
-      "bytes": 2203
+      "sha256": "90940493b956753f50412ee5bcfcf04607920ce00eff41f494212a68d903dc0a",
+      "bytes": 2160
     },
     {
       "path": "install.py",
-      "sha256": "1d0c24e9e9c4cc37990d38248347729d07597b00e23fe4a63a6fe3e9505c1bc1",
-      "bytes": 22057
+      "sha256": "9ba7f8831a28bae142f93e25fbeed1ae0448a24cc3b9f0fb236172583605421a",
+      "bytes": 22023
     },
     {
       "path": "ISSUES.md",
@@ -591,13 +591,13 @@
     },
     {
       "path": "manual/Getting-Started-DE.md",
-      "sha256": "15581b03d632d08e89178fe0092c52d6c2835010d1ff1cacee58d1246cf43915",
-      "bytes": 6962
+      "sha256": "203479ff55bb0b6addd577311d67563c0b6c9a941052ad84343cfe13b095b0ce",
+      "bytes": 6950
     },
     {
       "path": "manual/Getting-Started.md",
-      "sha256": "d24a0ddcb846116aef41571cf03f3df5955fe68d264a2d9845f8dfed0f6bcabf",
-      "bytes": 7574
+      "sha256": "a71b4b25dfaf76b6fa76d86aab017a08e780208a77337a6806cce3be5a6361f3",
+      "bytes": 7589
     },
     {
       "path": "manual/Licensing.md",
@@ -691,8 +691,8 @@
     },
     {
       "path": "README.md",
-      "sha256": "e7749d14cfdb236ffd28fe4a64eedf12e89e4495f110e610358bf2a643c6c9fb",
-      "bytes": 11260
+      "sha256": "4f5f98216db0032535c00f22aa01469e0990e14dccfe4ae4be5fa14fa22dc4f6",
+      "bytes": 11253
     },
     {
       "path": "RELEASE.md",
@@ -701,13 +701,13 @@
     },
     {
       "path": "requirements.lock.txt",
-      "sha256": "c02dd786e936a43d6a7685e410398623f876bdd72bf2f361fb7b0c722afdae1b",
-      "bytes": 22672
+      "sha256": "977b313e5b47b9187ae5fc36dd994f3df77082a36b6ecc68ef61adb3d7bac666",
+      "bytes": 22828
     },
     {
       "path": "requirements.txt",
-      "sha256": "7142f4cd21854088e0644437ce8e48f58398c760cae91ab7943946bb2e423888",
-      "bytes": 2165
+      "sha256": "3ee341e4537046be701194bae22bd5ed99fcd376f1234cb9f88fbeb983208640",
+      "bytes": 2157
     },
     {
       "path": "SECURITY.md",

@@ -1,6 +1,6 @@
 """
 
-  OBSIDIAN TRADING TERMINAL  -  One-Click Installer (Python 3.13.16)
+  OBSIDIAN TRADING TERMINAL  -  One-Click Installer (Python 3.12.10)
 
 
 Einmal ausfuehren -> installiert ALLES was der Bot braucht:
@@ -8,7 +8,7 @@ Einmal ausfuehren -> installiert ALLES was der Bot braucht:
   python install.py
 
 Was es macht:
-  1. Prueft Python-Version (Ziel: 3.13.16; erlaubt 3.13 ab Patch 16)
+  1. Prueft Python-Version (Ziel: 3.12.10; erlaubt 3.12 ab Patch 10)
   2. Erstellt/benutzt .venv im Projektordner
   3. Stellt pip offline aus der Python-Distribution im .venv bereit
   4. Installiert alle Pflicht-Pakete hashgeprueft aus requirements.lock.txt
@@ -81,7 +81,7 @@ INSTALL_ENV_MAX_BYTES = 1024 * 1024
 INSTALL_IMPORT_TIMEOUT_SECONDS = 60.0
 
 # Empfohlene Zielversion
-TARGET_PY = (3, 13, 16)
+TARGET_PY = (3, 12, 10)
 
 #  Pflicht-Pakete (PyPI-Name, Import-Name)  -  Fallback, falls die
 #    requirements-Datei fehlt. Indikatoren laufen nativ (kein pandas-ta).
@@ -233,9 +233,9 @@ def check_python() -> bool:
     head("[1/10] Python-Version pruefen")
     v = sys.version_info
     cur = f"{v.major}.{v.minor}.{v.micro}"
-    if (v.major, v.minor) != (3, 13) or v.micro < 16:
-        err(f"Python {cur} liegt ausserhalb des geprueften Bereichs 3.13 ab Patch 16.")
-        err("Installiere Python 3.13.16 von https://www.python.org/downloads/release/python-31316/")
+    if (v.major, v.minor) != (3, 12) or v.micro < 10:
+        err(f"Python {cur} liegt ausserhalb des geprueften Bereichs 3.12 ab Patch 10.")
+        err("Installiere Python 3.12.10 von https://www.python.org/downloads/release/python-31210/")
         return False
     ok(f"Python {cur}  -  OK (Zielreihe)")
 
@@ -595,7 +595,7 @@ def main() -> int:
     _sanitize_python_environment()
     print(f"""
 {C.BOLD}{C.B}
-   OBSIDIAN TRADING TERMINAL  -  Installer (Python 3.13)
+   OBSIDIAN TRADING TERMINAL  -  Installer (Python 3.12)
 {C.END}
 """)
     info(f"Projekt: {PROJECT_ROOT}")
