@@ -2082,6 +2082,7 @@ class VenueRecorder:
     _INTEGRITY_FRESHNESS_SECONDS = 7_200.0
     GAP_WARNING_INTERVAL_SEC = 60.0
     GAP_WARNING_KEYS_MAX = 64
+    METADATA_REFRESH_INTERVAL_SEC = 900.0
 
     def __init__(
         self,
@@ -2176,6 +2177,8 @@ class VenueRecorder:
         self.log_event = log_event
         self._gap_warning_seen_at: dict[str, float] = {}
         self._health_callback = health_callback
+        self._metadata_refresh_needed = False
+        self._metadata_refresh_attempt_at = None
         self._priority_loader = priority_loader
         self._last_priority_symbols: list[str] = []
         self._universe: list[str] = []
@@ -2625,7 +2628,35 @@ class VenueRecorder:
             )
         return path
 
+    def _refresh_missing_market_metadata(self) -> None:
+        """Re-read authoritative metadata, without inventing unknown markets.
+
+        A venue may publish tickers before its contract catalogue catches up.
+        Keep coverage degraded in that case and bound refresh traffic even if
+        the catalogue or transport remains unavailable.
+        """
+        if not self._metadata_refresh_needed:
+            return
+        now = time.monotonic()
+        last = self._metadata_refresh_attempt_at
+        if last is not None and now - last < self.METADATA_REFRESH_INTERVAL_SEC:
+            return
+        self._metadata_refresh_attempt_at = now
+        loader = getattr(self.exchange, "load_markets", None)
+        if not callable(loader):
+            return
+        endpoint = "venue_recorder_refresh_market_metadata"
+        reservation = self._require_api_budget(endpoint)
+        try:
+            markets = loader(reload=True)
+            if not isinstance(markets, dict) or not markets:
+                raise ValueError("market metadata refresh returned no snapshot")
+        except Exception:
+            self._record_api_failure(endpoint, reservation)
+            raise
+
     def capture_overview(self) -> int:
+        self._refresh_missing_market_metadata()
         endpoint = "venue_recorder_fetch_tickers"
         reservation = self._require_api_budget(endpoint)
         started = _capture_now_ms()
@@ -2987,6 +3018,8 @@ class VenueRecorder:
             health_details=coverage,
             event_universe=next_universe,
         )
+        # Publish refresh demand only after the coverage observation is durable.
+        self._metadata_refresh_needed = bool(unknown_count)
         self._last_priority_symbols = list(priority_universe)
         self._universe = next_universe
         return len(candidates)
@@ -3987,6 +4020,7 @@ class VenueRecorder:
                     next_l2_start_attempt = time.monotonic() + 30.0
                     self._log_gap("L2 start gap", exc)
             while not shutdown_requested():
+                cycle_started = time.monotonic()
                 now = time.monotonic()
                 if self._l2_collector is not None:
                     alive_missing = object()
@@ -4738,7 +4772,12 @@ class VenueRecorder:
                     "last_poll_monotonic": time.monotonic(),
                     "last_poll_wall_ts": time.time(),
                 })
-                shutdown_wait(self.micro_interval)
+                # The configured cadence includes request/write time. Adding
+                # a full sleep after every request made an eight-symbol sweep
+                # drift beyond its coverage budget as network latency grew.
+                shutdown_wait(max(
+                    0.0, self.micro_interval - (time.monotonic() - cycle_started)
+                ))
         finally:
             # No producer work occurs after this publication. External runtime
             # finalization may now close the shared writer without a reopen.

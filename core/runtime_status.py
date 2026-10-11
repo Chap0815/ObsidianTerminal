@@ -670,6 +670,11 @@ def write_runtime_status(log_dir: str | os.PathLike[str],
             payload["wall_ts"] = time.time()
             payload["monotonic_ts"] = time.monotonic()
             payload["clock_health"] = _clock_health()
+            if (
+                payload["status"].lower() == "ready"
+                and payload["clock_health"].get("ok") is not True
+            ):
+                payload["status"] = "degraded"
             encoded = json.dumps(
                 payload,
                 indent=2,

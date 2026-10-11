@@ -2286,6 +2286,7 @@ class ReconcileMixin:
         """Thread body: every RECONCILE_INTERVAL_SEC, run an exchange drift
         check. Skipped in SIMULATION mode (no real wallet to compare against).
         """
+        from config.exchange_config import refresh_exchange_clock
         from core.logger import log_event, send_telegram
         from core.symbol_locks import gc_idle_locks
         from config.telegram_config import TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
@@ -2297,6 +2298,7 @@ class ReconcileMixin:
                 self._shutdown_event.wait(timeout=self.GC_LOCKS_INTERVAL_SEC)
                 if self._shutdown_event.is_set():
                     return
+                refresh_exchange_clock(self.ex)
                 try:
                     self._recover_simulated_entry_tca_pending()
                 except Exception as e:
@@ -2337,6 +2339,8 @@ class ReconcileMixin:
             # Sleep first  startup_reconciliation already ran
             if self._shutdown_event.wait(timeout=self.RECONCILE_INTERVAL_SEC):
                 return
+
+            refresh_exchange_clock(self.ex)
 
             # GC idle symbol locks
             now = time.monotonic()
