@@ -742,7 +742,11 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         snapshot = {
             "ok": healthy,
             "component": "private_api",
-            "state": "authenticated" if healthy else "authentication_failed",
+            "state": (
+                "authenticated" if healthy else
+                "authentication_failed" if health_reason == "authentication_failed"
+                else "unavailable"
+            ),
             "reason": health_reason,
             "error_type": health_error_type,
             "checked_monotonic": time.monotonic(),
@@ -756,7 +760,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             with lock:
                 previous = dict(getattr(self, "_private_api_health", {}) or {})
                 self._private_api_health = snapshot
-        return (
+        changed = (
             previous.get("ok"),
             previous.get("reason"),
             previous.get("error_type"),
@@ -765,6 +769,22 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             snapshot["reason"],
             snapshot["error_type"],
         )
+        if changed:
+            try:
+                from core.logger import log_struct
+
+                log_struct(
+                    "private_api_health",
+                    bot=getattr(self, "BOT_NAME", "UNKNOWN"),
+                    ok=snapshot["ok"],
+                    state=snapshot["state"],
+                    reason=snapshot["reason"],
+                    error_type=snapshot["error_type"],
+                )
+            except Exception:
+                # Health publication must not depend on optional log delivery.
+                pass
+        return changed
 
     def _private_api_runtime_health(self) -> dict[str, Any]:
         """Expose explicit private-API authentication state for LIVE bots."""

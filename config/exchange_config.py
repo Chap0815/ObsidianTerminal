@@ -62,6 +62,10 @@ def is_authentication_error(exc: BaseException) -> bool:
     )
     if authentication_types and isinstance(exc, authentication_types):
         return True
+    # Transport exceptions may echo request headers containing an API-key
+    # label. That label is not an authentication rejection by the venue.
+    if isinstance(exc, ccxt.NetworkError):
+        return False
     message = str(exc).lower()
     return any(marker in message for marker in (
         "api key",
@@ -356,6 +360,7 @@ _LAST_TIME_RESYNC = {
 }
 _TIME_RESYNC_MIN_INTERVAL = 2.0   # don't refetch server time more than every 2s
 _CLOCK_OFFSET_MAX_AGE_SECONDS = 6.0 * 60.0 * 60.0
+_CLOCK_REFRESH_TARGET_AGE_SECONDS = 60.0 * 60.0
 _CLOCK_REFRESH_RETRY_SECONDS = 5.0 * 60.0
 _EXCHANGE_EPOCH_MIN_MS = 946_684_800_000.0  # 2000-01-01 UTC
 _EXCHANGE_EPOCH_MAX_MS = 16_725_225_600_000.0  # 2500-01-01 UTC
@@ -532,7 +537,7 @@ def _maybe_refresh_exchange_clock(ex) -> None:
             age_seconds = float(age_seconds)
             if (
                 math.isfinite(age_seconds)
-                and 0.0 <= age_seconds <= _CLOCK_OFFSET_MAX_AGE_SECONDS
+                and 0.0 <= age_seconds <= _CLOCK_REFRESH_TARGET_AGE_SECONDS
             ):
                 return
         now = time.monotonic()
@@ -552,6 +557,22 @@ def _maybe_refresh_exchange_clock(ex) -> None:
         resync_time_difference(ex)
     except Exception as exc:
         _silent("resync_time_difference", exc)
+
+
+def refresh_exchange_clock(ex) -> None:
+    """Maintain the time anchor from an existing maintenance worker.
+
+    Thread-local clients refresh their own clone. No heartbeat or strategy
+    thread needs to perform network I/O merely to keep its clock healthy.
+    """
+    try:
+        refresh = getattr(ex, "refresh_exchange_clock", None)
+        if callable(refresh):
+            refresh()
+        else:
+            _maybe_refresh_exchange_clock(ex)
+    except Exception as exc:
+        _silent("periodic_clock_refresh_check", exc)
 
 
 def _install_nonce_selfheal(ex):
@@ -1308,8 +1329,13 @@ def safe_fetch_positions(
     endpoint: str = "safe_fetch_positions",
     critical: bool = False,
     raise_on_budget_denied: bool = False,
+    transient_retry: bool = False,
+    raise_on_error: bool = False,
+    shutdown_event=None,
 ):
-    if type(raise_on_budget_denied) is not bool:
+    if any(type(value) is not bool for value in (
+        raise_on_budget_denied, transient_retry, raise_on_error,
+    )):
         return None
     expected_symbols = None
     if symbols is None:
@@ -1332,22 +1358,29 @@ def safe_fetch_positions(
 
     if not supports(ex, "fetchPositions"):
         return None
-    reservation = _safe_fetch_reservation(endpoint, critical=critical)
-    if not reservation:
-        if raise_on_budget_denied:
-            raise SafeFetchBudgetUnavailable(endpoint)
-        return None
-    try:
-        if expected_symbols is not None:
-            positions = ex.fetch_positions(list(expected_symbols))
-        else:
-            positions = ex.fetch_positions()
-        if type(positions) not in (list, tuple):
-            raise TypeError("fetch_positions returned no position list")
-        if any(type(position) is not dict for position in positions):
-            raise TypeError("fetch_positions returned a malformed position row")
-        if expected_symbols is not None:
-            if any(
+    # Only idempotent position reads may opt into one extra transport attempt.
+    # Each attempt consumes its own budget; rejected auth/schema/rate-limit
+    # outcomes are never turned into a retry or an authoritative empty list.
+    for attempt in range(2 if transient_retry else 1):
+        if shutdown_event is not None and shutdown_event.is_set():
+            if raise_on_error:
+                raise RuntimeError("position snapshot cancelled by shutdown")
+            return None
+        reservation = _safe_fetch_reservation(endpoint, critical=critical)
+        if not reservation:
+            if raise_on_budget_denied:
+                raise SafeFetchBudgetUnavailable(endpoint)
+            return None
+        try:
+            if expected_symbols is not None:
+                positions = ex.fetch_positions(list(expected_symbols))
+            else:
+                positions = ex.fetch_positions()
+            if type(positions) not in (list, tuple):
+                raise TypeError("fetch_positions returned no position list")
+            if any(type(position) is not dict for position in positions):
+                raise TypeError("fetch_positions returned a malformed position row")
+            if expected_symbols is not None and any(
                 not any(
                     explicit_trade_symbol_matches(position, expected_symbol)
                     for expected_symbol in expected_symbols
@@ -1357,21 +1390,32 @@ def safe_fetch_positions(
                 raise ValueError(
                     "fetch_positions returned a position outside requested symbols"
                 )
-        return positions
-    except Exception as e:
-        if isinstance(reservation, ApiCallReservation):
-            try:
-                record_api_error(endpoint, reservation)
-            except Exception:
-                pass
-        # Authentication loss is operational state, not a transient missing
-        # snapshot. Let guarded callers fail closed and publish explicit health
-        # instead of persisting the same swallowed error every minute.
-        if is_authentication_error(e):
-            raise
-        scope = symbols if expected_symbols is not None else "all"
-        _silent(f"{endpoint}({scope})", e)
-        return None
+            return positions
+        except Exception as exc:
+            if isinstance(reservation, ApiCallReservation):
+                try:
+                    record_api_error(endpoint, reservation)
+                except Exception:
+                    pass
+            if is_authentication_error(exc):
+                raise
+            if transient_retry and attempt == 0:
+                from bot_utils.network_retry import is_transient_network
+
+                if is_transient_network(exc):
+                    if shutdown_event is not None:
+                        shutdown_event.wait(0.5)
+                    else:
+                        time.sleep(0.5)
+                    continue
+            if raise_on_error:
+                raise
+            scope = symbols if expected_symbols is not None else "all"
+            owner = os.getenv("BOT_NAME", "UNKNOWN").upper()
+            if owner not in {"SPOT", "TREND", "FUTURES", "CROSS", "FUTREND"}:
+                owner = "UNKNOWN"
+            _silent(f"{owner} {endpoint}({scope})", exc)
+            return None
 
 
 def _normalise_client_order_id(value) -> str | None:

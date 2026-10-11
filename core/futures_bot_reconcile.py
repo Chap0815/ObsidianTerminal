@@ -2308,32 +2308,48 @@ class FuturesReconcileMixin:
                     self.ex,
                     endpoint="futures_reconcile_fetch_positions",
                     critical=True,
+                    transient_retry=True,
+                    raise_on_error=True,
+                    raise_on_budget_denied=True,
+                    shutdown_event=getattr(self, "_shutdown_event", None),
                 )
             except Exception as exc:
-                if not is_authentication_error(exc):
-                    raise
+                auth_failure = is_authentication_error(exc)
                 record_private_api = getattr(
                     self, "_record_private_api_health", None
                 )
                 changed = bool(
                     record_private_api(
                         ok=False,
-                        reason="authentication_failed",
+                        reason=("authentication_failed" if auth_failure
+                                else "position_snapshot_unavailable"),
                         error_type=type(exc).__name__,
                     )
                 ) if callable(record_private_api) else False
                 if changed:
+                    detail = (
+                        "private API authentication failed" if auth_failure
+                        else "private position snapshot unavailable"
+                    )
                     log_event(
-                        f"[{self.BOT_NAME}] private API authentication failed; "
+                        f"[{self.BOT_NAME}] {detail} "
+                        f"({type(exc).__name__}); "
                         "new entries remain blocked while reconciliation and "
                         "exit supervision keep retrying",
                         "WARN",
                     )
                 return False
             if exchange_positions is None:
+                record_private_api = getattr(self, "_record_private_api_health", None)
+                if callable(record_private_api):
+                    record_private_api(
+                        ok=False,
+                        reason="position_snapshot_unavailable",
+                        error_type="snapshot_unavailable",
+                    )
                 log_event(
                     "Reconciliation: fetch_positions unavailable on this "
-                    "exchange  skipping. Local state used as-is.", "WARN"
+                    "exchange; new entries blocked, local state retained.", "WARN"
                 )
                 return False
             record_private_api = getattr(
@@ -3876,6 +3892,7 @@ class FuturesReconcileMixin:
     #  Periodic reconcile thread 
 
     def _reconcile_loop(self) -> None:
+        from config.exchange_config import refresh_exchange_clock
         from core.logger import log_event
         from core.symbol_locks import gc_idle_locks
 
@@ -3887,6 +3904,7 @@ class FuturesReconcileMixin:
                     timeout=self.GC_LOCKS_INTERVAL_SEC
                 ):
                     return
+                refresh_exchange_clock(self.ex)
                 try:
                     self._recover_simulated_entry_tca_pending()
                 except Exception as exc:
@@ -3942,6 +3960,7 @@ class FuturesReconcileMixin:
                     return
 
             # GC idle locks
+            refresh_exchange_clock(self.ex)
             now = time.monotonic()
             if now - last_gc >= self.GC_LOCKS_INTERVAL_SEC:
                 last_gc = now

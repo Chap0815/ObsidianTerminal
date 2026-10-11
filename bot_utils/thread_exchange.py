@@ -636,6 +636,12 @@ class ThreadLocalExchange:
                     self._clones.extend(failed)
             return len(dead) - len(failed)
 
+    def refresh_exchange_clock(self) -> None:
+        """Refresh the calling maintenance thread's client, not other sessions."""
+        from config.exchange_config import _maybe_refresh_exchange_clock
+
+        _maybe_refresh_exchange_clock(self._get_clone())
+
     def load_markets(self, *args, **kwargs):
         """Refresh the canonical base and propagate one coherent snapshot."""
         with self._markets_refresh_lock:

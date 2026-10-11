@@ -1,6 +1,6 @@
 {
-  "build_id": "9f813efb32081848",
-  "created_at": "2026-10-08 13:18:20",
+  "build_id": "7f5847729760b9dc",
+  "created_at": "2026-10-11 16:07:42",
   "source": "update_deploy_manifest.py",
   "file_count": 225,
   "files": [
@@ -181,8 +181,8 @@
     },
     {
       "path": "bot_utils/thread_exchange.py",
-      "sha256": "1c333ddd3b1444baee695a6861d9d5d407d3042a23b17d7a439851a5dedd5028",
-      "bytes": 34592
+      "sha256": "15c78bf18eac18f2972078023f18dae1452cca6a4ccf7526d7c9a808f5bd4d55",
+      "bytes": 34853
     },
     {
       "path": "bot_utils/ticker_cache.py",
@@ -251,8 +251,8 @@
     },
     {
       "path": "config/exchange_config.py",
-      "sha256": "ac3edf1b6a33219fe48e47ac47df9740c6d8430a92e6942d187ccfe5463e479c",
-      "bytes": 62969
+      "sha256": "472a89b6580d73aa7ec47e7725391abd6545239c76099e978b86493c6225652f",
+      "bytes": 64894
     },
     {
       "path": "config/github_known_hosts",
@@ -306,8 +306,8 @@
     },
     {
       "path": "core/futures_bot.py",
-      "sha256": "1cb67566262b00dd5bd4940b606853488c855a3ad97870c42f53cf0bbb7fc102",
-      "bytes": 144704
+      "sha256": "02c91032fac0ef290831789497fbacd398a619c453ddda84064877fef83376e0",
+      "bytes": 145412
     },
     {
       "path": "core/futures_bot_exits.py",
@@ -316,8 +316,8 @@
     },
     {
       "path": "core/futures_bot_reconcile.py",
-      "sha256": "6e161730a9bf7a82de5707fbeaab6bee88298e08f7147fc456db639d6467dedc",
-      "bytes": 170675
+      "sha256": "2365f29fae74045d7fee40f15c7907a5709ddc561e1f26b34029c63592f10c51",
+      "bytes": 171696
     },
     {
       "path": "core/futures_bot_scan.py",
@@ -351,8 +351,8 @@
     },
     {
       "path": "core/runtime_status.py",
-      "sha256": "aedebf5cca19a1f9e561afcdbec8dd182e63e313accd838f09287fe5ac19fadb",
-      "bytes": 27621
+      "sha256": "1db910d5a77cb2f8d87efeefeab3819e3d5015e0108757516293aca00eaa3e89",
+      "bytes": 27819
     },
     {
       "path": "core/spot_bot.py",
@@ -366,8 +366,8 @@
     },
     {
       "path": "core/spot_bot_reconcile.py",
-      "sha256": "cadfa858e908623c4b14daa808f20cc8ca5148cf0c638be5e25672908aaed8c7",
-      "bytes": 96865
+      "sha256": "e1146bd2c7d667cda23fc8ba29b8eb4d9df283197c9d13a3bfd8aac5b6fa0023",
+      "bytes": 97024
     },
     {
       "path": "core/spot_bot_scan.py",
@@ -1096,8 +1096,8 @@
     },
     {
       "path": "trading/venue_recorder.py",
-      "sha256": "e1f329bda84c06cb3ea051a815857c65d8801132debbd2c5480dd903d25e59e3",
-      "bytes": 203240
+      "sha256": "89b3905169fd878e4c01a84f3ec4b52b6cd7f85dd677de1d675fb75ebd096db3",
+      "bytes": 205116
     },
     {
       "path": "trading/vol_target.py",
