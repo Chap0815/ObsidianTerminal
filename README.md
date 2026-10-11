@@ -4,10 +4,8 @@
 
 # Obsidian Trading Terminal
 
-### Your strategies. Your accounts. Your control.
-
-A Windows desktop terminal for automated cryptocurrency spot and perpetuals trading.<br />
-**Five strategies · Simulation-first · AI-compatible · Optional local Ollama integration**
+Run and monitor five cryptocurrency trading strategies from one Windows desktop.<br />
+**Spot and perpetuals · Simulation by default · Optional local AI with Ollama**
 
 [Get started](manual/Getting-Started.md) · [Deutsch](manual/Getting-Started-DE.md) · [Wiki](https://github.com/Chap0815/ObsidianTerminal/wiki) · [Strategy guide](manual/Strategies.md) · [Operating safely](manual/Operating-Safely.md) · [Updates](UPDATE_SETUP.md)
 
@@ -20,6 +18,11 @@ A Windows desktop terminal for automated cryptocurrency spot and perpetuals trad
 > are promised. Local stop-loss and trailing logic require the software and its
 > connections to work; they are not guaranteed exchange-side protection.
 > [Read the operating guide](manual/Operating-Safely.md) before enabling LIVE.
+
+![Obsidian desktop interface with five stopped strategies in simulation mode](manual/media/obsidian-terminal.png)
+
+*Interface preview using public defaults: all five strategies are stopped in SIM.
+No account credentials, live positions or trading results are shown.*
 
 ## One terminal, five distinct approaches
 
