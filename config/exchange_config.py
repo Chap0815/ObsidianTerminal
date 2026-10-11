@@ -1167,6 +1167,35 @@ def safe_set_margin_mode(ex, mode: str = "isolated", symbol=None,
     margin_reservation = None
     request_issued = False
     try:
+        # MEXC acknowledges this POST with {success: true, code: 0}.
+        # CCXT versions that feed that object into parse_leverage (a list
+        # parser) raise KeyError AFTER a successful mutation. Read the native
+        # acknowledgement directly; never resend to recover a parser failure.
+        native_setter = None
+        native_request = None
+        if getattr(ex, "id", None) == "mexc":
+            native_setter = getattr(
+                ex, "contractPrivatePostPositionChangeLeverage", None
+            )
+            if callable(native_setter):
+                markets = getattr(ex, "markets", None)
+                market = markets.get(symbol) if isinstance(markets, dict) else None
+                if (
+                    not isinstance(market, dict)
+                    or market.get("symbol") != symbol
+                    or market.get("contract") is not True
+                    or market.get("spot") is not False
+                    or not _valid_exchange_symbol(market.get("id"))
+                    or direction not in {"LONG", "SHORT"}
+                    or not leverage_value.is_integer()
+                ):
+                    return False
+                native_request = {
+                    "symbol": market["id"],
+                    "leverage": int(leverage_value),
+                    "openType": 1 if mode == "isolated" else 2,
+                    "positionType": 2 if direction == "SHORT" else 1,
+                }
         margin_reservation = try_consume_api_call(
             "futures_set_margin_mode",
             return_reservation=True,
@@ -1175,13 +1204,27 @@ def safe_set_margin_mode(ex, mode: str = "isolated", symbol=None,
             return False
         _throttle_admin()
         request_issued = True
-        ex.set_margin_mode(mode, symbol, params=params)
+        if native_request is not None:
+            response = native_setter(native_request)
+            code = response.get("code") if type(response) is dict else None
+            if (
+                type(response) is not dict
+                or response.get("success") is not True
+                or not (
+                    (type(code) is int and code == 0)
+                    or (type(code) is str and code == "0")
+                )
+            ):
+                raise RuntimeError("MEXC margin setting not acknowledged")
+        else:
+            ex.set_margin_mode(mode, symbol, params=params)
         return True
     except Exception as e:
         msg = str(e).lower()
         # "already set" / "not modified"  effectively fine.
         if (
-            not is_authentication_error(e)
+            native_request is None
+            and not is_authentication_error(e)
             and _admin_setting_already_applied(e)
         ):
             return True

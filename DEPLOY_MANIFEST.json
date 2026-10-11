@@ -1,6 +1,6 @@
 {
-  "build_id": "7f5847729760b9dc",
-  "created_at": "2026-10-11 16:07:42",
+  "build_id": "8190be9d118bee95",
+  "created_at": "2026-10-11 17:05:39",
   "source": "update_deploy_manifest.py",
   "file_count": 225,
   "files": [
@@ -251,8 +251,8 @@
     },
     {
       "path": "config/exchange_config.py",
-      "sha256": "472a89b6580d73aa7ec47e7725391abd6545239c76099e978b86493c6225652f",
-      "bytes": 64894
+      "sha256": "3916996060aa545ef279b4e23c5188cbc0cdbe57533c1d336d86942ede7f4c0a",
+      "bytes": 66938
     },
     {
       "path": "config/github_known_hosts",
