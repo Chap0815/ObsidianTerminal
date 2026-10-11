@@ -1,8 +1,8 @@
 {
-  "build_id": "8190be9d118bee95",
-  "created_at": "2026-10-11 17:05:39",
+  "build_id": "efed90772a8c720c",
+  "created_at": "2026-10-11 17:53:57",
   "source": "update_deploy_manifest.py",
-  "file_count": 225,
+  "file_count": 226,
   "files": [
     {
       "path": ".github/ISSUE_TEMPLATE/bug_report.yml",
@@ -610,6 +610,11 @@
       "bytes": 1763
     },
     {
+      "path": "manual/media/obsidian-terminal.png",
+      "sha256": "534646e37d9dc3ed63ed677a19a15ccefd44f5ab5252bb8d7368ef7ae8f7117e",
+      "bytes": 71384
+    },
+    {
       "path": "manual/Operating-Safely.md",
       "sha256": "f7d5c3189453327e81994983f3edb9884f0a7b9fc60cf7da33d70700b99f77a0",
       "bytes": 7512
@@ -626,8 +631,8 @@
     },
     {
       "path": "manual/Troubleshooting.md",
-      "sha256": "0dc7b285563241748f80c4539d0c4c0c263c1dc83a67e5f7bcd3265202cb96fd",
-      "bytes": 9720
+      "sha256": "d1a01c6278ab5b93d6dbf08c0d80b2847d9056bc85a61d2168772d34583c28ac",
+      "bytes": 9758
     },
     {
       "path": "news/__init__.py",
@@ -691,13 +696,13 @@
     },
     {
       "path": "README.md",
-      "sha256": "4f5f98216db0032535c00f22aa01469e0990e14dccfe4ae4be5fa14fa22dc4f6",
-      "bytes": 11253
+      "sha256": "a31bec088dece2bb6712b780e68a879b51a05f509138d535ab1ebdb7ba98e483",
+      "bytes": 11457
     },
     {
       "path": "RELEASE.md",
-      "sha256": "537a9bbd535a2baef019517a37685cc85531a5fb26de3fe1cbd9f735290d64dd",
-      "bytes": 8327
+      "sha256": "6abc47647d32561123870b399a0bd419b45116f62bb60c1998ff477095229941",
+      "bytes": 7199
     },
     {
       "path": "requirements.lock.txt",

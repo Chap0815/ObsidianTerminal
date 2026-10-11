@@ -16,7 +16,7 @@ Start by identifying whether the problem is installation, data, execution, recov
 
 | Symptom | What to inspect | Appropriate next step |
 | --- | --- | --- |
-| Python version rejected | Interpreter selected by `install.bat` | Use the accepted Python 3.10–3.12 range; the installer recommends 3.12.10. |
+| Python version rejected | Interpreter selected by `install.bat` | Use Python 3.12, patch 10 or newer. The reference version is 3.12.10; Python 3.10, 3.11 and 3.13 are not accepted. |
 | Package/import installation failure | Exact failed package or import and installer output | Resolve that error and rerun the installer in the same installation. |
 | Ollama/model missing | Whether AI is actually enabled | Standard strategies run with AI disabled; finish the core setup independently of optional AI. |
 | Window closes during startup | Startup output and recent application logs | Use `start_launcher.bat` to expose useful output; preserve the actual error. |
