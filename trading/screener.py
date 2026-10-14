@@ -438,35 +438,10 @@ _sym_scan_fails: dict = {}
 _sym_scan_lock = threading.Lock()
 
 
-_HARD_ERROR_MARKERS = (
-    "does not exist",
-    "invalid symbol",
-    "not found",
-    "no data",
-    "symbol not",
-    "invalid market",
-    "400",
-    "404",
-    "market not",
-    "trading pair",
-    "pair not",
-    "40018",
-    "40107",
-    "40401",
-    "43112",
-    "suspend",
-    "not support",
-    "not available",
-    "contract not",
-    "pair information",
-    "illegal symbol",
-)
-
 # Precise regex-based detection of "really gone" symbol errors. Uses word
 # boundaries (\b) on numeric codes and anchored phrases for textual markers,
 # avoiding false positives (e.g. "400" inside an order-id, "not found" from a
-# CCXT-internal cache warning). The substring tuple above is kept for any other
-# module that reads it; this regex is the detection path.
+# CCXT-internal cache warning).
 _HARD_ERROR_RE = _re_internal.compile(
     r"\b(?:"
     r"does not exist|invalid\s+symbol|symbol\s+not\s+(?:found|available)|"
@@ -490,9 +465,6 @@ def _is_hard_error(err_str: str) -> bool:
     symbol/market is gone, not just transiently unavailable.
     """
     return bool(_HARD_ERROR_RE.search(err_str or ""))
-
-
-_CCXT_CANDLES_URL_MARKERS = ("/market/candles", "/klines", "fetch_ohlcv")
 
 
 def _is_usdt_pair(symbol: str) -> bool:

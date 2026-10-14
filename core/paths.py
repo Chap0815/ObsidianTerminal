@@ -26,7 +26,6 @@ PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
 DATA_DIR:       Path = PROJECT_ROOT / "data"
 LOGS_DIR:       Path = PROJECT_ROOT / "logs"
 PROMPTS_DIR:    Path = PROJECT_ROOT / "prompts"
-DOCS_DIR:       Path = PROJECT_ROOT / "docs"
 LLM_SLOTS_DIR:  Path = PROJECT_ROOT / "llm_slots"
 OPT_RESULTS:    Path = PROJECT_ROOT / "optimizer_results"
 
@@ -45,7 +44,6 @@ SYMBOL_FIRST_SEEN:     Path = DATA_DIR / "symbol_first_seen.json"
 #  Config files 
 ENV_FILE:        Path = PROJECT_ROOT / ".env"
 BOT_CONFIG:      Path = PROJECT_ROOT / "bot_config.json"
-REQUIREMENTS:    Path = PROJECT_ROOT / "requirements.txt"
 
 #  Prompt files (user-editable + read-only defaults) 
 # Trend bot is mechanical (no LLM)  no prompt files.
@@ -87,9 +85,6 @@ def ensure_runtime_dirs() -> None:
 DB_PATH_STR:           str = str(DB_PATH)
 INDICATOR_FAILURES_STR: str = str(INDICATOR_FAILURES)
 SYMBOL_FIRST_SEEN_STR: str = str(SYMBOL_FIRST_SEEN)
-LOGS_DIR_STR:          str = str(LOGS_DIR)
-PROMPTS_DIR_STR:       str = str(PROMPTS_DIR)
-PROJECT_ROOT_STR:      str = str(PROJECT_ROOT)
 
 
 if __name__ == "__main__":

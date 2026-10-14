@@ -80,8 +80,6 @@ INSTALL_CONFIG_MAX_BYTES = 2 * 1024 * 1024
 INSTALL_ENV_MAX_BYTES = 1024 * 1024
 INSTALL_IMPORT_TIMEOUT_SECONDS = 60.0
 
-# Empfohlene Zielversion
-TARGET_PY = (3, 12, 10)
 
 #  Pflicht-Pakete (PyPI-Name, Import-Name)  -  Fallback, falls die
 #    requirements-Datei fehlt. Indikatoren laufen nativ (kein pandas-ta).

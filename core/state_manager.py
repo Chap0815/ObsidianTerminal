@@ -10,7 +10,6 @@ from __future__ import annotations
 import json
 import math
 import os
-import re
 import shutil
 import sqlite3
 import threading
@@ -22,8 +21,6 @@ from bot_utils.runtime_threads import thread_definitely_never_started
 from core.models import Position
 
 
-# Robust coin-key regex: only A-Z0-9, 2-15 chars
-_COIN_RE = re.compile(r"^[A-Z0-9]{2,15}$")
 _STATE_JSON_MAX_BYTES = 4 * 1024 * 1024
 _STATE_WRITER_TERMINAL = False
 

@@ -808,34 +808,3 @@ def compute_spot_equity(ex) -> Optional[dict]:
         "open_count":   open_count,
         "source":  "balance (stables 1:1) + holdings  ticker",
     }
-
-
-#  Optional: combined helper for "total exchange balance" 
-
-def compute_combined_equity(spot_ex=None, futures_ex=None) -> dict:
-    """Convenience wrapper that returns both equities + a grand total.
-
-    Each side is independent  a failure on one side does not zero the
-    other. Missing sides are simply omitted from the grand total.
-
-    Returns a dict that's safe to render directly in a dashboard:
-      {
-        "spot":    {...} or None,
-        "futures": {...} or None,
-        "grand_total": float | None,
-      }
-    """
-    spot = compute_spot_equity(spot_ex) if spot_ex is not None else None
-    fut = compute_futures_equity(futures_ex) if futures_ex is not None else None
-
-    grand = None
-    parts = []
-    if spot is not None:
-        parts.append(spot["equity"])
-    if fut is not None:
-        parts.append(fut["equity"])
-    if parts:
-        total = sum(parts)
-        grand = round(total, 4) if math.isfinite(total) else None
-
-    return {"spot": spot, "futures": fut, "grand_total": grand}

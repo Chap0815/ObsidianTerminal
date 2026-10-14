@@ -2502,11 +2502,3 @@ def send_telegram(token, chat_id, msg) -> bool:
 def is_in_cooldown(cool: dict, sym: str, cooldown_file: str) -> bool:
     from trading.cooldown_utils import is_in_cooldown as _check
     return _check(cool, sym, cooldown_file)
-
-
-def sleep_with_status(seconds, bot, open_trades, balance):
-    if seconds <= 0:
-        return
-    for remaining in range(seconds, 0, -30):
-        log_status(bot, open_trades, balance, remaining)
-        time.sleep(min(30, remaining))

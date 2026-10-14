@@ -31,19 +31,10 @@ def _bounded_env_float(
 
 #  Dust / Precision Thresholds 
 DUST_THRESHOLD          = 1e-8
-FULL_FILL_THRESHOLD     = 0.999
-RECONCILE_TOLERANCE     = 0.95
 
 #  Minimum Notional Value 
 MIN_NOTIONAL_USDT       = 5.5
 
-#  Fee Estimation 
-FUTURES_FEE_BUFFER_PCT  = 0.003
-
-#  Order Engine Spread Thresholds 
-MARKET_SPREAD_PCT       = 0.15
-LIMIT_SPREAD_PCT        = 0.50
-LIMIT_OFFSET_PCT        = 0.05
 
 #  Slippage Circuit Breaker 
 MAX_SLIPPAGE_PCT        = 0.5
@@ -75,15 +66,11 @@ SPREAD_TRIP_COUNT       = 5
 SPREAD_WINDOW_SEC       = 180
 
 #  API Rate Limiting 
-DEFAULT_MAX_API_CALLS    = 900
-FUTURES_MAX_API_CALLS    = 300
 API_ERROR_RATE_THRESHOLD = 0.3
 API_RATE_DB_TIMEOUT_SEC  = 2.0
 
 #  Ticker Cache 
-TICKER_CACHE_TTL_SEC     = 3.0
 TICKER_STALE_MAX_SEC     = 8.0
-TICKER_CACHE_MAX_ENTRIES = 500
 
 #  Market-filter evidence cache
 MARKET_FILTER_CACHE_TTL_SECONDS = 300
@@ -100,12 +87,7 @@ SIM_CAPTURE_CONTRACT_SCHEMA = 1
 LLM_INFERENCE_TIMEOUT   = 120.0
 LLM_MAX_CONCURRENT      = 2
 LLM_SLOT_WAIT_SEC       = 90.0
-# stale-lock > 1.5 inference timeout, min. 180s
-LLM_STALE_LOCK_SEC      = max(LLM_INFERENCE_TIMEOUT * 1.5, 180.0)
 
-#  LLM Generation Limits 
-LLM_NUM_PREDICT         = 1200   # max output tokens per call
-LLM_NUM_CTX             = 3072   # context window
 
 #  Log Rotation 
 STRUCT_LOG_MAX_BYTES    = 20 * 1024 * 1024
@@ -126,14 +108,10 @@ OPS_SNAPSHOT_BACKUPS    = 2
 TG_OVERFLOW_MAX_BYTES   = 10 * 1024 * 1024
 TG_OVERFLOW_BACKUPS     = 2
 
-#  Cooldown 
-DEFAULT_COOLDOWN_MIN    = 120
-SELL_FAIL_COOLDOWN_MIN  = 15     # kurze Cooldown nach Sell-Fail
 
 #  Risk / Kelly 
 KELLY_FRACTION          = 0.25
 MIN_TRADES_FOR_LEARNING = 30
-KELLY_CONFIDENCE_MIN    = 0.1
 BASE_CAPITAL_USDT       = 500.0
 MIN_POSITION_USDT       = 5.0
 MAX_POSITION_PCT        = 0.15
@@ -217,13 +195,6 @@ BACKTEST_SPOT_TAKER_FEE    = 0.0005
 BACKTEST_FUTURES_TAKER_FEE = 0.001
 BACKTEST_MAKER_FEE         = 0.0
 
-#  BTC Correlation Thresholds 
-BTC_STRESS_1H_PCT             = -1.5
-BTC_STRESS_24H_PCT            = -3.0
-BTC_DUMP_THRESHOLD            = -2.0
-
-#  F&G Cache Max Staleness 
-FG_MAX_STALE_AGE_SEC          = 3600
 
 #  Spot cash / non-position assets
 STABLECOIN_EQUIVALENTS = frozenset({
@@ -271,16 +242,10 @@ NEUTRAL_ATR_PCT = 2.0
 MAX_SIZE_SCALE  = 1.5
 MIN_SIZE_SCALE  = 0.35
 
-#  Legacy Rebuild 
-LEGACY_REBUILD_INTERVAL_SEC = 3600
-
-#  Symbol Tracking (WARN-Suppression) 
-SYMBOL_GRACE_PERIOD_HOURS = 24
 
 #  Indicator Failure Cache 
 SOFT_FAILURE_TTL_SEC = 300       # 5 min
 HARD_FAILURE_TTL_SEC = 3600      # 1h
-RATE_LIMIT_TTL_SEC   = 300
 
 #  Killswitch Re-Check Interval (Futures Monitor) 
 KILLSWITCH_CHECK_INTERVAL_SEC = 60   # nicht jeden Tick (Monitor ~20s)
@@ -291,19 +256,3 @@ class MarketRegime(str, Enum):
     BEAR    = "BEAR"
     NEUTRAL = "NEUTRAL"
     UNKNOWN = "UNKNOWN"
-
-    @classmethod
-    def from_string(cls, s: str) -> "MarketRegime":
-        try:
-            return cls(str(s).upper())
-        except ValueError:
-            return cls.UNKNOWN
-
-
-#  Trade State Strings 
-TRADE_STATE_PENDING    = "PENDING"
-TRADE_STATE_OPEN       = "OPEN"
-TRADE_STATE_PARTIAL    = "PARTIAL"
-TRADE_STATE_CLOSING    = "CLOSING"
-TRADE_STATE_CLOSED     = "CLOSED"
-TRADE_STATE_RECONCILED = "RECONCILED"
