@@ -764,19 +764,3 @@ def read_bot_section(bot_name: str) -> dict:
         exist or the config file is unreadable.
     """
     return _CACHE.get_section(bot_name)
-
-
-def read_full_config() -> dict:
-    """Return the entire bot_config.json as a fresh dict.
-
-    Use sparingly  most callers want a single section via
-    ``read_bot_section``. This exists for the launcher UI which
-    needs to render ALL bots' parameters at once.
-    """
-    with _CACHE._lock:
-        _CACHE._maybe_reload()
-        # Return a shallow copy so callers can mutate without
-        # corrupting the cache. Section values are themselves dicts
-        # so we copy one level deeper.
-        return {k: (dict(v) if isinstance(v, dict) else v)
-                for k, v in _CACHE._raw.items()}

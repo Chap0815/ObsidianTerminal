@@ -1,12 +1,6 @@
 """
 core/trend_bot.py  Majors trend-following bot (the repurposed "Trend" slot).
 
-Validated 2026-06-13 (tools/trend_check.py, 720d MEXC majors): a long/flat
-ENSEMBLE trend rule on BTC/ETH/BNB/XRP/SOL beat buy-and-hold on BOTH return
-AND drawdown, robustly across SMA lengths (7/7) and coins (4/5). SPOT, NO
-LEVERAGE  the edge is risk-adjusted; leverage would re-inflate the very
-drawdown the strategy removes.
-
 Design: reuse the whole SpotBot lifecycle (state, SIM accounting, killswitch,
 shutdown, reconcile, UI state) and ONLY swap the two decision loops:
 

@@ -2762,18 +2762,6 @@ class ObsidianApp(ctk.CTk):
         from launcher.core.bot_controller import open_positions_for_stop
         return open_positions_for_stop(bot_name)
 
-    def _refresh_spot_positions_with_live_prices(self, bot_name, positions):
-        from launcher.core.positions import refresh_spot_positions_with_live_prices
-        return refresh_spot_positions_with_live_prices(positions)
-
-    def _show_spot_stop_dialog(self, name, positions):
-        from launcher.ui.dialogs.shutdown import show_spot_stop_dialog
-        show_spot_stop_dialog(self, name, positions)
-
-    def _async_close_and_stop_spot(self, name, update):
-        from launcher.core.bot_controller import async_close_and_stop_spot
-        async_close_and_stop_spot(self, name, update)
-
     def _async_simple_stop(self, name, card, update):
         from launcher.core.bot_controller import async_simple_stop
         async_simple_stop(self, name, card, update)
@@ -2785,33 +2773,13 @@ class ObsidianApp(ctk.CTk):
         from launcher.core.bot_controller import open_positions_for_stop
         return open_positions_for_stop(bot_name)
 
-    def _refresh_positions_with_live_prices(self, positions):
-        from launcher.core.positions import refresh_positions_with_live_prices
-        return refresh_positions_with_live_prices(positions)
-
-    def _show_futures_stop_dialog(self, name, positions):
-        from launcher.ui.dialogs.shutdown import show_futures_stop_dialog
-        show_futures_stop_dialog(self, name, positions)
-
     def _emergency_close_futures_and_stop(self, name):
         from launcher.ui.dialogs.shutdown import emergency_close_futures_and_stop
         emergency_close_futures_and_stop(self, name)
 
-    def _async_close_and_stop(self, name, card, update):
-        from launcher.core.bot_controller import async_close_and_stop_futures
-        async_close_and_stop_futures(self, name, card, update)
-
-    def _show_busy_dialog(self, title, intro, worker, **worker_kwargs):
-        from launcher.ui.dialogs.shutdown import show_busy_dialog
-        show_busy_dialog(self, title, intro, worker, **worker_kwargs)
-
     def _restart_bot(self, name):
         from launcher.core.bot_controller import restart_bot
         restart_bot(self, name)
-
-    def _config_changed_since_start(self, name):
-        from launcher.core.bot_controller import config_changed_since_start
-        return config_changed_since_start(self, name)
 
     def _config_restart_required_reason(self, name):
         from launcher.core.bot_controller import config_restart_required_reason
@@ -2832,10 +2800,6 @@ class ObsidianApp(ctk.CTk):
     def _open_heatmap_dialog(self):
         from launcher.ui.dialogs.tools import open_heatmap_dialog
         open_heatmap_dialog(self)
-
-    def _run_tool_dialog(self, title, tool_name, description):
-        from launcher.ui.dialogs.tools import run_tool_dialog
-        run_tool_dialog(self, title, tool_name, description)
 
     def _ensure_prompt_files_exist(self):
         """
@@ -5699,7 +5663,3 @@ class ObsidianApp(ctk.CTk):
     def _show_quit_with_positions_dialog(self, open_summary):
         from launcher.ui.dialogs.shutdown import show_quit_with_positions_dialog
         show_quit_with_positions_dialog(self, open_summary)
-
-    def _async_stop_all_and_quit(self, update, close_positions):
-        from launcher.ui.dialogs.shutdown import async_stop_all_and_quit
-        async_stop_all_and_quit(self, update, close_positions)

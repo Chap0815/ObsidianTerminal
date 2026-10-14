@@ -252,21 +252,6 @@ def safe_geometry(
     return w, h
 
 
-def clamp_offset(
-    win, x: int, y: int, w: int, h: int, margin: int = _SCREEN_MARGIN
-) -> tuple[int, int]:
-    """Clamp physical offsets for a window with logical width/height."""
-    scaling = _window_scaling(win) or 1.0
-    try:
-        phys_sw = win.winfo_screenwidth()
-        phys_sh = win.winfo_screenheight()
-    except Exception:
-        phys_sw, phys_sh = 1920, 1080
-    x = max(0, min(int(x), max(0, int(phys_sw - margin - w * scaling))))
-    y = max(0, min(int(y), max(0, int(phys_sh - margin - h * scaling))))
-    return x, y
-
-
 #  Sparkline (mini PnL trend line in each bot card)
 
 

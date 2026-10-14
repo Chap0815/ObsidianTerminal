@@ -1,56 +1,11 @@
-"""
-base_bot.py  Shared Trading Engine Foundation
+"""Optional base class for custom trading bots.
 
-STATUS NOTE (Phase 2 review):
-    None of main_bot_balanced / _aggressive / _futures currently inherits
-    from BaseBot. They are independent 1500-4000-line modules with ~80%
-    duplicated logic. Migrating all three onto BaseBot would eliminate
-    the duplication and remove an entire category of "bug-fixed once but
-    only in two of three bots" defects. Until that migration happens,
-    this module is kept as a reference for the target architecture  DO
-    NOT delete it.
+The production strategies use their own engines and do not inherit BaseBot.
+This class provides configuration, exchange and state setup, stop evaluation,
+cooldown checks, price fallback, event logging and shutdown handling.
 
-    The Phase-2 patches applied directly to the main bots (UTC cooldown,
-    clientOrderId idempotency, candidate correlation check, kill-switch
-    invocation via the updated is_bot_paused) bring all three bots in
-    line with the safety guarantees this class would provide.
-
-Extracts the common logic from main_bot_balanced.py, main_bot_aggressive.py,
-and main_bot_futures.py into a single reusable base class.
-
-What lives here (shared across all bots):
-  Startup exchange reconciliation
-  Risk check pipeline (paused? bad hour? can_buy_now? max trades?)
-  Order placement with retry and slippage recording
-  Stop-loss / trailing-stop evaluation (shared math)
-  Cooldown management
-  SQLite state via StateManager
-  Event bus integration
-  Shutdown handler
-
-What subclasses override:
-  get_signal(symbol, row)  Signal
-  execute_buy(signal)  Position | None
-  execute_sell(pos, reason) bool
-  calculate_stop_price(pos) float
-  main_loop_body()  runs once per scan cycle
-
-Usage:
-    from trading.base_bot import BaseBot
-    from core.models import PositionType
-
-    class BalancedBot(BaseBot):
-        BOT_NAME     = "TREND"
-        POSITION_TYPE = PositionType.SPOT
-
-        def get_signal(self, symbol, row):
-            ...
-        def execute_buy(self, signal):
-            ...
-
-    bot = BalancedBot(config_path="bot_config.json")
-    bot.run()
-"""
+Subclasses implement signal generation, entry and exit execution, stop-price
+calculation and the scan body."""
 
 from __future__ import annotations
 
@@ -61,8 +16,7 @@ import threading
 import signal
 import atexit
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from core.models import Position, Signal, PositionType
 from core.state_manager import StateManager
@@ -71,22 +25,13 @@ from bot_utils.order_utils import explicit_trade_symbol_matches
 from bot_utils.safe_numeric import safe_positive_float
 
 
-#  Helpers 
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)
-
-def _utcnow_str() -> str:
-    return _utcnow().strftime("%Y-%m-%d %H:%M:%S")
-
-
 # 
 #  BaseBot 
 # 
 
 class BaseBot(ABC):
     """
-    Abstract base class for all trading bots.
+    Optional abstract base class for custom trading bots.
 
     Concrete subclasses must set class attributes:
         BOT_NAME      str           "TREND" / "SPOT" / "FUTURES"
@@ -220,61 +165,6 @@ class BaseBot(ABC):
         )
         return self._state_manager.load()
 
-    #  Risk checks (shared) 
-
-    def _check_risk_pipeline(self,
-                              positions: Dict[str, Position],
-                              candidate_symbol: str = ""
-                              ) -> Tuple[bool, str]:
-        """
-        Run all shared pre-trade risk checks.
-        Returns (allowed, reason).
-        """
-        from trading.risk_manager import is_bot_paused, is_bad_hour
-        from trading.market_filters import can_buy_now
-
-        paused, reason = is_bot_paused(
-            self.BOT_NAME, simulation=self.simulation)
-        if paused:
-            return False, f"Bot paused: {reason}"
-
-        if len(positions) >= self.max_open_trades:
-            return False, f"Max open trades reached ({self.max_open_trades})"
-
-        if is_bad_hour(self.BOT_NAME):
-            # is_bad_hour() entscheidet in LOKALER Zeit (BOT_TIMEZONE)  die
-            # Meldung muss dieselbe Zeitachse zeigen, nicht UTC, sonst wirkt der
-            # angezeigte Wert je nach Zeitzone um Stunden falsch".
-            try:
-                import os as _os
-                from zoneinfo import ZoneInfo as _ZI
-                _tz = _os.getenv("BOT_TIMEZONE", "UTC")
-                _h = datetime.now(_ZI(_tz)).hour
-                _label = f"{_h}:xx {_tz}"
-            except Exception:
-                _label = f"{_utcnow().hour}:xx UTC"
-            return False, f"Bad hour ({_label})"
-
-        open_syms = list(positions.keys())
-        ok, reason = can_buy_now(
-            self._exchange,
-            bot_name=self.BOT_NAME,
-            open_symbols=open_syms,
-            candidate_symbol=candidate_symbol,
-        )
-        if not ok:
-            return False, reason
-
-        return True, "OK"
-
-    def _check_position_size(self, atr_pct: float = 0.0) -> float:
-        """Return the volatility + Kelly adjusted position size."""
-        try:
-            from trading.risk_manager import get_combined_position_size
-            return get_combined_position_size(self.BOT_NAME, atr_pct)
-        except Exception:
-            return float(self.cfg("POSITION_SIZE", self.DEFAULT_POSITION_USDT))
-
     #  Stop-loss evaluation (shared math) 
 
     def evaluate_stops(self, pos: Position, current_price: float,
@@ -290,8 +180,7 @@ class BaseBot(ABC):
           Trailing stop:  price < highest  (1 - trail_pct/100)
             (activates only when profitable  highest > buy)
 
-        This shared implementation ensures TREND and SPOT apply
-        identical stop math.
+        Subclasses can reuse this stop math for spot positions.
         """
         if not current_price or current_price <= 0:
             return None
@@ -313,13 +202,7 @@ class BaseBot(ABC):
 
         return None
 
-    #  Cooldown helpers 
-
-    def _set_cooldown(self, cool: dict, symbol: str, minutes: int) -> None:
-        """Set cooldown via unified UTC helper."""
-        from trading.cooldown_utils import set_cooldown
-        cooldown_path = os.path.join(self.log_dir, "cooldown.json")
-        set_cooldown(cool, symbol, minutes, cooldown_path)
+    #  Cooldown checks
 
     def _is_in_cooldown(self, cool: dict, symbol: str) -> bool:
         """Check cooldown via unified UTC helper."""

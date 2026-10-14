@@ -955,7 +955,6 @@ def _running_bot_processes() -> list[str]:
     except Exception:
         return _running_bot_processes_via_cim()
     current = os.getpid()
-    root_text = str(ROOT).replace("\\", "/").lower()
     from launcher.config.settings import BOT_META
     from core.process_identity import bot_process_scope
     out: list[str] = []
@@ -1324,8 +1323,6 @@ def _running_dashboard_processes() -> list[DashboardTarget]:
     except Exception:
         return _running_dashboard_processes_via_cim()
     current = os.getpid()
-    root_cwd = str(ROOT).replace("\\", "/").lower().rstrip("/")
-    root_command = root_cwd + "/"
     out: list[DashboardTarget] = []
     scan_incomplete = False
     saw_current_pid = False

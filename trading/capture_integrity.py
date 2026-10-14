@@ -7,6 +7,7 @@ import math
 import os
 import sqlite3
 import uuid
+from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from contextlib import nullcontext
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
@@ -77,6 +78,9 @@ L2_COVERAGE_EXCLUDED_FLAGS = frozenset({"stale_exchange_timestamp"})
 L2_STALE_WARNING = "l2_stale_exchange_timestamp_excluded"
 UNIVERSE_CONTRACT = "persisted_point_in_time_dynamic"
 SEQUENCE_CONTRACT = "l2_sequence_unverified_snapshot_only"
+AVAILABILITY_CONTRACT_V2 = "bounded_outage_exclusion_v2"
+AVAILABILITY_CONTRACT_V3 = "bounded_outage_exclusion_v3"
+OVERVIEW_NUMERIC_QUARANTINE = "overview_numeric_payload_quarantined"
 
 
 def _capture_now_utc() -> datetime:
@@ -354,7 +358,12 @@ def _availability_summary(
     day: date,
     *,
     connection_epochs: list[int],
+    contract: str = AVAILABILITY_CONTRACT_V2,
 ) -> dict:
+    if type(contract) is not str or contract not in {
+        AVAILABILITY_CONTRACT_V2, AVAILABILITY_CONTRACT_V3,
+    }:
+        raise ValueError("unsupported capture availability contract")
     raw_windows = _merge_gap_windows(gaps, day, buffer=timedelta(0))
     exclusions = _merge_gap_windows(
         gaps,
@@ -402,7 +411,7 @@ def _availability_summary(
     if gaps:
         warnings.append("bounded_capture_outage_excluded")
     return {
-        "contract": "bounded_outage_exclusion_v2",
+        "contract": contract,
         "state": (
             "degraded" if gaps or transport_changed else "complete"
         ),
@@ -863,6 +872,7 @@ def _partition_rows(
         dict[str, list[tuple[datetime, datetime]]] | None
     ) = None,
     maximum_gap: timedelta | None = None,
+    quarantine_numeric_overview: bool = False,
 ) -> tuple[dict, dict]:
     if _linklike(path):
         raise ValueError(f"{stream} partition is linked")
@@ -883,6 +893,7 @@ def _partition_rows(
     try:
         connection.row_factory = sqlite3.Row
         overview_rows = []
+        overview_quarantined_times = set()
         connection_epochs = set()
         warnings = set()
         event_count = 0
@@ -1142,12 +1153,33 @@ def _partition_rows(
                     warnings.add("rest_trade_window_saturated")
             disqualifying = set(flags) - allowed
             if disqualifying:
-                raise ValueError(
-                    f"{stream} disqualifying flags={sorted(disqualifying)} "
-                    f"market={_event_diagnostic(row['market_id'])} "
-                    f"exchange_time={_event_diagnostic(row['exchange_time'])} "
-                    f"event_id={_event_diagnostic(row['event_id'])}"
+                if not (
+                    quarantine_numeric_overview
+                    and stream == "overview"
+                    and disqualifying == {"invalid_numeric_payload"}
+                ):
+                    raise ValueError(
+                        f"{stream} disqualifying flags={sorted(disqualifying)} "
+                        f"market={_event_diagnostic(row['market_id'])} "
+                        f"exchange_time={_event_diagnostic(row['exchange_time'])} "
+                        f"event_id={_event_diagnostic(row['event_id'])}"
+                    )
+                # Only numerical defects are eligible. The immutable row still
+                # has to prove its identity, UTC clock, schema, request receipt
+                # and point-in-time universe before its whole window is excluded.
+                day_start, day_end = _day_bounds(day)
+                if row["market_id"] != "ALL_USDT_SWAPS":
+                    raise ValueError("overview quarantine aggregate identity is invalid")
+                if not day_start <= received_time < day_end:
+                    raise ValueError("overview quarantine receipt escaped UTC day")
+                _, identity_issues, _ = _membership_intervals(
+                    [{"received_time": received_time, "payload": payload}], day,
                 )
+                if identity_issues:
+                    raise ValueError("overview quarantine universe identity is invalid")
+                overview_quarantined_times.add(received_time)
+                warnings.add(OVERVIEW_NUMERIC_QUARANTINE)
+                continue
             if stream == "depth":
                 _validate_book_payload(payload, "depth")
             elif (
@@ -1382,6 +1414,7 @@ def _partition_rows(
         raise RuntimeError("capture artifact changed during validation")
     return final_manifest, {
         "overview": overview_rows,
+        "overview_quarantined_times": sorted(overview_quarantined_times),
         "websocket_trade_events": websocket_trade_events,
         "connection_epochs": sorted(connection_epochs),
         "coverage_gaps": coverage_gaps,
@@ -1503,6 +1536,30 @@ def _membership_intervals(
     return dict(intervals), sorted(set(issues)), gaps
 
 
+def _numeric_overview_gaps(
+    overview: list[dict], quarantined: list[datetime], day: date,
+) -> list[dict]:
+    """Exclude from the last proven snapshot to the next proven snapshot.
+
+    Neither the defective snapshot nor its unknown membership transition is
+    used. The common availability builder adds the normal two-minute buffer
+    and enforces the same per-episode and per-day budgets on these windows.
+    """
+    day_start, day_end = _day_bounds(day)
+    valid_times = sorted({row["received_time"] for row in overview})
+    gaps = []
+    for timestamp in quarantined:
+        left = bisect_left(valid_times, timestamp) - 1
+        right = bisect_right(valid_times, timestamp)
+        started = valid_times[left] if left >= 0 else day_start
+        ended = valid_times[right] if right < len(valid_times) else day_end
+        gaps.append(_gap_record(
+            "overview", "ALL_USDT_SWAPS", OVERVIEW_NUMERIC_QUARANTINE,
+            max(day_start, started), min(day_end, ended),
+        ))
+    return gaps
+
+
 def _coverage_gaps(
     by_market: dict[str, list[datetime]],
     intervals: dict[str, list[tuple[datetime, datetime]]],
@@ -1548,10 +1605,15 @@ def validate_capture_day(
     max_symbols: int,
     micro_interval_seconds: float,
     l2_sample_interval_seconds: float,
+    availability_contract: str = AVAILABILITY_CONTRACT_V3,
 ) -> dict:
     """Validate one closed UTC day while retaining only bounded index fields."""
     if type(day) is not date:
         raise ValueError("capture day must be a date")
+    if type(availability_contract) is not str or availability_contract not in {
+        AVAILABILITY_CONTRACT_V2, AVAILABILITY_CONTRACT_V3,
+    }:
+        raise ValueError("unsupported capture availability contract")
     rest_gap, l2_gap = _capture_policy_gaps(
         max_symbols=max_symbols,
         micro_interval_seconds=micro_interval_seconds,
@@ -1595,6 +1657,9 @@ def validate_capture_day(
                     intervals if coverage_gap is not None else None
                 ),
                 maximum_gap=coverage_gap,
+                quarantine_numeric_overview=(
+                    availability_contract == AVAILABILITY_CONTRACT_V3
+                ),
             )
         except (OSError, sqlite3.Error, ValueError) as exc:
             issues.append(f"{stream}:{type(exc).__name__}:{str(exc)[:400]}")
@@ -1622,11 +1687,17 @@ def validate_capture_day(
         manifest.append(entry)
         stream_data[stream] = data
         if stream == "overview":
-            intervals, overview_issues, overview_gaps = _membership_intervals(
-                data["overview"], day
-            )
-            issues.extend(overview_issues)
-            availability_gaps.extend(overview_gaps)
+            if data["overview"]:
+                intervals, overview_issues, overview_gaps = _membership_intervals(
+                    data["overview"], day
+                )
+                issues.extend(overview_issues)
+                availability_gaps.extend(overview_gaps)
+            else:
+                issues.append("overview_no_usable_rows")
+            availability_gaps.extend(_numeric_overview_gaps(
+                data["overview"], data["overview_quarantined_times"], day,
+            ))
         elif stream in {"depth", "l2_stream"}:
             availability_gaps.extend(
                 data.get("coverage_gaps", [])
@@ -1654,6 +1725,7 @@ def validate_capture_day(
         availability_gaps,
         day,
         connection_epochs=sorted(observed_epochs),
+        contract=availability_contract,
     )
     if not availability["within_daily_budget"]:
         issues.append("availability_daily_budget_exceeded")
@@ -1775,6 +1847,8 @@ def _verify_sealed_report(
     if report.get("day") != expected_day_text:
         raise RuntimeError("sealed capture report day does not match seal path")
     status = report.get("status")
+    numeric_quarantine_excluded = False
+    numeric_quarantine_contract = False
     if status not in {"valid", "usable_with_gaps", "invalid"}:
         raise RuntimeError("sealed capture report status is invalid")
     if status in {"valid", "usable_with_gaps"} and set(report) != {
@@ -1801,6 +1875,9 @@ def _verify_sealed_report(
         )
         legacy_availability = (
             availability_contract == "bounded_outage_exclusion_v1"
+        )
+        numeric_quarantine_contract = (
+            availability_contract == AVAILABILITY_CONTRACT_V3
         )
         availability_fields = {
             "contract",
@@ -1829,6 +1906,7 @@ def _verify_sealed_report(
             or availability_contract not in {
                 "bounded_outage_exclusion_v1",
                 "bounded_outage_exclusion_v2",
+                AVAILABILITY_CONTRACT_V3,
             }
             or availability.get("state") != expected_availability_state
             or availability.get("within_daily_budget") is not True
@@ -1929,6 +2007,14 @@ def _verify_sealed_report(
                         )
                 previous_end = ended
                 total_excluded_seconds += raw_duration
+                if OVERVIEW_NUMERIC_QUARANTINE in interval["reasons"]:
+                    if (
+                        not numeric_quarantine_contract
+                        or "overview" not in interval["streams"]
+                        or "ALL_USDT_SWAPS" not in interval["markets"]
+                    ):
+                        raise ValueError("numeric quarantine provenance is invalid")
+                    numeric_quarantine_excluded = True
             excluded_seconds = availability.get("excluded_seconds")
             if (
                 type(excluded_seconds) not in {int, float}
@@ -2122,6 +2208,10 @@ def _verify_sealed_report(
             allowed_warnings = {
                 "trades": {"rest_trade_window_saturated"},
                 "l2_stream": {L2_STALE_WARNING},
+                "overview": (
+                    {OVERVIEW_NUMERIC_QUARANTINE}
+                    if numeric_quarantine_contract else set()
+                ),
             }.get(stream, set())
             warnings = item.get("warnings")
             if (
@@ -2136,6 +2226,11 @@ def _verify_sealed_report(
                 raise RuntimeError(
                     "sealed capture manifest warnings are invalid"
                 )
+            if stream == "overview" and (
+                (OVERVIEW_NUMERIC_QUARANTINE in warnings)
+                != numeric_quarantine_excluded
+            ):
+                raise RuntimeError("sealed numeric quarantine provenance is invalid")
         reported_bytes = item.get("bytes")
         if type(reported_bytes) is not int or reported_bytes < 0:
             raise RuntimeError("sealed capture manifest byte length is invalid")

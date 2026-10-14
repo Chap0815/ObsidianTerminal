@@ -3,8 +3,7 @@ REM ================================================================
 REM   OBSIDIAN TRADING TERMINAL - Launcher starten (ohne Konsole)
 REM ================================================================
 REM Doppelklick startet den crash-sicheren Launcher-Supervisor mit pythonw.exe.
-REM Es erscheint kein schwarzes Konsolenfenster. Diese .bat schliesst
-REM sich nach dem Start sofort selbst.
+REM Diese .bat schliesst sich nach dem Start sofort selbst.
 
 cd /d "%~dp0"
 set PYTHONPATH=

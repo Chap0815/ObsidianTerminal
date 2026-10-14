@@ -1,15 +1,5 @@
 """
-bot_utils/indicators.py  Native, dependency-free technical indicators.
-
-WARUM nativ statt pandas_ta:
-  pandas-ta 0.3.14b0 wurde von PyPI ENTFERNT. Die einzige verbleibende
-  Version (0.4.71b0) zieht numpy 2.x + pandas 3.0 + numba nach  pandas 3.0
-  bringt Breaking Changes, gegen die der restliche Bot nicht getestet ist.
-  Eine externe Lib, die jederzeit von PyPI verschwinden kann, ist fuer einen
-  Trading-Bot eine echte Schwachstelle.
-
-Diese vier Funktionen decken ALLES ab, was Screener + Backtester brauchen,
-in reinem pandas (vektorisiert, schnell, numpy-1.x UND 2.x, pandas-2 UND 3).
+bot_utils/indicators.py  Technical indicators implemented with pandas/numpy.
 
 FIDELITAET:
   rsi  rekursive Wilder-RMA mit expliziter Zero-loss-Behandlung
@@ -23,8 +13,7 @@ FIDELITAET:
     von pandas_ta ist ``MACDs`` (Signallinie), NICHT das Histogramm. Die
     Variable hiess zwar "macd_hist", gefiltert wurde aber stets auf der
     Signallinie. Wir replizieren das 1:1, um das (validierte) Live-Verhalten
-    NICHT zu aendern. ``macd_hist()`` steht separat bereit, falls spaeter auf
-    das echte Histogramm umgestellt werden soll.
+    NICHT zu aendern.
 """
 from __future__ import annotations
 
@@ -77,17 +66,6 @@ def macd_signal(close: pd.Series, fast: int = 12, slow: int = 26,
     """
     _, sig = _macd_lines(close, fast, slow, signal)
     return sig
-
-
-def macd_hist(close: pd.Series, fast: int = 12, slow: int = 26,
-              signal: int = 9) -> pd.Series:
-    """True MACD histogram (MACD - signal).
-
-    Currently not used by the screener; kept for a future migration away from
-    the legacy signal-line behavior.
-    """
-    macd_line, sig = _macd_lines(close, fast, slow, signal)
-    return macd_line - sig
 
 
 def atr(high: pd.Series, low: pd.Series, close: pd.Series,

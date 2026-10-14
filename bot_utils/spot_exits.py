@@ -1098,10 +1098,6 @@ def spot_recovery_terminal_disposition(order: dict) -> str:
     return "unresolved"
 
 
-def spot_recovery_is_terminal_zero_fill(order: dict) -> bool:
-    return spot_recovery_terminal_disposition(order) == "zero"
-
-
 def _validate_explicit_spot_identity_fields(
     order: dict,
     *,

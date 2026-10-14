@@ -1728,9 +1728,6 @@ live_total = (
     float(live_trades["profit_usdt"].sum()) if not live_trades.empty else 0.0
 )
 sim_total = float(sim_trades["profit_usdt"].sum()) if not sim_trades.empty else 0.0
-live_n = len(live_trades)
-sim_n = len(sim_trades)
-legacy_n = len(legacy_trades)
 metrics = compute_metrics(live_trades, trades_raw)
 total = metrics.get("total", 0)
 n_tr = metrics.get("trades", 0)
@@ -1749,7 +1746,6 @@ else:
     today_live = today_trades
 today_pnl = today_live["profit_usdt"].sum() if not today_live.empty else 0.0
 today_positions = _positions_for_view(today_live, trades_raw)
-today_count = len(today_positions)
 
 # Open positions count (spot + futures)
 open_spot_all = load_open_spot_trades() if needs_position_sources else []
@@ -1767,7 +1763,6 @@ open_spot_active_all = [
     if not (t.get("state_is_stale") or t.get("state_error"))
 ]
 open_spot_live = [t for t in open_spot_active_all if t.get("mode", "SIM") == "LIVE"]
-open_spot_sim = [t for t in open_spot_active_all if t.get("mode", "SIM") == "SIM"]
 open_fut_all = load_futures_live() if needs_position_sources else pd.DataFrame()
 if not open_fut_all.empty:
     _overview_fut_col = (
@@ -1837,13 +1832,6 @@ legacy_money = pnl_snapshot["modes"]["LEGACY"]
 stale_live_futures = 0
 if not open_fut_stale_all.empty and "mode" in open_fut_stale_all.columns:
     stale_live_futures = int((open_fut_stale_all["mode"] == "LIVE").sum())
-stale_live_spot = int(
-    sum(
-        1
-        for row in open_spot_stale_all
-        if str(row.get("mode", "SIM")).upper() == "LIVE"
-    )
-)
 live_total = live_money["realized"]
 sim_total = sim_money["realized"]
 total_unreal = live_money["unrealized"]

@@ -1650,6 +1650,7 @@ def _verified_carry_capture_scope(venue_root: Path) -> dict | None:
                 or availability.get("contract") not in {
                     "bounded_outage_exclusion_v1",
                     "bounded_outage_exclusion_v2",
+                    "bounded_outage_exclusion_v3",
                 }
                 or availability.get("within_daily_budget") is not True
                 or not isinstance(

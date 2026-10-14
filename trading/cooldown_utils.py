@@ -913,7 +913,7 @@ def _fsync_cooldown_directory(path: Path) -> None:
         directory_fd = os.open(str(path), flags)
     except AttributeError:
         return
-    except OSError as exc:
+    except OSError:
         raise
     primary_error: BaseException | None = None
     try:
