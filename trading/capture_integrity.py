@@ -13,6 +13,7 @@ from contextlib import nullcontext
 from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from pathlib import Path
 
+from sqlite_safety import harden_sqlite_connection
 from trading.capture_trade_identity import (
     read_trade_identity,
     validate_trade_identity_schema,
@@ -884,11 +885,11 @@ def _partition_rows(
             raise ValueError(f"{stream} partition has active {suffix[1:]} data")
     relative_path = f"{stream}/{path.name}"
     initial_manifest = _manifest_file(path, relative_path)
-    connection = sqlite3.connect(
+    connection = harden_sqlite_connection(sqlite3.connect(
         f"file:{path.as_posix()}?mode=ro&immutable=1",
         uri=True,
         timeout=30.0,
-    )
+    ))
     primary_error: BaseException | None = None
     try:
         connection.row_factory = sqlite3.Row

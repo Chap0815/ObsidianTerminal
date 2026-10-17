@@ -21,7 +21,7 @@ import time
 
 from bot_utils.config import _read_config_json, parse_explicit_bool
 from bot_utils.runtime_threads import thread_definitely_never_started
-from launcher.config.settings import BOT_META, BOT_ORDER, CONFIG_FILE
+from launcher.config.settings import BOT_META, BOT_ORDER, CONFIG_FILE, PROJECT_ROOT
 from launcher.core.runtime_status_values import (
     finite_float_or_none,
     positive_int_or_zero,
@@ -48,6 +48,11 @@ from launcher.core.metrics_service import (
 from launcher.core.system_monitor import get_system_stats
 
 _RUNTIME_MODE_MAX_AGE_SEC = 180.0
+# Conservative UI evidence caps matching FuturesBot's default health windows:
+# private reconciliation 2 * 300 + 15 seconds; delivered ticker 30 seconds.
+# A status payload may shorten these windows, never extend them arbitrarily.
+_PRIVATE_API_EVIDENCE_MAX_AGE_SEC = 615.0
+_PUBLIC_DATA_EVIDENCE_MAX_AGE_SEC = 30.0
 _TRADE_METRICS_REFRESH_SEC = 5.0
 _RUNTIME_STATUS_UNSET = object()
 
@@ -107,6 +112,112 @@ def _runtime_status_is_fresh(rs: dict, *, now: float | None = None) -> bool:
         age = time.time() - wall_ts
         return -5.0 <= age <= _RUNTIME_MODE_MAX_AGE_SEC
     return False
+
+
+def _runtime_connection_status(statuses: dict, fallback: dict) -> tuple[dict, dict]:
+    """Project acknowledged runtime evidence; never infer trading permission."""
+    from core.process_identity import pid_matches_bot
+
+    now = time.monotonic()
+    verified = []
+    for bot in BOT_ORDER:
+        rs = statuses.get(bot, {})
+        if not isinstance(rs, dict) or rs.get("bot") != bot:
+            continue
+        build = rs.get("build_id")
+        mono = finite_float_or_none(rs.get("monotonic_ts"))
+        age = now - mono if mono is not None else None
+        if (not isinstance(build, str) or len(build) != 16
+                or any(ch not in "0123456789abcdef" for ch in build.lower())
+                or age is None or not -5.0 <= age <= 45.0
+                or not _runtime_status_is_fresh(rs)):
+            continue
+        try:
+            if not pid_matches_bot(positive_int_or_zero(rs.get("pid")), bot):
+                continue
+        except Exception:
+            continue
+        verified.append((rs, mono))
+
+    summary = {
+        "verified": len(verified),
+        "degraded": sum(str(rs.get("status")).lower() == "degraded"
+                        for rs, _mono in verified),
+        "unverified": len(BOT_ORDER) - len(verified),
+    }
+    private_states = []
+    public_states = []
+    private_ages = []
+    public_ages = []
+    for rs, mono in verified:
+        heartbeat_age = max(0.0, now - mono)
+        health = rs.get("private_api_health")
+        if rs.get("simulation") is False and isinstance(health, dict) and health:
+            checked = finite_float_or_none(health.get("checked_monotonic"))
+            limit = finite_float_or_none(health.get("stale_after_seconds"))
+            if limit is not None and not 0.0 < limit <= _PRIVATE_API_EVIDENCE_MAX_AGE_SEC:
+                limit = None
+            age = now - checked if checked is not None else None
+            if health.get("state") == "stale" or (
+                    age is not None and limit is not None and age > limit):
+                private_states.append("stale")
+            elif (health.get("ok") is True
+                  and health.get("state") == "authenticated"
+                  and age is not None and limit is not None
+                  and -5.0 <= age <= limit):
+                private_states.append("authenticated")
+                private_ages.append(max(0.0, age))
+            elif health.get("ok") is False:
+                private_states.append("unavailable")
+            else:
+                private_states.append("unverified")
+        elif rs.get("simulation") is False:
+            private_states.append("unverified")
+        ticker = rs.get("ticker_health")
+        if isinstance(ticker, dict) and ticker:
+            age = finite_float_or_none(ticker.get("ticker_success_age_seconds"))
+            limit = finite_float_or_none(ticker.get("success_stale_after_seconds"))
+            if limit is not None and not 0.0 < limit <= _PUBLIC_DATA_EVIDENCE_MAX_AGE_SEC:
+                limit = None
+            if ticker.get("ok") is False:
+                public_states.append("unavailable")
+            elif (ticker.get("ok") is True and age is not None
+                  and limit is not None and 0.0 <= age
+                  and age + heartbeat_age <= limit):
+                public_states.append("fresh")
+                public_ages.append(age + heartbeat_age)
+            else:
+                public_states.append("unverified")
+
+    def aggregate(states, success):
+        for state in ("unavailable", "stale", "unverified"):
+            if state in states:
+                return state
+        return success if states else "unverified"
+
+    private = aggregate(private_states, "authenticated")
+    public = aggregate(public_states, "fresh")
+    private_detail = private + (f" ({int(max(private_ages))}s)"
+                               if private == "authenticated" else "")
+    public_detail = public + (f" ({int(max(public_ages))}s)"
+                             if public == "fresh" else "")
+    result = dict(fallback)
+    result.update({
+        "private": private,
+        "public": public,
+        "details": (f"Public data: {public_detail}\nPrivate API: {private_detail}"
+                    "\nTrading: unverified"),
+    })
+    if private_states or public_states:
+        from launcher.core.metrics_service import _exchange_display_name
+
+        label = f"Private {private}" if private_states else f"Public data {public}"
+        result.update({
+            "active": private == "authenticated" and public == "fresh",
+            "unverified": True,
+            "label": f"{_exchange_display_name()}  {label}",
+        })
+    return result, summary
 
 
 def _runtime_or_config_sim(
@@ -409,7 +520,7 @@ class DataPoller:
         self._spot_exchange = None  # cached connection for unrealized fetch
         self._equity_spot_exchange = None
         self._equity_futures_exchange = None
-        self._error_counter   = _ErrorLogCounter("error_log.txt")
+        self._error_counter = _ErrorLogCounter(os.path.join(PROJECT_ROOT, "error_log.txt"))
         initial_state = {
             "done": threading.Event(),
             "start_gate": threading.Event(),
@@ -639,6 +750,9 @@ class DataPoller:
                         value = {}
                     runtime_status[bot] = value if isinstance(value, dict) else {}
                 new_data["runtime_status"] = runtime_status
+                (new_data["exchange"], new_data["runtime_summary"]) = (
+                    _runtime_connection_status(runtime_status, new_data["exchange"])
+                )
                 mode_is_sim = {
                     bot: _runtime_or_config_sim(
                         bot,

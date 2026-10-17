@@ -627,6 +627,7 @@ def _finalize_pre_submit_rejection(
             fee_usdt=fee_usdt,
         )
     except Exception as cleanup_error:
+        blocked.intent_finalization_failed = True
         try:
             blocked.add_note(
                 "pre-submit intent finalization failed: "

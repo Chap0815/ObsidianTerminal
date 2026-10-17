@@ -19,6 +19,7 @@ from pathlib import Path
 
 import portalocker
 
+from sqlite_safety import harden_sqlite_connection
 from bot_utils.api_budget import (
     ApiCallReservation,
     record_api_error,
@@ -488,6 +489,7 @@ class SQLitePartitionWriter:
                         self._discard_setup_connection(connection)
                     raise
                 self._setup_connection_candidate = None
+            harden_sqlite_connection(connection, close_on_failure=False)
             journal_mode = connection.execute(
                 "PRAGMA journal_mode"
             ).fetchone()
@@ -1006,6 +1008,7 @@ class SQLitePartitionWriter:
             raise
         self._setup_connection_candidate = None
         try:
+            harden_sqlite_connection(connection, close_on_failure=False)
             journal_mode = connection.execute(
                 "PRAGMA journal_mode=WAL"
             ).fetchone()
@@ -2179,6 +2182,8 @@ class VenueRecorder:
         self._health_callback = health_callback
         self._metadata_refresh_needed = False
         self._metadata_refresh_attempt_at = None
+        self._metadata_observed_unknown_ids: set[str] = set()
+        self._metadata_confirmed_unknown_ids: set[str] = set()
         self._priority_loader = priority_loader
         self._last_priority_symbols: list[str] = []
         self._universe: list[str] = []
@@ -2628,6 +2633,44 @@ class VenueRecorder:
             )
         return path
 
+    @staticmethod
+    def _metadata_index_consistent(markets, markets_by_id) -> bool:
+        if type(markets) is not dict or not markets or type(markets_by_id) is not dict:
+            return False
+        # CCXT stores raw rows in markets_by_id but adds default fee/limit
+        # fields to markets. Compare identities and explicit contract facts,
+        # rather than requiring those differently normalized rows to be equal.
+        identity_fields = (
+            "id", "symbol", "base", "quote", "settle", "type", "spot",
+            "swap", "future", "contract", "linear", "inverse", "active",
+            "contractSize",
+        )
+
+        def identity(row):
+            return tuple((type(row.get(key)), row.get(key)) for key in identity_fields)
+
+        expected = {}
+        for row in markets.values():
+            if type(row) is not dict or not SQLitePartitionWriter._valid_text(
+                row.get("id"), max_chars=256
+            ):
+                return False
+            expected.setdefault(row["id"], []).append(identity(row))
+        if set(expected) != set(markets_by_id):
+            return False
+        for market_id, rows in markets_by_id.items():
+            if type(rows) is not list or len(rows) != len(expected[market_id]):
+                return False
+            remaining = list(expected[market_id])
+            for row in rows:
+                if type(row) is not dict:
+                    return False
+                try:
+                    remaining.remove(identity(row))
+                except ValueError:
+                    return False
+        return True
+
     def _refresh_missing_market_metadata(self) -> None:
         """Re-read authoritative metadata, without inventing unknown markets.
 
@@ -2642,6 +2685,7 @@ class VenueRecorder:
         if last is not None and now - last < self.METADATA_REFRESH_INTERVAL_SEC:
             return
         self._metadata_refresh_attempt_at = now
+        self._metadata_confirmed_unknown_ids = set()
         loader = getattr(self.exchange, "load_markets", None)
         if not callable(loader):
             return
@@ -2651,6 +2695,14 @@ class VenueRecorder:
             markets = loader(reload=True)
             if not isinstance(markets, dict) or not markets:
                 raise ValueError("market metadata refresh returned no snapshot")
+            if not self._metadata_index_consistent(
+                self._market_mapping(self.exchange),
+                getattr(self.exchange, "markets_by_id", None),
+            ):
+                raise ValueError("market metadata refresh returned inconsistent index")
+            self._metadata_confirmed_unknown_ids = set(
+                self._metadata_observed_unknown_ids
+            )
         except Exception:
             self._record_api_failure(endpoint, reservation)
             raise
@@ -2733,6 +2785,12 @@ class VenueRecorder:
             known_market_ids.add(row["id"])
         unknown_ids = []
         unknown_count = 0
+        inactive_ids = []
+        inactive_count = 0
+        observed_unknown_ids = set()
+        metadata_catalog_consistent = self._metadata_index_consistent(
+            markets, markets_by_id
+        )
 
         def _strict_unknown_raw(symbol, ticker):
             exchange_id = getattr(self.exchange, "id", None)
@@ -2776,6 +2834,40 @@ class VenueRecorder:
                     return False
             return True
 
+        def _unlisted_inactive_ticker(symbol, ticker):
+            if (
+                symbol not in self._metadata_confirmed_unknown_ids
+                or not metadata_catalog_consistent
+            ):
+                return False
+            info = ticker["info"]
+            if not {"last", "bid", "ask", "timestamp", "baseVolume", "quoteVolume"} <= set(ticker):
+                return False
+            if any(key in info for key in ("bid1", "ask1")):
+                return False
+            if any(ticker.get(key) is not None for key in ("last", "bid", "ask")):
+                return False
+            for source, key in (
+                (info, "lastPrice"), (info, "volume24"),
+                (info, "amount24"), (info, "holdVol"),
+                (ticker, "baseVolume"), (ticker, "quoteVolume"),
+            ):
+                if self._finite_number_or_none(source.get(key)) != 0.0:
+                    return False
+            index = self._finite_number_or_none(info.get("indexPrice"))
+            fair = self._finite_number_or_none(info.get("fairPrice"))
+            if index is None or index <= 0.0 or fair != index:
+                return False
+            timestamp = self._finite_number_or_none(info.get("timestamp"))
+            if (
+                timestamp is None or not timestamp.is_integer()
+                or self._finite_number_or_none(ticker.get("timestamp")) != timestamp
+                or timestamp > ended + MAX_EXCHANGE_FUTURE_SKEW_MS
+                or timestamp < ended - max(30.0, self.overview_interval * 2.5) * 1000
+            ):
+                return False
+            return True
+
         for symbol, ticker in ticker_rows:
             if not SQLitePartitionWriter._valid_text(symbol, max_chars=256):
                 invalid_ticker_identity = True
@@ -2803,6 +2895,12 @@ class VenueRecorder:
                 raw_market = None
             if not isinstance(raw_market, dict):
                 if _strict_unknown_raw(symbol, ticker):
+                    observed_unknown_ids.add(symbol)
+                    if _unlisted_inactive_ticker(symbol, ticker):
+                        inactive_count += 1
+                        if len(inactive_ids) < 16:
+                            inactive_ids.append(symbol)
+                        continue
                     unknown_count += 1
                     if len(unknown_ids) < 16:
                         unknown_ids.append(symbol)
@@ -3002,6 +3100,8 @@ class VenueRecorder:
             ),
             "unknown_market_count": unknown_count,
             "unknown_market_ids": unknown_ids,
+            "unlisted_inactive_ticker_count": inactive_count,
+            "unlisted_inactive_ticker_ids": inactive_ids,
             "coverage_flags": ["unknown_market_metadata"] if unknown_count else [],
         }
         self._write_event(
@@ -3019,7 +3119,9 @@ class VenueRecorder:
             event_universe=next_universe,
         )
         # Publish refresh demand only after the coverage observation is durable.
-        self._metadata_refresh_needed = bool(unknown_count)
+        self._metadata_refresh_needed = bool(observed_unknown_ids)
+        self._metadata_observed_unknown_ids = observed_unknown_ids
+        self._metadata_confirmed_unknown_ids.intersection_update(observed_unknown_ids)
         self._last_priority_symbols = list(priority_universe)
         self._universe = next_universe
         return len(candidates)

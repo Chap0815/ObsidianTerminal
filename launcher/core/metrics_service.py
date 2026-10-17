@@ -28,6 +28,7 @@ from pathlib import Path
 
 import requests as _req
 
+from sqlite_safety import harden_sqlite_connection
 from bot_utils.config import _read_config_json
 from core.constants import MARKET_REGIME_EVIDENCE_MAX_AGE_SECONDS
 from bot_utils.order_utils import explicit_trade_symbol_matches
@@ -140,11 +141,11 @@ def query_db(sql: str, params: tuple = ()) -> list:
     primary_error: BaseException | None = None
     try:
         uri_path = Path(DB_PATH).resolve().as_uri()
-        conn = sqlite3.connect(
+        conn = harden_sqlite_connection(sqlite3.connect(
             f"{uri_path}?mode=ro",
             uri=True,
             timeout=20.0,
-        )
+        ))
         conn.execute("PRAGMA busy_timeout=20000")
         conn.execute("PRAGMA query_only=ON")
         return conn.execute(sql, params).fetchall()
@@ -167,11 +168,11 @@ def query_db_dict(sql: str, params: tuple = ()) -> list[dict]:
     primary_error: BaseException | None = None
     try:
         uri_path = Path(DB_PATH).resolve().as_uri()
-        conn = sqlite3.connect(
+        conn = harden_sqlite_connection(sqlite3.connect(
             f"{uri_path}?mode=ro",
             uri=True,
             timeout=20.0,
-        )
+        ))
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=20000")
         conn.execute("PRAGMA query_only=ON")
@@ -229,11 +230,11 @@ def _open_metrics_snapshot() -> sqlite3.Connection | None:
     conn = None
     try:
         uri_path = Path(DB_PATH).resolve().as_uri()
-        conn = sqlite3.connect(
+        conn = harden_sqlite_connection(sqlite3.connect(
             f"{uri_path}?mode=ro",
             uri=True,
             timeout=20.0,
-        )
+        ))
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=20000")
         conn.execute("PRAGMA query_only=ON")

@@ -1665,6 +1665,12 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             "unknown_market_ids": bounded_strings(
                 raw_overview.get("unknown_market_ids"), limit=16
             ),
+            "unlisted_inactive_ticker_count": bounded_nonnegative(
+                raw_overview.get("unlisted_inactive_ticker_count")
+            ),
+            "unlisted_inactive_ticker_ids": bounded_strings(
+                raw_overview.get("unlisted_inactive_ticker_ids"), limit=16
+            ),
             "coverage_flags": bounded_strings(raw_overview.get("coverage_flags")),
         }
         rest_ok = report.get("rest_ok") is True

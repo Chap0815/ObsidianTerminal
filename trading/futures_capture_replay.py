@@ -24,6 +24,7 @@ from typing import Iterable
 
 import pandas as pd
 
+from sqlite_safety import harden_sqlite_connection
 from bot_utils.indicators import atr, ema, macd_signal, rsi
 from core.constants import (
     MAX_24H_PUMP_PCT,
@@ -373,11 +374,11 @@ def freeze_replay_dataset(
             source_connection = destination_connection = None
             primary_error: BaseException | None = None
             try:
-                source_connection = sqlite3.connect(
+                source_connection = harden_sqlite_connection(sqlite3.connect(
                     f"file:{path.as_posix()}?mode=ro",
                     uri=True,
-                )
-                destination_connection = sqlite3.connect(target)
+                ))
+                destination_connection = harden_sqlite_connection(sqlite3.connect(target))
                 source_connection.backup(destination_connection)
                 destination_connection.commit()
                 integrity = destination_connection.execute(

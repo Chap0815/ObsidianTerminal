@@ -21,6 +21,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 # DB lives in data/trading_bot.db. core.paths is the single source of truth;
 # runtime directories are created only when a connection is actually opened.
+from sqlite_safety import harden_sqlite_connection
 from core.paths import DB_PATH_STR as DB_PATH, ensure_runtime_dirs
 from core.constants import (
     MARKET_FILTER_CACHE_TTL_SECONDS,
@@ -533,7 +534,7 @@ def get_connection() -> sqlite3.Connection:
     if conn is not None:
         return conn
     ensure_runtime_dirs()
-    conn = sqlite3.connect(DB_PATH, timeout=20.0)
+    conn = harden_sqlite_connection(sqlite3.connect(DB_PATH, timeout=20.0))
     try:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
@@ -652,7 +653,7 @@ def _tight_connection() -> sqlite3.Connection:
     if conn is not None:
         return conn
     ensure_runtime_dirs()
-    conn = sqlite3.connect(DB_PATH, timeout=API_RATE_DB_TIMEOUT_SEC)
+    conn = harden_sqlite_connection(sqlite3.connect(DB_PATH, timeout=API_RATE_DB_TIMEOUT_SEC))
     try:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
@@ -2317,7 +2318,7 @@ def _maintenance_loop() -> None:
         while not _MAINT_STOP_EVENT.wait(wait_seconds):
             conn = None
             try:
-                conn = sqlite3.connect(DB_PATH, timeout=10.0)
+                conn = harden_sqlite_connection(sqlite3.connect(DB_PATH, timeout=10.0))
                 acquired = _try_or_renew_advisory_lease(
                     conn,
                     _MAINTENANCE_LOCK_NAME,
@@ -2345,7 +2346,7 @@ def _maintenance_loop() -> None:
         if lease_held:
             conn = None
             try:
-                conn = sqlite3.connect(DB_PATH, timeout=2.0)
+                conn = harden_sqlite_connection(sqlite3.connect(DB_PATH, timeout=2.0))
                 if not _release_advisory_lock(
                     conn,
                     _MAINTENANCE_LOCK_NAME,
@@ -2375,7 +2376,7 @@ def _maintenance_cycle() -> None:
     primary_error = None
     try:
         try:
-            conn = sqlite3.connect(DB_PATH, timeout=10.0)
+            conn = harden_sqlite_connection(sqlite3.connect(DB_PATH, timeout=10.0))
         except Exception as exc:
             _log_db_background_failure_preserving(
                 "open DB maintenance connection",
@@ -2528,7 +2529,7 @@ def _gc_api_rate_global() -> None:
     latest_plausible = (now + timedelta(minutes=5)).strftime(
         "%Y-%m-%d %H:%M:%S"
     )
-    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    conn = harden_sqlite_connection(sqlite3.connect(DB_PATH, timeout=10.0))
     primary_error: BaseException | None = None
     try:
         conn.execute(
@@ -2609,7 +2610,7 @@ def _run_maintenance_delete(
     *,
     context: str,
 ) -> None:
-    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    conn = harden_sqlite_connection(sqlite3.connect(DB_PATH, timeout=10.0))
     primary_error: BaseException | None = None
     try:
         conn.execute(statement, params)
@@ -2652,7 +2653,7 @@ def _run_maintenance_delete(
 
 def _gc_market_regime_top_n() -> None:
     """Effizientes DELETE via id-threshold statt NOT IN."""
-    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+    conn = harden_sqlite_connection(sqlite3.connect(DB_PATH, timeout=10.0))
     primary_error: BaseException | None = None
     try:
         row = conn.execute(
@@ -2790,7 +2791,7 @@ def _drain_pending_vacuum_release(*, timeout: float = 2.0) -> bool:
     try:
         budget = max(0.0, float(timeout))
         deadline = _steady_monotonic() + budget
-        conn = sqlite3.connect(DB_PATH, timeout=budget)
+        conn = harden_sqlite_connection(sqlite3.connect(DB_PATH, timeout=budget))
         released = _release_advisory_lock_before_deadline(
             conn,
             _VACUUM_LOCK_NAME,
@@ -2890,7 +2891,7 @@ def _vacuum_worker_loop() -> None:
         )
         if should_consider:
             try:
-                conn = sqlite3.connect(DB_PATH, timeout=30.0)
+                conn = harden_sqlite_connection(sqlite3.connect(DB_PATH, timeout=30.0))
                 have_lock = False
                 keep_cooldown_lock = False
                 holder_id = ""

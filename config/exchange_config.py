@@ -510,7 +510,7 @@ def resync_time_difference(ex) -> bool:
             _LAST_TIME_RESYNC["offset_ms"] = offset_ms
             _log_event(
                 "[exchange] clock-skew self-heal: resynced server-time offset "
-                f"(timeDifference={ex.options.get('timeDifference')}ms)", "WARN")
+                f"(timeDifference={ex.options.get('timeDifference')}ms)", "INFO")
             return True
         except Exception as e:
             _silent("resync_time_difference", e)

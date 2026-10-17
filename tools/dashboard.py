@@ -39,6 +39,7 @@ except UpdateInProgressError as exc:
 
 import streamlit as st
 
+from sqlite_safety import harden_sqlite_connection
 from bot_utils.atomic_publish import atomic_write_bytes
 from bot_utils.config import parse_explicit_bool
 from bot_utils.order_utils import explicit_trade_symbol_matches
@@ -795,7 +796,7 @@ def _ro_connect():
     second connection-local guard against accidental future write statements.
     """
     uri = Path(DB_PATH).resolve().as_uri() + "?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, timeout=20.0)
+    conn = harden_sqlite_connection(sqlite3.connect(uri, uri=True, timeout=20.0))
     try:
         conn.execute("PRAGMA busy_timeout=20000")
         conn.execute("PRAGMA query_only=ON")

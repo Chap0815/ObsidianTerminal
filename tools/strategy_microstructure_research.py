@@ -22,6 +22,7 @@ sys.dont_write_bytecode = True
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from sqlite_safety import harden_sqlite_connection
 from core.constants import MARKET_REGIME_EVIDENCE_MAX_AGE_SECONDS  # noqa: E402
 from trading.exit_evidence import classify_exit_reason  # noqa: E402
 from trading.profit_research_runner import _complete_expectancy_campaign  # noqa: E402
@@ -115,7 +116,7 @@ def _json(value: Any, default: Any) -> Any:
 
 
 def _ro(path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True, timeout=30)
+    conn = harden_sqlite_connection(sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True, timeout=30))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=30000")
     return conn

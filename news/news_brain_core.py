@@ -17,7 +17,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Tuple
 
-import feedparser
 import requests
 from dotenv import load_dotenv
 from news.http_limits import (
@@ -25,6 +24,7 @@ from news.http_limits import (
     read_bounded_response,
     require_success,
 )
+from news.rss_parser import parse_rss_bytes
 from shared_limits import read_bounded_text_file, read_loopback_proxy_port
 
 # Load .env from PROJECT_ROOT explicitly.
@@ -202,7 +202,7 @@ def _fetch_one_feed(url: str):
             stream=True,
         )
         require_success(r)
-        feed = feedparser.parse(read_bounded_response(r))
+        feed = parse_rss_bytes(read_bounded_response(r))
     except Exception:
         with _RSS_CACHE_LOCK:
             # Cache the failure briefly (60s) so we don't hammer a dead feed

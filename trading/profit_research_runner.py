@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Mapping
 
+from sqlite_safety import harden_sqlite_connection
 from core.constants import MARKET_REGIME_EVIDENCE_MAX_AGE_SECONDS
 from trading.carry_sim import CarryEngine, CarryTerms
 from trading.execution_cost_model import (
@@ -171,9 +172,9 @@ def _read_connection(path: Path) -> sqlite3.Connection:
         raise FileNotFoundError(path) from exc
     if not requested.is_file():
         raise FileNotFoundError(requested)
-    conn = sqlite3.connect(
+    conn = harden_sqlite_connection(sqlite3.connect(
         f"file:{requested.as_posix()}?mode=ro", uri=True, timeout=15
-    )
+    ))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=15000")
     return conn
@@ -2369,7 +2370,7 @@ def register_experiment_trial(
         ) from exc
     if not db_path.is_file():
         raise FileNotFoundError(db_path)
-    conn = sqlite3.connect(db_path, timeout=15)
+    conn = harden_sqlite_connection(sqlite3.connect(db_path, timeout=15))
     try:
         conn.execute("PRAGMA busy_timeout=15000")
         if not _table_exists(conn, "experiment_registry"):

@@ -24,6 +24,7 @@ from pathlib import Path
 
 import portalocker
 
+from sqlite_safety import harden_sqlite_connection
 from trading.expectancy_training import (
     CandidateLabel,
     ExpectancyPrediction,
@@ -1756,10 +1757,10 @@ def _carry_history_report(
             exclusions = scoped
         conn = None
         try:
-            conn = sqlite3.connect(
+            conn = harden_sqlite_connection(sqlite3.connect(
                 f"file:{path.as_posix()}?mode=ro&immutable=1",
                 uri=True,
-            )
+            ))
             rows = conn.execute(
                 "SELECT event_id, exchange_time, received_time, payload_json "
                 "FROM venue_events "

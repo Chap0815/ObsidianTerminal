@@ -169,6 +169,7 @@ class _RuntimeShutdownFinalizationState:
         self.exchange_closed = False
         self.last_status_signature: tuple[object, ...] | None = None
         self.last_status_written_at = 0.0
+        self.timeout_reported = False
 
 
 def _shutdown_finalization_state(owner) -> _RuntimeShutdownFinalizationState:
@@ -199,6 +200,18 @@ def _report_shutdown_error(owner, context: str, exc: Exception) -> None:
         silent_log(context, exc)
     except Exception:
         pass
+
+
+def _report_shutdown_timeout(owner, state, timeout: float) -> None:
+    with state.lock:
+        if state.complete or state.timeout_reported:
+            return
+        state.timeout_reported = True
+    _report_shutdown_error(
+        owner,
+        "Runtime shutdown retry",
+        TimeoutError(f"shutdown did not converge within {timeout:.2f}s"),
+    )
 
 
 @contextmanager
@@ -239,12 +252,8 @@ def _close_exchange_for_shutdown(
     if exchange is None:
         return True
     if not allowed or getattr(owner, "_emergency_in_progress", False):
-        if report_errors:
-            _report_shutdown_error(
-                owner,
-                "Exchange shutdown",
-                RuntimeError("runtime worker is still using the exchange"),
-            )
+        # A live worker defers teardown; the finalizer reports WARN until
+        # convergence or the existing retry deadline, never closes beneath it.
         return False
     terminal = (
         getattr(owner, "_emergency_closed", False) is True
@@ -272,7 +281,7 @@ def _close_exchange_for_shutdown(
             _report_shutdown_error(owner, "Exchange shutdown", exc)
         return False
     if result is not None and result is not True:
-        if report_errors:
+        if report_errors and result is not False:
             _report_shutdown_error(
                 owner,
                 "Exchange shutdown",
@@ -316,7 +325,6 @@ def _schedule_shutdown_finalization_retry(
         def retry_until_terminal() -> None:
             deadline = time.monotonic() + timeout
             converged = False
-            timeout_reported = False
             try:
                 while True:
                     time.sleep(interval)
@@ -337,16 +345,7 @@ def _schedule_shutdown_finalization_retry(
                         completed_elsewhere = state.complete
                     if completed_elsewhere:
                         return
-                    if not timeout_reported:
-                        timeout_reported = True
-                        _report_shutdown_error(
-                            owner,
-                            "Runtime shutdown retry",
-                            TimeoutError(
-                                "shutdown did not converge within "
-                                f"{timeout:.2f}s"
-                            ),
-                        )
+                    _report_shutdown_timeout(owner, state, timeout)
                     emergency_closed = (
                         getattr(owner, "_emergency_closed", False) is True
                     )
@@ -438,7 +437,8 @@ def wait_for_runtime_shutdown(
     Only resource/status failures may exhaust the bounded retry budget.
     """
     interval = max(0.01, float(_SHUTDOWN_RETRY_INTERVAL_SEC))
-    deadline = time.monotonic() + max(interval, float(_SHUTDOWN_RETRY_TIMEOUT_SEC))
+    timeout = max(interval, float(_SHUTDOWN_RETRY_TIMEOUT_SEC))
+    deadline = time.monotonic() + timeout
     first_pass = True
     pause_before_retry = False
     interrupt_pending = False
@@ -465,6 +465,9 @@ def wait_for_runtime_shutdown(
             ):
                 return True
             if time.monotonic() >= deadline:
+                _report_shutdown_timeout(
+                    owner, _shutdown_finalization_state(owner), timeout,
+                )
                 with _shutdown_transition_gate(owner):
                     threads = owner._runtime_threads()
                     closed = getattr(owner, "_emergency_closed", False) is True
@@ -660,7 +663,9 @@ def finalize_runtime_shutdown(
                 confirmed = result is None or result is True
                 resources[name] = confirmed
                 if not confirmed:
-                    if not _quiet:
+                    # Explicit False is a pending, retryable close. Invalid
+                    # acknowledgements and exceptions remain immediate errors.
+                    if not _quiet and result is not False:
                         _report_shutdown_error(
                             owner,
                             f"{name} shutdown",
