@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
+from sqlite_safety import harden_sqlite_connection
 from core.constants import SIM_CAPTURE_CONTRACT_SCHEMA
 from trading.execution_cost_model import (
     ExecutionCostObservation,
@@ -199,7 +200,7 @@ def _read_connection(path: Path) -> sqlite3.Connection:
     if not requested.is_file():
         raise FileNotFoundError(requested)
     resolved = requested.resolve(strict=True)
-    connection = sqlite3.connect(f"file:{resolved.as_posix()}?mode=ro", uri=True)
+    connection = harden_sqlite_connection(sqlite3.connect(f"file:{resolved.as_posix()}?mode=ro", uri=True))
     try:
         connection.row_factory = sqlite3.Row
     except BaseException as setup_error:

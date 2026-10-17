@@ -3734,15 +3734,41 @@ class CrossBot(FuturesBot):
                     e, FuturesOrderNotSubmitted)
                 _outcome_unknown = isinstance(
                     e, FuturesOrderOutcomeUnknown)
+                from bot_utils.futures_order import FuturesOpeningRestricted
+
+                if isinstance(e, FuturesOpeningRestricted):
+                    try:
+                        from core.database import add_to_blacklist
+
+                        add_to_blacklist(
+                            base, self.BOT_NAME, 0.0, hours=24,
+                            reason=str(e),
+                        )
+                    except Exception as restriction_error:
+                        try:
+                            self._log_error(
+                                f"cross opening restriction persistence {base}",
+                                restriction_error,
+                            )
+                        except Exception:
+                            pass
                 emit_entry_lifecycle(
                     entry_id, bot=self.BOT_NAME, symbol=base,
                     stage="order_failed", mode=entry_mode,
                     reason=type(e).__name__, direction=side)
                 log_event(f"[{self.BOT_NAME}] {base}: open failed ({e})", "WARN")
-                try:
-                    self._log_error(f"cross open {base}", e)
-                except Exception:
-                    pass
+                if (
+                    not _not_submitted
+                    or getattr(e, "intent_finalization_failed", False)
+                    or (
+                        e.__cause__ is not None
+                        and not isinstance(e, FuturesOpeningRestricted)
+                    )
+                ):
+                    try:
+                        self._log_error(f"cross open {base}", e)
+                    except Exception:
+                        pass
                 if _not_submitted:
                     cleaned = self._cleanup_untracked_entry_state(
                         base,

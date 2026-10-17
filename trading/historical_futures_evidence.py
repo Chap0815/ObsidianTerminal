@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Mapping
+from sqlite_safety import harden_sqlite_connection
 
 
 MAX_OVERVIEW_PAYLOAD_BYTES = 8 * 1024 * 1024
@@ -543,7 +544,7 @@ def load_overview_snapshots(
         connection = None
         try:
             uri = f"file:{path.as_posix()}?mode=ro&immutable=1"
-            connection = sqlite3.connect(uri, uri=True)
+            connection = harden_sqlite_connection(sqlite3.connect(uri, uri=True))
             rows = connection.execute(
                 "SELECT event_id,exchange_time,received_time,"
                 "quality_flags_json,payload_json FROM venue_events "

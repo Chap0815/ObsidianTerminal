@@ -26,6 +26,7 @@ from news.http_limits import (
     read_bounded_response,
     require_success,
 )
+from news.rss_parser import parse_rss_bytes
 from shared_limits import read_loopback_proxy_port
 from bot_utils.runtime_threads import thread_definitely_never_started
 
@@ -711,8 +712,7 @@ def _fetch_one_rss(url: str, symbol: str) -> list:
             stream=True,
         )
         require_success(r)
-        # Pass raw bytes to feedparser for full encoding detection.
-        feed = feedparser.parse(read_bounded_response(r))
+        feed = parse_rss_bytes(read_bounded_response(r))
     except Exception:
         return []
     entries = getattr(feed, "entries", None)

@@ -14,6 +14,7 @@ Extracted from main_bot_futures.py:
 """
 from __future__ import annotations
 
+import json
 import math
 import re
 import threading
@@ -403,7 +404,54 @@ class FuturesOrderOutcomeUnknown(RetryForbiddenError):
 
 
 class FuturesOrderNotSubmitted(RuntimeError):
-    """The API budget blocked an order before ``create_order`` was called."""
+    """The order was not accepted: blocked locally or explicitly rejected."""
+
+
+class FuturesOpeningRestricted(FuturesOrderNotSubmitted):
+    """MEXC explicitly rejected this opening request with regional code 8950."""
+
+
+def _is_mexc_opening_restriction(exchange_id: str, error: Exception) -> bool:
+    """Accept only the complete, unambiguous venue rejection response.
+
+    A code in transport text, malformed payload, or another exchange is never
+    proof that an order did not land. Reduce-only callers do not use this gate.
+    """
+    if exchange_id != "mexc":
+        return False
+    from ccxt import ExchangeError
+
+    if not isinstance(error, ExchangeError):
+        return False
+    text = str(error)
+    if not text.startswith("mexc ") or len(text) > 4096:
+        return False
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate response field")
+            result[key] = value
+        return result
+
+    try:
+        response = json.loads(text[5:], object_pairs_hook=unique_object)
+    except (TypeError, ValueError):
+        return False
+    return (
+        type(response) is dict
+        and response.get("success") is False
+        and type(response.get("code")) is int
+        and response["code"] == 8950
+        and response.get("message") == (
+            "For risk management reasons, opening positions for this trading "
+            "pair is unavailable in your country or region. You may only "
+            "close existing positions."
+        )
+        and set(response) <= {"success", "code", "message", "data"}
+        and response.get("data") is None
+    )
 
 
 class _TradeRecoveryOrder(dict):
@@ -1617,8 +1665,16 @@ def create_order_with_retry(ex,
                 order = ex.create_order(
                     order_symbol, "market", order_side, order_amount,
                     params=order_params)
-            except Exception:
+            except Exception as create_error:
                 _record_create_error()
+                if (
+                    not reduce_only
+                    and _is_mexc_opening_restriction(exchange_id, create_error)
+                ):
+                    raise FuturesOpeningRestricted(
+                        "MEXC 8950: regional opening restriction; "
+                        "closing remains allowed"
+                    ) from create_error
                 raise
             cid = order_params.get("clientOrderId")
             client_id_conflict = _order_client_id_conflicts(order, cid)
@@ -1742,7 +1798,8 @@ def create_order_with_retry(ex,
         except Exception as e:
             last_err = e
             err_str = str(e).lower()
-            if isinstance(e, (FuturesOrderOutcomeUnknown,
+            if isinstance(e, (FuturesOrderNotSubmitted,
+                              FuturesOrderOutcomeUnknown,
                               _InvalidOrderResponse)):
                 if log_struct:
                     try:

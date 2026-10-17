@@ -49,6 +49,8 @@ _PUBLIC_OPTIONS_MAX_DEPTH = 32
 _PUBLIC_OPTIONS_MAX_NODES = 10_000
 _PUBLIC_ASYNC_CLOSE_RETRY_SECONDS = 1.0
 _PERSIST_EXECUTOR_MAX_WORKERS = 4
+_STANDARD_POOL_SUBMIT = ThreadPoolExecutor.submit
+_STANDARD_POOL_SUBMIT_CODE = _STANDARD_POOL_SUBMIT.__code__
 _TRADE_UPDATE_MAX_ROWS = 20_000
 _TRADE_PERSIST_RETRY_INITIAL_SECONDS = 0.1
 _TRADE_PERSIST_RETRY_MAX_SECONDS = 5.0
@@ -203,6 +205,10 @@ async def close_public_async_exchange(
         if cancellation_requested:
             raise asyncio.CancelledError
         return closed
+
+
+class _MexcSubscriptionRefresh(Exception):
+    """A removed public subscription requires a fresh MEXC transport owner."""
 
 
 class OrderBookValidationError(ValueError):
@@ -640,6 +646,7 @@ class L2ShadowCollector:
         ] = {}
         self._connection_epoch = 0
         self._health_lock = threading.Lock()
+        self._health_session_active = True
         self._health_seen_symbols: set[str] = set()
         self._health_last_persist_monotonic: dict[str, float] = {}
         self._health_trade_watcher_symbols: set[str] = set()
@@ -700,7 +707,8 @@ class L2ShadowCollector:
                 for symbol in desired
             )
             return bool(
-                desired
+                self._health_session_active
+                and desired
                 and self._health_ok_logged
                 and desired.issubset(self._health_seen_symbols)
                 and fresh
@@ -711,7 +719,8 @@ class L2ShadowCollector:
         desired = set(self._symbol_snapshot())
         with self._health_lock:
             return bool(
-                desired
+                self._health_session_active
+                and desired
                 and desired.issubset(self._health_trade_watcher_symbols)
                 and not desired.intersection(
                     self._health_trade_invalid_symbols
@@ -731,7 +740,8 @@ class L2ShadowCollector:
                 "l2_missing_or_stale": sorted(
                     symbol
                     for symbol in desired
-                    if symbol not in self._health_last_persist_monotonic
+                    if not self._health_session_active
+                    or symbol not in self._health_last_persist_monotonic
                     or not 0.0
                     <= now - self._health_last_persist_monotonic[symbol]
                     <= self._health_stale_after_seconds
@@ -739,7 +749,8 @@ class L2ShadowCollector:
                 "trade_missing_or_stale": sorted(
                     symbol
                     for symbol in desired
-                    if symbol not in self._health_trade_watcher_symbols
+                    if not self._health_session_active
+                    or symbol not in self._health_trade_watcher_symbols
                     or symbol in self._health_trade_invalid_symbols
                 ),
                 "trade_duplicates_suppressed": (
@@ -1513,6 +1524,8 @@ class L2ShadowCollector:
             self._nonce_regressions_since_sample.clear()
             self._updates_since_sample.clear()
             self._connection_epoch = epoch
+        with self._health_lock:
+            self._health_session_active = True
 
     def _mark_l2_healthy(
         self,
@@ -1524,6 +1537,8 @@ class L2ShadowCollector:
         if not desired or symbol not in desired:
             return
         with self._health_lock:
+            if not self._health_session_active:
+                return
             self._health_last_persist_monotonic[symbol] = (
                 observed_at_monotonic
             )
@@ -1570,6 +1585,8 @@ class L2ShadowCollector:
         with self._health_lock:
             # A valid callback is also direct evidence that the watcher is
             # active. This keeps record_trades useful in isolated diagnostics.
+            if not self._health_session_active:
+                return
             self._health_trade_watcher_symbols.add(symbol)
             self._health_trade_invalid_symbols.discard(symbol)
             self._health_last_trade_monotonic[symbol] = observed_at_monotonic
@@ -1656,10 +1673,28 @@ class L2ShadowCollector:
                 return False
             pending[0]["done"].wait(timeout=remaining)
 
-    async def _close_owned_async_client(self, exchange) -> None:
+    async def _drain_persist_work_async(self) -> bool:
+        """Drain exact accepted work, deferring owner cancellation until close."""
+        cancelled = False
+        lock, states = self._persist_registry()
+        while True:
+            with lock:
+                if not states:
+                    return cancelled
+            try:
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                cancelled = True
+                current = asyncio.current_task()
+                if current is not None:
+                    while current.cancelling():
+                        current.uncancel()
+
+    async def _close_owned_async_client(self, exchange) -> bool:
         """Keep one exact close owner until the client confirms completion."""
         failure_logged = False
         close_task = None
+        cancelled = False
 
         async def invoke_close() -> bool:
             close = getattr(exchange, "close", None)
@@ -1688,7 +1723,9 @@ class L2ShadowCollector:
             except asyncio.CancelledError:
                 current = asyncio.current_task()
                 if current is not None:
-                    current.uncancel()
+                    cancelled = cancelled or bool(current.cancelling())
+                    while current.cancelling():
+                        current.uncancel()
                 if close_task is None or not close_task.done():
                     continue
                 try:
@@ -1715,7 +1752,7 @@ class L2ShadowCollector:
                 close_task = None
             if closed is True:
                 self._release_async_client(exchange)
-                return
+                return cancelled
             if not failure_logged:
                 self._log(
                     "async exchange close was not confirmed; retrying",
@@ -1728,7 +1765,9 @@ class L2ShadowCollector:
             except asyncio.CancelledError:
                 current = asyncio.current_task()
                 if current is not None:
-                    current.uncancel()
+                    cancelled = cancelled or bool(current.cancelling())
+                    while current.cancelling():
+                        current.uncancel()
 
     async def _persist_off_loop(self, callback, *args, **kwargs):
         """Keep the loop responsive and drain durable work before cancellation."""
@@ -1758,7 +1797,32 @@ class L2ShadowCollector:
                     state["done"].set()
 
         if executor is not None:
-            task = loop.run_in_executor(executor, tracked_work)
+            try:
+                task = loop.run_in_executor(executor, tracked_work)
+            except RuntimeError as exc:
+                # Thread startup can raise after accepting work. Only explicit
+                # rejections raised inside the original standard-pool submit
+                # prove it was not accepted; deeper/wrapped failures do not.
+                origin = exc.__traceback__
+                while origin is not None and origin.tb_next is not None:
+                    origin = origin.tb_next
+                if (
+                    type(executor) is ThreadPoolExecutor
+                    and getattr(executor_submit, "__func__", None) is _STANDARD_POOL_SUBMIT
+                    and type(exc) is RuntimeError
+                    and str(exc) in {
+                        "cannot schedule new futures after shutdown",
+                        "cannot schedule new futures after interpreter shutdown",
+                    }
+                    and origin is not None
+                    and origin.tb_frame.f_code is _STANDARD_POOL_SUBMIT_CODE
+                    and origin.tb_frame.f_locals.get("self") is executor
+                ):
+                    with lock:
+                        if states.get(token) is state:
+                            states.pop(token, None)
+                        state["done"].set()
+                raise
         else:
             work_awaitable = asyncio.to_thread(tracked_work)
             try:
@@ -1935,10 +1999,17 @@ class L2ShadowCollector:
             trade_exchange = l2_exchange
         tasks: dict[tuple[str, str], asyncio.Task] = {}
         task_started: dict[tuple[str, str], float] = {}
+        subscribed_symbols: set[str] = set()
         partial_stale: tuple[str, ...] = ()
         try:
             while not self._should_stop():
                 desired = set(self._symbol_snapshot())
+                if self.exchange_id == "mexc":
+                    if subscribed_symbols - desired:
+                        # Cancelling a watch leaves the remote subscription alive.
+                        # Remember watchers that already returned on retirement.
+                        raise _MexcSubscriptionRefresh()
+                    subscribed_symbols.update(desired)
                 retired = []
                 for key in set(tasks):
                     if key[1] in desired:
@@ -1992,6 +2063,10 @@ class L2ShadowCollector:
                         )
                     )
                 ]
+                if stale and self.exchange_id == "mexc":
+                    # Rewatching an existing CCXT subscription does not send a
+                    # new subscribe; a fresh client is required for recovery.
+                    raise TimeoutError("L2 watcher stale for " + ",".join(sorted(stale)))
                 recovering = {
                     symbol
                     for symbol in partial_stale
@@ -2066,6 +2141,9 @@ class L2ShadowCollector:
                             f"{kind} watcher ended unexpectedly for {symbol}"
                         )
         finally:
+            if self.exchange_id == "mexc":
+                with self._health_lock:
+                    self._health_session_active = False
             for task in tasks.values():
                 task.cancel()
             if tasks:
@@ -2109,8 +2187,13 @@ class L2ShadowCollector:
         reconnect_attempts = 0
         last_warning_at = 0.0
         while not self._should_stop():
+            if self.exchange_id == "mexc" and not self._symbol_snapshot():
+                await self._interruptible_sleep(0.25)
+                continue
             l2_exchange = None
             trade_exchange = None
+            refresh_requested = False
+            cancelled_during_cleanup = False
             try:
                 endpoint = "l2_stream_load_markets"
                 try:
@@ -2166,6 +2249,9 @@ class L2ShadowCollector:
                 await self._watch_session(l2_exchange, trade_exchange)
             except asyncio.CancelledError:
                 break
+            except _MexcSubscriptionRefresh:
+                refresh_requested = True
+                self._log("capture subscription set changed; refreshing public transports", "INFO")
             except Exception as exc:
                 error_type, error_detail = _safe_exception_summary(exc)
                 interruption_wall_ts = _capture_now_ms() / 1000.0
@@ -2219,6 +2305,14 @@ class L2ShadowCollector:
                     last_warning_at = now
                 last_error_type = error_type
             finally:
+                if self.exchange_id == "mexc":
+                    with self._health_lock:
+                        self._health_session_active = False
+                    cancelled_during_cleanup = await self._drain_persist_work_async()
+                    self._begin_health_check(
+                        error_type=("SubscriptionRefresh" if refresh_requested else last_error_type),
+                        reconnect_attempts=reconnect_attempts,
+                    )
                 exchanges = []
                 for exchange in (trade_exchange, l2_exchange):
                     if exchange is not None and all(
@@ -2226,9 +2320,14 @@ class L2ShadowCollector:
                     ):
                         exchanges.append(exchange)
                 for exchange in exchanges:
-                    await self._close_owned_async_client(exchange)
-            if self._should_stop():
+                    close_cancelled = await self._close_owned_async_client(exchange)
+                    cancelled_during_cleanup = cancelled_during_cleanup or close_cancelled
+            if self._should_stop() or (
+                self.exchange_id == "mexc" and cancelled_during_cleanup
+            ):
                 break
+            if refresh_requested:
+                continue
             wait = min(backoff * random.uniform(0.75, 1.25), self.reconnect_max_seconds)
             await self._interruptible_sleep(max(1.0, wait))
             backoff = min(backoff * 2.0, self.reconnect_max_seconds)

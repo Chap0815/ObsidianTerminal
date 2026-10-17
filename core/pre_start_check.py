@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
+from sqlite_safety import harden_sqlite_connection
 from bot_utils.config import (
     _INT_FIELDS,
     _finite_integral_or_none,
@@ -221,7 +222,7 @@ def _db_rows(table: str, where: str = "", params: Iterable = ()) -> tuple[list[d
     con = None
     try:
         database_uri = f"{Path(DB_PATH).resolve().as_uri()}?mode=ro"
-        con = sqlite3.connect(database_uri, uri=True)
+        con = harden_sqlite_connection(sqlite3.connect(database_uri, uri=True))
         con.row_factory = sqlite3.Row
         sql = f"SELECT * FROM {table}"
         if where:
@@ -242,7 +243,7 @@ def _check_database_integrity() -> list[CheckIssue]:
     connection = None
     try:
         database_uri = f"{Path(DB_PATH).resolve().as_uri()}?mode=ro"
-        connection = sqlite3.connect(database_uri, uri=True)
+        connection = harden_sqlite_connection(sqlite3.connect(database_uri, uri=True))
         quick = connection.execute("PRAGMA quick_check(1)").fetchone()
         if quick is None or str(quick[0]).lower() != "ok":
             detail = "no result" if quick is None else str(quick[0])

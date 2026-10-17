@@ -14,6 +14,7 @@ RELEASE_ROOT_FILES = frozenset({
     "SUPPORT.md", "UPDATE_SETUP.md", "bot_config.default.json", "env_parameter.txt",
     "env_setup_files.py", "install.bat", "install.py", "launcher.pyw",
     "requirements.lock.txt", "requirements.txt", "setup_wizard.pyw", "shared_limits.py",
+    "sqlite_safety.py",
     "start_launcher.bat", "update.bat", "update_barrier.py",
 })
 RELEASE_ROOT_METADATA_FILES = frozenset({"DEPLOY_MANIFEST.json"})
@@ -26,6 +27,8 @@ def is_release_root_file(name: str) -> bool:
 
 REQUIRED_RELEASE_ITEMS = [
     "launcher.pyw",
+    "sqlite_safety.py",
+    "news/rss_parser.py",
     "update_barrier.py",
     "env_setup_files.py",
     "setup_wizard.pyw",
@@ -106,6 +109,8 @@ REQUIRED_RELEASE_DIRS = {
 
 UPDATE_SMOKE_FILES = [
     "launcher.pyw",
+    "sqlite_safety.py",
+    "news/rss_parser.py",
     "update_barrier.py",
     "env_setup_files.py",
     "setup_wizard.pyw",

@@ -16,6 +16,7 @@ import threading
 import time
 from typing import Dict, Optional
 
+from sqlite_safety import harden_sqlite_connection
 from bot_utils.atomic_publish import atomic_write_bytes
 from bot_utils.runtime_threads import thread_definitely_never_started
 from core.models import Position
@@ -788,7 +789,7 @@ class StateManager:
         except Exception:
             # Fallback: own dedicated connection, if core.database isn't
             # importable.
-            conn = sqlite3.connect(self.db_path, timeout=20.0)
+            conn = harden_sqlite_connection(sqlite3.connect(self.db_path, timeout=20.0))
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")

@@ -576,9 +576,48 @@ def _post_ui(app, callback, *, delay_ms: int = 0) -> None:
     app.after(delay_ms, callback)
 
 
+def _set_windows_app_id() -> None:
+    """Set the taskbar identity before Tk creates its first native window."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "anthropic.obsidian.trading.terminal"
+            )
+        except Exception:
+            pass
+
+
+def _set_window_icon(window) -> None:
+    """Use the product icon for this window and future Tk toplevels."""
+    candidates = (
+        os.path.join(PROJECT_ROOT, "launcher", "ui", "components", "obsidian.ico"),
+        os.path.join(PROJECT_ROOT, "launcher", "ui", "obsidian.ico"),
+        os.path.join(PROJECT_ROOT, "obsidian.ico"),
+        os.path.join(PROJECT_ROOT, "assets", "obsidian.ico"),
+    )
+    icon = next((path for path in candidates if os.path.isfile(path)), None)
+    if icon:
+        try:
+            window.iconbitmap(icon, default=icon)
+        except Exception:
+            pass
+
+
+def _apply_mapped_window_icon(event) -> None:
+    # CTk toplevels schedule their own default icon after creation. Set the
+    # product icon before that callback, including dialogs in other modules.
+    if isinstance(event.widget, (ctk.CTk, ctk.CTkToplevel)):
+        _set_window_icon(event.widget)
+
+
 class ObsidianApp(ctk.CTk):
     def __init__(self):
+        _set_windows_app_id()
         super().__init__()
+        _set_window_icon(self)
+        self.bind_all("<Map>", _apply_mapped_window_icon, add="+")
 
         self._ui_owner_thread = threading.get_ident()
         self._ui_dispatch_queue: queue.Queue[tuple[int, object]] = (
@@ -624,42 +663,6 @@ class ObsidianApp(ctk.CTk):
 
         # Windows Titlebar dunkel machen
         force_dark_titlebar(self)
-
-        # Taskbar / window icon  looks for obsidian.ico in several
-        # candidate locations. Best-effort: gracefully no-ops on Linux/Mac
-        # (where .ico isn't the native format) and when the file is
-        # missing. On Windows we ALSO set the AppUserModelID so the icon
-        # shows correctly in the taskbar (without this, Windows groups
-        # the app under the Python interpreter icon even though the
-        # window itself shows the custom icon).
-        try:
-            import os as _os
-            import sys as _sys
-            from launcher.config.settings import PROJECT_ROOT
-            _script_dir = _os.path.dirname(_os.path.abspath(__file__))
-            # Search candidates in priority order
-            _candidates = [
-                _os.path.join(_script_dir, "components", "obsidian.ico"),  # launcher/ui/components/  NEW
-                _os.path.join(_script_dir, "obsidian.ico"),                # launcher/ui/
-                _os.path.join(PROJECT_ROOT, "obsidian.ico"),               # project root (legacy)
-                _os.path.join(PROJECT_ROOT, "assets", "obsidian.ico"),     # assets/
-            ]
-            _icon_path = next((p for p in _candidates if _os.path.isfile(p)), None)
-            if _icon_path:
-                try:
-                    self.iconbitmap(_icon_path)
-                except Exception:
-                    pass
-                if _sys.platform == "win32":
-                    try:
-                        import ctypes
-                        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                            "anthropic.obsidian.trading.terminal"
-                        )
-                    except Exception:
-                        pass
-        except Exception:
-            pass
 
         # Always start maximized  content is scaled to fit, so it never clips
         # on any resolution/aspect ratio (16:9, 16:10, 21:9, 4:3). Re-asserted
@@ -1119,6 +1122,12 @@ class ObsidianApp(ctk.CTk):
         self._sb_section(_c, "CONNECTIONS")
         self.sb_db = self._sb_status(_c, "Database", "", COLORS["text_muted"])
         self.sb_exchange = self._sb_status(_c, "Exchange", "", COLORS["text_muted"])
+        self.sb_exchange_details = ctk.CTkLabel(
+            _c, text="Public data: unverified\nPrivate API: unverified\nTrading: unverified",
+            font=ctk.CTkFont(FONT_BODY, 10), text_color=COLORS["text_muted"],
+            anchor="w", justify="left", wraplength=205,
+        )
+        self.sb_exchange_details.pack(fill="x", pady=(0, 3))
         self.sb_llm = self._sb_status(_c, "LLM", "", COLORS["text_muted"])
 
         # Larger font for LLM model text.
@@ -1141,14 +1150,14 @@ class ObsidianApp(ctk.CTk):
         err_row.pack(fill="x", pady=(0, 2))
 
         # Slightly larger font for error status.
-        ctk.CTkLabel(err_row, text="Error log",
+        ctk.CTkLabel(err_row, text="Error history",
                       font=ctk.CTkFont(FONT_BODY, 10, "bold"),
                       text_color=COLORS["text_subtle"], anchor="w"
                       ).pack(side="left")
         self.sb_errors = ctk.StringVar(value="0 logged")
         err_lbl = ctk.CTkLabel(err_row, textvariable=self.sb_errors,
                                 font=ctk.CTkFont(FONT_BODY, 10, "bold"),
-                                text_color=COLORS["success"], anchor="e",
+                                text_color=COLORS["text_muted"], anchor="e",
                                 cursor="hand2")
         err_lbl.pack(side="right")
         err_lbl.bind("<Button-1>", lambda e: self._show_error_log())
@@ -4142,7 +4151,7 @@ class ObsidianApp(ctk.CTk):
     def _set_error_log_count(self, count):
         self.sb_errors.set(f"{count} logged")
         self.sb_errors._lbl.configure(
-            text_color=COLORS["danger"] if count > 0 else COLORS["success"],
+            text_color=COLORS["text_muted"],
             cursor="hand2",
         )
 
@@ -5226,16 +5235,15 @@ class ObsidianApp(ctk.CTk):
             self.sb_db._lbl.configure(text_color=COLORS["danger"])
 
         ex = cache.get("exchange") or {"active": False, "label": ""}
-        if metrics_error and cache.get("metrics_error_scope") != "bot":
-            self.sb_exchange.set("DB Error")
-            self.sb_exchange._lbl.configure(text_color=COLORS["warning"])
-        else:
-            self.sb_exchange.set(ex["label"])
-            self.sb_exchange._lbl.configure(
-                text_color=(COLORS["success"] if ex["active"] else
-                            COLORS["warning"] if ex.get("unverified") else
-                            COLORS["text_muted"])
-            )
+        self.sb_exchange.set(ex["label"])
+        self.sb_exchange._lbl.configure(
+            text_color=(COLORS["success"] if ex["active"] else
+                        COLORS["warning"] if ex.get("unverified") else
+                        COLORS["text_muted"])
+        )
+        self.sb_exchange_details.configure(text=ex.get(
+            "details", "Public data: unverified\nPrivate API: unverified\nTrading: unverified"
+        ))
 
         llm_enabled = any(
             BOT_META.get(bot, {}).get("uses_llm", True)
@@ -5263,6 +5271,14 @@ class ObsidianApp(ctk.CTk):
         self.sb_clk.set(datetime.now().strftime("%H:%M:%S"))
 
         self._set_error_log_count(cache.get("error_count", 0))
+        runtime_summary = cache.get("runtime_summary") or {}
+        degraded = runtime_summary.get("degraded", 0)
+        unverified = runtime_summary.get("unverified", len(BOT_ORDER))
+        self.sb_errors_text.configure(
+            text=(f"Runtime: {degraded} degraded, {unverified} unverified.\n"
+                  "Retained errors require review; history is not a recovery signal."),
+            text_color=COLORS["warning"] if degraded or unverified else COLORS["text_subtle"],
+        )
 
         # Statusbar mit Ready/Live Badge updaten
         self._update_statusbar_state()
