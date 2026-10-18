@@ -1555,7 +1555,7 @@ def check_kill_switches(bot_name: str, exchange=None,
                     newest_loss_time = streak_now
             streak += 1
         if streak >= 5:
-            reason = f"STOP: Kill-Switch: {streak} consecutive stop-losses"
+            reason = f"STOP: Kill-Switch: {streak} consecutive losing closes"
             remaining = max(
                 0.0,
                 ((newest_loss_time or streak_now) + timedelta(hours=4)
