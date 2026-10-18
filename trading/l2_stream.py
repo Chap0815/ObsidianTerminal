@@ -2001,6 +2001,7 @@ class L2ShadowCollector:
         task_started: dict[tuple[str, str], float] = {}
         subscribed_symbols: set[str] = set()
         partial_stale: tuple[str, ...] = ()
+        mexc_stale_since: dict[str, float] = {}
         try:
             while not self._should_stop():
                 desired = set(self._symbol_snapshot())
@@ -2063,10 +2064,24 @@ class L2ShadowCollector:
                         )
                     )
                 ]
-                if stale and self.exchange_id == "mexc":
-                    # Rewatching an existing CCXT subscription does not send a
-                    # new subscribe; a fresh client is required for recovery.
-                    raise TimeoutError("L2 watcher stale for " + ",".join(sorted(stale)))
+                if self.exchange_id == "mexc":
+                    mexc_stale_since = {
+                        symbol: mexc_stale_since.get(symbol, now)
+                        for symbol in stale
+                    }
+                    # A quiet or briefly invalid symbol must not interrupt
+                    # healthy public streams. Keep its original subscription
+                    # alive, with health still stale, for the existing startup
+                    # recovery window. Rewatching the same CCXT subscription
+                    # would not actually resubscribe. A whole-roster stall or
+                    # persistent partial stall still needs a fresh client.
+                    if stale and any(
+                        now - since >= self._health_startup_grace_seconds
+                        for since in mexc_stale_since.values()
+                    ):
+                        raise TimeoutError(
+                            "L2 watcher stale for " + ",".join(sorted(stale))
+                        )
                 recovering = {
                     symbol
                     for symbol in partial_stale
@@ -2095,7 +2110,7 @@ class L2ShadowCollector:
                     elif partial_stale:
                         self._log("partial L2 staleness recovered", "OK")
                     partial_stale = stale_signature
-                if stale:
+                if stale and self.exchange_id != "mexc":
                     retired_stale = []
                     for symbol in stale:
                         key = ("l2", symbol)

@@ -1,6 +1,6 @@
 {
-  "build_id": "53d7118e431c7aa0",
-  "created_at": "2026-10-17 16:37:36",
+  "build_id": "647598c3745ef886",
+  "created_at": "2026-10-18 17:07:29",
   "source": "update_deploy_manifest.py",
   "file_count": 228,
   "files": [
@@ -1011,8 +1011,8 @@
     },
     {
       "path": "trading/l2_stream.py",
-      "sha256": "e2f4bdd949a41747c882d74b46ee52a6e1fb79ac0ac1da0870968ba40eb3d022",
-      "bytes": 100263
+      "sha256": "7ffa3eae5881189ea8bbee6de6d371f91885cac2b57772e777f9f1162cf96b7a",
+      "bytes": 101065
     },
     {
       "path": "trading/market_filters.py",
@@ -1076,8 +1076,8 @@
     },
     {
       "path": "trading/risk_manager.py",
-      "sha256": "123c022a468dbf1a39d55b6704daa3c1239fbe7daa77f9a2be9c0aac6a7a8fda",
-      "bytes": 67232
+      "sha256": "67df9477bc21f0f80318a91a2f87745bbdc497c4e881801f84844e88dea1562f",
+      "bytes": 67234
     },
     {
       "path": "trading/runtime_observability.py",
