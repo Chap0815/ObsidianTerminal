@@ -161,6 +161,8 @@ def _parser() -> argparse.ArgumentParser:
     status.add_argument("--minimum-cost-samples", type=_positive_int, default=50)
     status.add_argument("--minimum-expectancy-rows", type=_positive_int, default=1200)
     status.add_argument("--write-report", action="store_true")
+    status.add_argument("--settled-funding-snapshot", action="append", type=Path,
+                        help="local FUTURES SIM funding-cost diagnostics; never training labels")
 
     train = sub.add_parser(
         "train-expectancy", help="write a candidate model outside data/models"
@@ -266,10 +268,16 @@ def main(argv: list[str] | None = None) -> int:
     try:
         root = _real_project_root(args.root)
         if args.command == "status":
+            funding_options = {}
+            if args.settled_funding_snapshot:
+                from trading.settled_funding_model import load_settled_funding_provider
+                funding_options["settled_funding_provider"] = load_settled_funding_provider(
+                    args.settled_funding_snapshot)
             payload = build_research_status(
                 root,
                 minimum_cost_samples=args.minimum_cost_samples,
                 minimum_expectancy_rows=args.minimum_expectancy_rows,
+                **funding_options,
             )
             if args.write_report:
                 payload["report"] = str(_write_report(root, payload))

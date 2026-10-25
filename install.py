@@ -286,9 +286,7 @@ def install_packages() -> bool:
     try:
         from tools.install_locked_dependencies import install_locked_requirements
 
-        result = install_locked_requirements(
-            REQ_FILE, pip_runner=lambda *args: _pip(*args, capture=False)
-        )
+        result = install_locked_requirements(REQ_FILE)
     except (OSError, UnicodeError, ValueError) as exc:
         err(f"Dependency-Lock abgelehnt: {exc}")
         return False

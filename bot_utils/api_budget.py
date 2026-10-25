@@ -126,7 +126,11 @@ class ApiCallReservation:
 
 
 _MEXC_CONTRACT_DEPTH_ENDPOINT = "mexc_contract_depth"
-_MEXC_CONTRACT_DEPTH_BURST_MAX = 16
+# Current venue contract: GET /api/v1/contract/depth/{symbol}, 10 calls/2s.
+# https://www.mexc.com/api-docs/futures/market-endpoints/get-contract-order-book-depth
+# The older mexcdevelop documentation advertised a larger allowance. Keep all
+# swap book consumers in this single durable scope, regardless of bot/client.
+_MEXC_CONTRACT_DEPTH_BURST_MAX = 10
 _MEXC_CONTRACT_DEPTH_BURST_WINDOW_SECONDS = 2
 _MEXC_CONTRACT_BOTS = frozenset({"CROSS", "FUTURES", "FUTREND"})
 _MEXC_CONTRACT_DEPTH_SOURCES = frozenset({
@@ -136,6 +140,7 @@ _MEXC_CONTRACT_DEPTH_SOURCES = frozenset({
     "entry_executor_fetch_order_book",
     "futures_entry_fetch_spread_book",
     "futrend_shadow_fetch_order_book",
+    "l2_snapshot_fetch_order_book",
     "market_filter_fetch_spread_order_book",
     "venue_recorder_fetch_order_book",
 })

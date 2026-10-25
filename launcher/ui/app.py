@@ -38,6 +38,7 @@ from bot_utils.atomic_publish import atomic_write_bytes
 from bot_utils.config import _read_config_json
 from bot_utils.runtime_threads import thread_definitely_never_started
 from bot_utils.subprocess_capture import run_bounded_capture
+from core.version import APP_NAME, APP_VERSION
 
 try:
     import psutil  # noqa: F401  (used inside _refresh via HAS_PSUTIL)
@@ -490,6 +491,7 @@ from launcher.ui.components.widgets import (
     MiniBar,
     ParamRow,
     Sparkline,
+    TrainingStatusPanel,
     attach_tooltip,
     enable_keyboard_activation,
 )
@@ -497,6 +499,7 @@ from launcher.ui.cadence import PeriodicGate
 from launcher.ui.dialogs.prompt_editor import PromptEditor
 from launcher.ui.scaling import apply_scaling
 from launcher.ui.theme import force_dark_titlebar
+from launcher.ui.training_presenter import training_status_cards
 
 
 def _fetch_ollama_model_names(endpoint: str, *, timeout: float) -> list[str]:
@@ -648,7 +651,7 @@ class ObsidianApp(ctk.CTk):
         self._update_check_started = False
         self._update_check_state: dict | None = None
 
-        self.title("Obsidian Trading Terminal v5.0")
+        self.title(f"{APP_NAME} v{APP_VERSION}")
         # Resolution-adaptive scaling: shrink the 2K/4K-baseline layout so it
         # fits the real screen (1080p .. 4K, ultrawide). Override via env
         # UI_SCALE=<factor> or config UI.SCALE. Must run before geometry.
@@ -723,6 +726,8 @@ class ObsidianApp(ctk.CTk):
         self.poller = DataPoller()
 
         self._build_ui()
+        self._training_status_busy = False
+        self.after(100, self._refresh_training_status)
         self._apply_initial_visibility()
         self._set_content_minsize()
         self._refresh_tick()
@@ -897,7 +902,7 @@ class ObsidianApp(ctk.CTk):
                       ).grid(row=0, column=1, sticky="sew")
 
         # Persistent show/hide filters; selected cards have a filled surface.
-        pill_label = ctk.CTkLabel(bar, text="Bots",
+        pill_label = ctk.CTkLabel(bar, text="Show bots",
                                     font=ctk.CTkFont(FONT_BODY, 12, "bold"),
                                     text_color=COLORS["text_muted"])
         pill_label.pack(side="left", padx=(16, 10), pady=12)
@@ -942,7 +947,7 @@ class ObsidianApp(ctk.CTk):
 
         # Open Dashboard (rechts)
         dash_btn = keyboard_button(
-            bar, text="Open Dashboard",
+            bar, text="Browser dashboard",
             width=144, height=34, corner_radius=8,
             font=ctk.CTkFont(FONT_BODY, 12, "bold"),
             fg_color="transparent", hover_color=COLORS["panel_hover"],
@@ -972,8 +977,8 @@ class ObsidianApp(ctk.CTk):
                     ).grid(row=0, column=0, rowspan=3, sticky="nse")
 
         # Logo oben (kompakt)
-        logo_box = ctk.CTkFrame(sb, fg_color="transparent", height=48)
-        logo_box.pack(fill="x", padx=14, pady=(10, 4))
+        logo_box = ctk.CTkFrame(sb, fg_color="transparent", height=60)
+        logo_box.pack(fill="x", padx=18, pady=(14, 8))
         logo_box.pack_propagate(False)
         ctk.CTkLabel(logo_box, text="",
                       font=ctk.CTkFont(self.mono_font, 18, "bold"),
@@ -982,29 +987,43 @@ class ObsidianApp(ctk.CTk):
         logo_text = ctk.CTkFrame(logo_box, fg_color="transparent")
         logo_text.pack(side="left", fill="y")
         ctk.CTkLabel(logo_text, text="Obsidian",
-                      font=ctk.CTkFont(self.display_font, 14, "bold"),
-                      text_color=COLORS["text"], anchor="w", height=22
+                      font=ctk.CTkFont(self.display_font, 20, "bold"),
+                      text_color=COLORS["text"], anchor="w", height=28
                       ).pack(anchor="w", pady=(4, 0))
-        ctk.CTkLabel(logo_text, text="Trading Terminal",
-                      font=ctk.CTkFont(FONT_BODY, 10),
+        ctk.CTkLabel(logo_text, text=f"TRADING TERMINAL  /  {APP_VERSION}",
+                      font=ctk.CTkFont(FONT_BODY, 10, "bold"),
                       text_color=COLORS["text_subtle"], anchor="w", height=16
                       ).pack(anchor="w")
 
         # Separator unter Logo
         ctk.CTkFrame(sb, fg_color=COLORS["border_soft"], height=1).pack(fill="x", padx=10, pady=(2, 4))
 
-        # Scrollable sidebar body so the lower cards stay reachable on short
-        # windows. The scroll-frame can break _refresh()'s pack(before=...) of
-        # the balance rows (TclError "isn't packed"), but _safe_pack_before()
-        # catches that and _refresh runs inside _refresh_tick(), so a layout
-        # glitch only reorders the balance rows cosmetically  it can't freeze
-        # the UI.
-        inner = ctk.CTkScrollableFrame(
-            sb, fg_color="transparent",
-            scrollbar_button_color=COLORS["border"],
-            scrollbar_button_hover_color=COLORS["text_muted"],
-        )
-        inner.pack(fill="both", expand=True, padx=(10, 2), pady=2)
+        # Keep tools and system evidence one keyboard-accessible click away.
+        # Switching this display-only deck does not pause any data collection.
+        navigation = ctk.CTkFrame(sb, fg_color=COLORS["bg_alt"], corner_radius=8)
+        navigation.pack(fill="x", padx=12, pady=(4, 10))
+        self.sidebar_navigation = {}
+        self.sidebar_views = {}
+        view_area = ctk.CTkFrame(sb, fg_color="transparent")
+        view_area.pack(fill="both", expand=True, padx=(10, 2), pady=2)
+        view_area.grid_columnconfigure(0, weight=1)
+        view_area.grid_rowconfigure(0, weight=1)
+        for index, section in enumerate(("Overview", "System", "Tools")):
+            navigation.grid_columnconfigure(index, weight=1)
+            button = keyboard_button(
+                navigation, text=section, width=64, height=32, corner_radius=6,
+                font=ctk.CTkFont(FONT_BODY, 11, "bold"),
+                fg_color="transparent", hover_color=COLORS["panel_hover"],
+                text_color=COLORS["text_muted"],
+                command=lambda selected=section: self._select_sidebar_view(selected))
+            button.grid(row=0, column=index, sticky="ew", padx=2, pady=3)
+            self.sidebar_navigation[section] = button
+            frame = ctk.CTkScrollableFrame(
+                view_area, fg_color="transparent",
+                scrollbar_button_color=COLORS["border"],
+                scrollbar_button_hover_color=COLORS["text_muted"])
+            self.sidebar_views[section] = frame
+        inner = self.sidebar_views["Overview"]
 
         # MARKET  gerahmte Karte
         _c = self._sb_card(inner)
@@ -1093,6 +1112,8 @@ class ObsidianApp(ctk.CTk):
         self.sb_cross_pos = self._sb_metric(_c, "Cross Open", "0", COLORS["text"])
         self.sb_futrend_pos = self._sb_metric(_c, "Future Trend Open", "0", COLORS["text"])
 
+        # System observations retain their own scroll position.
+        inner = self.sidebar_views["System"]
         # System monitor card.
         _c = self._sb_card(inner)
         self._sb_section(_c, "SYSTEM MONITOR")
@@ -1178,6 +1199,7 @@ class ObsidianApp(ctk.CTk):
             text_color=COLORS["text_subtle"], anchor="w", wraplength=200)
         self.sb_errors_text.pack(fill="x", padx=8, pady=6)
 
+        inner = self.sidebar_views["Tools"]
         # TOOLS  gerahmte Karte
         _c = self._sb_card(inner)
         self._sb_section(_c, "TOOLS")
@@ -1268,6 +1290,21 @@ class ObsidianApp(ctk.CTk):
         # KEINE Status/Time section  Time wird im Footer angezeigt
         # Backward-Compat: dummy StringVar damit Refresh-Loop nicht crasht
         self.sb_clk = ctk.StringVar(value="")
+        self._select_sidebar_view("Overview")
+
+    def _select_sidebar_view(self, selected: str):
+        """Local navigation only; status refreshes continue for every section."""
+        if selected not in self.sidebar_views:
+            return
+        for name, frame in self.sidebar_views.items():
+            active = name == selected
+            if active:
+                frame.grid(row=0, column=0, sticky="nsew")
+            else:
+                frame.grid_remove()
+            self.sidebar_navigation[name].configure(
+                fg_color=COLORS["purple_dim"] if active else "transparent",
+                text_color=COLORS["text"] if active else COLORS["text_muted"])
 
     def _open_env_reference(self):
         """Open env_parameter.txt (the full .env reference) in the OS default
@@ -1296,16 +1333,16 @@ class ObsidianApp(ctk.CTk):
         card = ctk.CTkFrame(parent, fg_color=COLORS["panel_alt"],
                              border_color=COLORS["border"], border_width=1,
                              corner_radius=10)
-        card.pack(fill="x", pady=(0, 8))
+        card.pack(fill="x", pady=(0, 12))
         inner = ctk.CTkFrame(card, fg_color="transparent")
-        inner.pack(fill="x", padx=11, pady=9)
+        inner.pack(fill="x", padx=12, pady=11)
         return inner
 
     def _sb_section(self, parent, text):
         ctk.CTkLabel(parent, text=text,
-                      font=ctk.CTkFont(self.display_font, 10, "bold"),
-                      text_color=COLORS["text_dim"], anchor="w"
-                      ).pack(fill="x", pady=(2, 4))
+                      font=ctk.CTkFont(FONT_BODY, 11, "bold"),
+                      text_color=COLORS["accent_text"], anchor="w"
+                      ).pack(fill="x", pady=(0, 8))
 
     def _sb_metric(self, parent, label, value, color):
         row = ctk.CTkFrame(parent, fg_color="transparent")
@@ -1373,13 +1410,20 @@ class ObsidianApp(ctk.CTk):
         return self.MAX_CARD_COLUMNS
 
     def _build_main(self):
+        workspace = ctk.CTkFrame(self, fg_color="transparent")
+        workspace.grid(row=1, column=1, sticky="nsew", padx=20, pady=(14, 20))
+        workspace.grid_columnconfigure(0, weight=1)
+        workspace.grid_rowconfigure(1, weight=1)
+        self.training_panel = TrainingStatusPanel(workspace)
+        self.training_panel.grid(row=0, column=0, sticky="ew", pady=(0, 14))
+        self.training_panel.set_cards(training_status_cards(None))
         main = ctk.CTkScrollableFrame(
-            self,
+            workspace,
             fg_color=COLORS["bg"],
             scrollbar_button_color=COLORS["border"],
             scrollbar_button_hover_color=COLORS["text_muted"],
         )
-        main.grid(row=1, column=1, sticky="nsew", padx=20, pady=20)
+        main.grid(row=1, column=0, sticky="nsew")
         self._current_card_columns = self.MAX_CARD_COLUMNS
         for i in range(self.MAX_CARD_COLUMNS):
             main.grid_columnconfigure(i, weight=1)
@@ -1387,12 +1431,44 @@ class ObsidianApp(ctk.CTk):
             main.grid_rowconfigure(i, weight=0)
         self.main_frame = main
         main.bind("<Configure>", self._on_main_resize)
-        main.bind("<Configure>", lambda _e: self.after_idle(self._refresh_main_scrollregion), add="+")
+        main.bind("<Configure>", self._schedule_main_scrollregion, add="+")
         self._bind_card_area_mousewheel(main)
 
         for col, bot in enumerate(BOT_ORDER):
             self.cards[bot] = self._build_bot_card(main, bot, col)
-        self.after_idle(self._refresh_main_scrollregion)
+        self._schedule_main_scrollregion()
+
+    def _refresh_training_status(self):
+        """Bounded read-only I/O off Tcl's event thread; never start training."""
+        if self._ui_dispatch_closed:
+            return
+        self.after(30_000, self._refresh_training_status)
+        if self._training_status_busy:
+            return
+        self._training_status_busy = True
+
+        def read_status():
+            try:
+                from trading.training_status import read_training_ui_status
+                status = read_training_ui_status(PROJECT_ROOT)
+            except Exception:
+                status = None
+            cards = training_status_cards(status)
+
+            def publish():
+                self._training_status_busy = False
+                self.training_panel.set_cards(cards)
+
+            if not self.post_ui(publish):
+                # A saturated best-effort UI queue must not disable future
+                # reads permanently. No Tk objects are touched by this worker.
+                self._training_status_busy = False
+
+        try:
+            threading.Thread(target=read_status, name="training-status-read", daemon=True).start()
+        except RuntimeError:
+            self._training_status_busy = False
+            self.training_panel.set_cards(training_status_cards(None))
 
     def _bind_card_area_mousewheel(self, frame) -> None:
         """Make mouse-wheel scrolling work over child widgets in bot cards."""
@@ -1454,6 +1530,17 @@ class ObsidianApp(ctk.CTk):
         frame.bind("<Enter>", _enter)
         frame.bind("<Leave>", _leave)
 
+    def _schedule_main_scrollregion(self, _event=None) -> None:
+        """Coalesce geometry bursts without delaying any data/status refresh."""
+        if getattr(self, "_scrollregion_update_id", None) is None:
+            self._scrollregion_update_id = self.after_idle(self._run_main_scrollregion_update)
+
+    def _run_main_scrollregion_update(self) -> None:
+        try:
+            self._refresh_main_scrollregion()
+        finally:
+            self._scrollregion_update_id = None
+
     def _refresh_main_scrollregion(self) -> None:
         """Force CTk's canvas to know the full dynamic card grid height."""
         frame = getattr(self, "main_frame", None)
@@ -1487,7 +1574,7 @@ class ObsidianApp(ctk.CTk):
             self._current_card_columns = cols
             self._refresh_visibility_layout()
         else:
-            self.after_idle(self._refresh_main_scrollregion)
+            self._schedule_main_scrollregion()
 
     def _build_bot_card(self, parent, name: str, col: int):
         meta = BOT_META[name]
@@ -1510,14 +1597,14 @@ class ObsidianApp(ctk.CTk):
 
         #  ROW 0: Header 
         head = ctk.CTkFrame(card, fg_color="transparent")
-        head.grid(row=0, column=0, sticky="ew", padx=22, pady=(20, 6))
+        head.grid(row=0, column=0, sticky="ew", padx=20, pady=(16, 6))
         head.grid_columnconfigure(0, weight=1)
         head.grid_columnconfigure(1, weight=0)
 
         name_block = ctk.CTkFrame(head, fg_color="transparent")
         name_block.grid(row=0, column=0, rowspan=2, sticky="nw")
         ctk.CTkLabel(name_block, text=meta["label"],
-                      font=ctk.CTkFont(self.display_font, 19, "bold"),
+                      font=ctk.CTkFont(self.display_font, 21, "bold"),
                       text_color=COLORS["text"], anchor="w", height=24
                       ).pack(anchor="w")
         # Signature underline  the one accent that carries "Obsidian"
@@ -1657,10 +1744,10 @@ class ObsidianApp(ctk.CTk):
         #  ROW 1: PnL Hero in tinted Container-Box 
         hero_wrap = ctk.CTkFrame(card, fg_color=COLORS["bg"], corner_radius=10,
                                     border_width=1, border_color=COLORS["border_soft"])
-        hero_wrap.grid(row=1, column=0, sticky="ew", padx=18, pady=(10, 10))
+        hero_wrap.grid(row=2, column=0, sticky="ew", padx=18, pady=(4, 10))
 
         hero = ctk.CTkFrame(hero_wrap, fg_color="transparent")
-        hero.pack(fill="x", padx=14, pady=12)
+        hero.pack(fill="x", padx=14, pady=10)
         hero.grid_columnconfigure(0, weight=1)
 
         pnl_block = ctk.CTkFrame(hero, fg_color="transparent")
@@ -1759,18 +1846,15 @@ class ObsidianApp(ctk.CTk):
                         "Faustregel: bei 67% WR brauchst du  ~0.49.",
                         delay_ms=400)
 
-        #  Sparkline: kumulierte PnL-Kurve der letzten ~30 Trades 
-        # row=2 ist frei (hero_wrap=1, param_wrap=3). Gerahmtes Mini-Chart-
-        # Panel, damit die Linie nicht "schwebt", sondern in einer klar
-        # abgegrenzten Flche liegt (wie ein kleines Chart-Widget).
+        # Historical context follows the primary metrics and parameter controls.
         spark_wrap = ctk.CTkFrame(card, fg_color=COLORS["panel_alt"],
                                    border_color=COLORS["border"], border_width=1,
                                    corner_radius=10)
-        spark_wrap.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 4))
+        spark_wrap.grid(row=4, column=0, sticky="ew", padx=18, pady=(8, 2))
         spark_wrap.grid_columnconfigure(0, weight=1)
 
         spark_head = ctk.CTkFrame(spark_wrap, fg_color="transparent")
-        spark_head.grid(row=0, column=0, sticky="ew", padx=12, pady=(7, 1))
+        spark_head.grid(row=0, column=0, sticky="ew", padx=12, pady=(4, 0))
         ctk.CTkLabel(spark_head, text="PNL TREND",
                       font=ctk.CTkFont(self.display_font, 10, "bold"),
                       text_color=COLORS["text_dim"]
@@ -1780,7 +1864,7 @@ class ObsidianApp(ctk.CTk):
                       text_color=COLORS["text_subtle"]
                       ).pack(side="right")
 
-        sparkline = Sparkline(spark_wrap, height=40)
+        sparkline = Sparkline(spark_wrap, height=30)
         sparkline.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 8))
         attach_tooltip(sparkline,
                         "Kumulierter realisierter PnL ueber die letzten ~30\n"
@@ -1795,7 +1879,7 @@ class ObsidianApp(ctk.CTk):
         # COLLAPSIBLE: click the header chevron to fold the params away and
         # give the activity log all the vertical space. The collapsed state
         # is per-bot and persists in app.config["UI"]["params_collapsed"][name].
-        param_wrap = ctk.CTkFrame(card, fg_color="#0a0e15", corner_radius=10,
+        param_wrap = ctk.CTkFrame(card, fg_color=COLORS["panel_alt"], corner_radius=10,
                                      border_width=1, border_color=COLORS["border_soft"])
         param_wrap.grid(row=3, column=0, sticky="nsew", padx=18, pady=(0, 2))
 
@@ -1810,7 +1894,7 @@ class ObsidianApp(ctk.CTk):
 
         # Header IM Container
         param_header = ctk.CTkFrame(param_wrap, fg_color="transparent")
-        param_header.pack(fill="x", padx=14, pady=(10, 6))
+        param_header.pack(fill="x", padx=12, pady=(6, 6))
 
         # Real button: the parameter section is reachable without a mouse.
         chevron_var = ctk.StringVar(
@@ -1936,9 +2020,10 @@ class ObsidianApp(ctk.CTk):
         sep_6 = ctk.CTkFrame(card, fg_color=COLORS["border_soft"], height=1)
         sep_6.grid(row=6, column=0, sticky="ew", padx=22, pady=(4, 0))
 
-        #  ROW 7: Action Buttons (kompakter) 
+        # Actions directly follow the bot identity and runtime state. The
+        # original callbacks and refresh-controlled enabled states are retained.
         actions = ctk.CTkFrame(card, fg_color="transparent", height=46)
-        actions.grid(row=7, column=0, sticky="ew", padx=18, pady=3)
+        actions.grid(row=1, column=0, sticky="ew", padx=18, pady=(4, 10))
         actions.grid_propagate(False)
         actions.pack_propagate(False)
 
@@ -2342,10 +2427,9 @@ class ObsidianApp(ctk.CTk):
         for i in range(len(BOT_ORDER)):
             self.main_frame.grid_rowconfigure(i, weight=0, minsize=0)
 
-        # Force redraw  wichtig bei manchen tk-Versionen
+        # A single idle geometry pass serves this whole visibility change.
         try:
-            self.main_frame.update_idletasks()
-            self._refresh_main_scrollregion()
+            self._schedule_main_scrollregion()
         except Exception:
             pass
 
@@ -2413,7 +2497,7 @@ class ObsidianApp(ctk.CTk):
         )
 
         ctk.CTkLabel(right,
-                      text="Obsidian Trading Terminal",
+                      text=f"{APP_NAME} v{APP_VERSION}",
                       font=ctk.CTkFont(FONT_BODY, 10, "bold"),
                       text_color=COLORS["text_subtle"]
                       ).pack(side="right")

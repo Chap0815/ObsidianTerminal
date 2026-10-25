@@ -32,7 +32,7 @@ from bot_utils.atomic_publish import atomic_write_bytes
 _CACHE_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "ohlcv_cache")
 
-_TF_MS = {"1h": 3_600_000, "1d": 86_400_000}
+_TF_MS = {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}
 _CACHE_JSON_MAX_BYTES = 50_000_000
 _CACHE_SCHEMA = 1
 OHLCV_CACHE_NAMESPACE_LOCK = ".namespace.lock"

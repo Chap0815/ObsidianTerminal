@@ -1,14 +1,19 @@
 {
   "advisories": [],
-  "requirements_lock_sha256": "977b313e5b47b9187ae5fc36dd994f3df77082a36b6ecc68ef61adb3d7bac666",
-  "retrieved_at_utc": "2026-10-17T06:22:01.640373+00:00",
+  "requirements_lock_sha256": "cd1d847a2a3b6b2b2bd68adda21c1d486fcea2da86a7497bf1dff63666e96368",
+  "retrieved_at_utc": "2026-10-25T01:56:17.060470+00:00",
   "safety_floors": {
-    "aiohttp": "3.14.3",
+    "aiohttp": "3.14.4",
     "anyio": "4.14.2",
+    "certifi": "2026.10.19",
     "cryptography": "50.0.1",
-    "gitpython": "3.2.0",
+    "gitpython": "3.2.1",
     "multidict": "6.9.1",
-    "urllib3": "2.8.0"
+    "pillow": "13.0.0",
+    "setuptools": "84.1.0",
+    "streamlit": "1.66.1",
+    "urllib3": "2.8.0",
+    "yarl": "1.25.1"
   },
   "schema_version": 1,
   "source": "https://api.osv.dev/v1/querybatch"

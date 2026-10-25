@@ -29,6 +29,11 @@ Run
   python trend_check.py                    # 365d daily, BTC ETH BNB XRP SOL
   python trend_check.py 540                 # ~18 months
   python trend_check.py 365 BTC ETH SOL     # custom universe
+  python trend_check.py 365 BTC --runtime-params 50,150,20,50,2,1
+  python trend_check.py 365 BTC --runtime-snapshot path/to/sanitized.json
+
+Runtime inputs are explicit effective signal values, not historical config
+evidence. The default rules and --sweep remain separate research variants.
 """
 
 # ruff: noqa: E402  # update barrier must run before project/runtime imports
@@ -36,9 +41,11 @@ Run
 from __future__ import annotations
 
 import math
+import json
 import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -57,6 +64,114 @@ MIN_TREND_DAYS = 200
 MAX_TREND_DAYS = 3_650
 MAX_TREND_COINS = 100
 MAX_COIN_LENGTH = 20
+MAX_RUNTIME_SNAPSHOT_BYTES = 8_192
+_RUNTIME_FIELDS = (
+    ("TREND_SMA_FAST", "sma_fast"), ("TREND_SMA_SLOW", "sma_slow"),
+    ("TREND_CROSS_FAST", "cross_fast"), ("TREND_CROSS_SLOW", "cross_slow"),
+    ("TREND_VOTE_MIN", "vote_min"), ("TREND_EXIT_VOTE", "exit_vote"),
+)
+
+
+def _params_from_snapshot(snapshot):
+    """Accept only explicit effective signal values, using runtime sanitizing."""
+    from bot_utils.config import merge_runtime_config
+    from trading.trend_signal import TrendParams, params_from_cfg
+
+    keys = {key for key, _field in _RUNTIME_FIELDS}
+    if type(snapshot) is not dict or set(snapshot) != keys or any(type(v) is not int for v in snapshot.values()):
+        raise ValueError("runtime snapshot must contain exactly six effective integer signal keys")
+    defaults = {key: getattr(TrendParams(), field) for key, field in _RUNTIME_FIELDS}
+    sanitized = merge_runtime_config("TREND", defaults, {"TREND": snapshot})
+    if any(sanitized.get(key) != snapshot[key] for key in keys):
+        raise ValueError("runtime snapshot contains values changed by runtime sanitizing")
+    return params_from_cfg(sanitized.get)
+
+
+def _load_runtime_snapshot(path):
+    def unique(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("duplicate runtime snapshot key")
+            result[key] = value
+        return result
+
+    def invalid_constant(_value):
+        raise ValueError("invalid runtime snapshot number")
+
+    with Path(path).open("rb") as stream:
+        raw = stream.read(MAX_RUNTIME_SNAPSHOT_BYTES + 1)
+    if len(raw) > MAX_RUNTIME_SNAPSHOT_BYTES:
+        raise ValueError("runtime snapshot exceeds byte limit")
+    try:
+        payload = json.loads(raw.decode("utf-8-sig"), object_pairs_hook=unique,
+                             parse_constant=invalid_constant)
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError("invalid runtime snapshot JSON") from exc
+    return _params_from_snapshot(payload)
+
+
+def _extract_runtime_options(args):
+    remaining, params = [], None
+    index = 0
+    while index < len(args):
+        argument = args[index]
+        if argument not in {"--runtime-params", "--runtime-snapshot"}:
+            remaining.append(argument)
+            index += 1
+            continue
+        if params is not None or index + 1 >= len(args):
+            raise ValueError("runtime signal input must be supplied exactly once")
+        value = args[index + 1]
+        if argument == "--runtime-snapshot":
+            params = _load_runtime_snapshot(value)
+        else:
+            if len(value) > 128:
+                raise ValueError("runtime signal input too long")
+            values = value.split(",")
+            if len(values) != len(_RUNTIME_FIELDS) or any(not part.isascii() or not part.isdigit() for part in values):
+                raise ValueError("runtime params require six comma-separated integers")
+            params = _params_from_snapshot({key: int(part) for (key, _field), part in zip(_RUNTIME_FIELDS, values)})
+        index += 2
+    return remaining, params
+
+
+def _runtime_signal_trace(closes, params, *, initially_held=False):
+    """Only runtime signals; retain its history guard and held-state hysteresis."""
+    from trading.trend_signal import bars_required, has_full_history, is_in_trend
+
+    if type(initially_held) is not bool:
+        raise ValueError("initial holding state must be boolean")
+    values = []
+    for value in closes:
+        if isinstance(value, bool):
+            raise ValueError("invalid runtime signal close")
+        parsed = float(value)
+        if not math.isfinite(parsed) or parsed <= 0:
+            raise ValueError("invalid runtime signal close")
+        values.append(parsed)
+    trace, held = [], initially_held
+    window = bars_required(params) + 6
+    for index in range(len(values)):
+        history = values[max(0, index + 1 - window):index + 1]
+        decision = is_in_trend(history, params, currently_held=held) if has_full_history(history, params) else (held, 0, {})
+        trace.append(decision)
+        held = decision[0]
+    return trace
+
+
+def _runtime_closed_ohlc(series, *, since_ms, now_ms):
+    """Apply the runtime's daily close gate before research normalization."""
+    from bot_utils.safe_numeric import parse_ohlcv_closes
+
+    # Validate every observed row before clipping the research window. Dropping
+    # future or malformed source rows first would conceal a runtime rejection.
+    if parse_ohlcv_closes(series, expected_interval_ms=86_400_000, now_ms=now_ms) is None:
+        return []
+    bucket = now_ms // 86_400_000 * 86_400_000
+    return [row for row in series if since_ms <= float(row[0]) < bucket]
+
+
 # Cost per position switch (one side), spot-taker-ish. Round trip = 2. Few
 # trades on daily trend, so this is minor. Override TREND_COST_PCT.
 def _trend_cost_from_env(raw=None) -> float:
@@ -130,7 +245,7 @@ def _validated_trend_ohlc(series, *, since_ms: int, until_ms: int) -> list:
     return [candles[timestamp] for timestamp in timestamps]
 
 
-def _fetch_ohlc(ex, symbol: str, days: int) -> list:
+def _fetch_ohlc(ex, symbol: str, days: int, *, runtime_signal: bool = False) -> list:
     """Cache-backed, rate-limit-safe DAILY OHLC  list of [ts,o,h,l,c,...]."""
     if (
         isinstance(days, bool)
@@ -140,7 +255,11 @@ def _fetch_ohlc(ex, symbol: str, days: int) -> list:
         return []
     tf_ms = 86_400_000
     try:
-        raw_now_ms = ex.milliseconds()
+        if runtime_signal:
+            from core.clock import now_ms as runtime_now_ms
+            raw_now_ms = runtime_now_ms()
+        else:
+            raw_now_ms = ex.milliseconds()
     except Exception as e:
         print(f"   [WARN] {symbol}: {_safe_exc(e)}")
         return []
@@ -155,10 +274,11 @@ def _fetch_ohlc(ex, symbol: str, days: int) -> list:
     if (
         not math.isfinite(numeric_now_ms)
         or numeric_now_ms <= 0.0
-        or not numeric_now_ms.is_integer()
+        or (not runtime_signal and not numeric_now_ms.is_integer())
     ):
         print(f"   [WARN] {symbol}: invalid exchange clock")
         return []
+    # TrendBot also truncates its regular submillisecond clock to integer ms.
     now_ms = int(numeric_now_ms)
     try:
         raw_asof = backtest_asof_ms()  # IS/OOS wall: cap "now" to cutoff
@@ -189,12 +309,15 @@ def _fetch_ohlc(ex, symbol: str, days: int) -> list:
         print(f"   [WARN] {symbol}: {_safe_exc(e)}")
         return []
     current_bucket_start = (now_ms // tf_ms) * tf_ms
-    validated = _validated_trend_ohlc(
-        series,
-        since_ms=since,
-        until_ms=current_bucket_start - 1,
-    )
-    if not validated or validated[-1][0] != current_bucket_start - tf_ms:
+    if runtime_signal:
+        validated = _runtime_closed_ohlc(series, since_ms=since, now_ms=now_ms)
+    else:
+        validated = _validated_trend_ohlc(
+            series,
+            since_ms=since,
+            until_ms=current_bucket_start - 1,
+        )
+    if not validated or float(validated[-1][0]) != current_bucket_start - tf_ms:
         print(f"   [WARN] {symbol}: stale daily history")
         return []
     return validated
@@ -309,8 +432,7 @@ def _verdict(s_ret, b_ret, s_dd, b_dd) -> str:
 
 
 def _sig_ensemble(c, h, low):
-    """Long when a MAJORITY of the fast rules agree  more robust than any one
-    moving-average length (reduces overfit to a single parameter)."""
+    """Research long/flat rule using a majority of three fast signals."""
     votes = (
         _sig_price_ma(c, h, low, 50).astype(int)
         + _sig_price_ma(c, h, low, 100).astype(int)
@@ -379,13 +501,395 @@ def _print_sweep(data):
     print(f"  -> ensemble beats B&H on {bc}/{len(data)} coins")
 
 
+MAX_SIZING_ROWS = 20_000
+MAX_SIZING_REPORT_BYTES = 16 * 1024 * 1024
+_SIZING_FIELDS = ("POSITION_SIZE", "POSITION_SIZE_MAX", "TREND_VOL_TARGET_LOOKBACK")
+_SIZING_SOURCE_FILES = (
+    "tools/trend_check.py", "trading/trend_signal.py", "trading/vol_target.py",
+    "tools/native_ohlcv_snapshot.py", "tools/ohlcv_cache.py",
+    "bot_utils/safe_numeric.py", "bot_utils/config.py", "bot_utils/atomic_publish.py",
+    "tools/simulation_workspace.py", "trading/profit_research_runner.py",
+    "trading/experiment_registry_contract.py", "sqlite_safety.py",
+)
+
+
+def _sizing_source_hashes(source_root=None):
+    """Bind public code bytes, including the actual signal/input validators."""
+    import hashlib
+    from tools.native_ohlcv_snapshot import _plain_path
+
+    root = _plain_path(Path(__file__).absolute().parents[1] if source_root is None else source_root)
+    result = {}
+    for relative in _SIZING_SOURCE_FILES:
+        path = _plain_path(root / relative)
+        with path.open("rb") as stream:
+            before = os.fstat(stream.fileno())
+            raw = stream.read(2 * 1024 * 1024 + 1)
+            after = os.fstat(stream.fileno())
+        if (len(raw) > 2 * 1024 * 1024 or len(raw) != before.st_size
+                or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)):
+            raise ValueError("sizing source is oversized or changed during hashing")
+        result[relative] = hashlib.sha256(raw).hexdigest()
+    return result
+
+
+def _sizing_values(size, cap, lookback):
+    if (type(size) not in (int, float) or not math.isfinite(size) or not 0 < size <= 10_000
+            or type(cap) not in (int, float) or not math.isfinite(cap) or not 0 <= cap <= 10_000
+            or type(lookback) is not int or not 10 <= lookback <= 200):
+        raise ValueError("sizing requires finite size (0,10000], cap [0,10000], integer lookback [10,200]")
+    return float(size), float(cap), lookback
+
+
+def _sizing_inputs(directory):
+    """Read every declared daily Spot stream, without substitutes or subsets."""
+    import csv
+    import hashlib
+    import io
+    from tools import native_ohlcv_snapshot as native
+
+    directory = native._plain_path(directory)
+    manifest = native.verify_snapshot(directory)
+    if (manifest["schema_version"], manifest["market_type"], manifest["endpoint"]) != (
+            2, "spot", "/api/v3/klines"):
+        raise ValueError("sizing diagnostics require a native Spot schema2 snapshot")
+    daily = {item["symbol"]: item for item in manifest["streams"] if item["timeframe"] == "1d"}
+    universe = {item["symbol"] for item in manifest["streams"]}
+    days = (manifest["end_ms"] - manifest["start_ms"]) // 86_400_000
+    if (set(daily) != universe or not 1 <= len(universe) <= MAX_TREND_COINS
+            or not 1 <= days <= MAX_TREND_DAYS or days * len(universe) > MAX_SIZING_ROWS):
+        raise ValueError("incomplete daily basket or sizing row budget exceeded")
+    closes = {}
+    for symbol, item in sorted(daily.items()):
+        if item["rows"] != days:
+            raise ValueError("daily basket grids differ")
+        with native._plain_path(directory / item["file"]).open("rb") as stream:
+            raw = stream.read(native.MAX_FILE_BYTES + 1)
+        if len(raw) != item["bytes"] or hashlib.sha256(raw).hexdigest() != item["sha256"]:
+            raise ValueError("daily source changed during sizing read")
+        reader = csv.reader(io.StringIO(raw.decode("utf-8"), newline=""))
+        if next(reader, None) != list(native._HEADER):
+            raise ValueError("daily CSV header differs from native contract")
+        rows = []
+        for index, row in enumerate(reader):
+            if index >= days or len(row) != 6 or any(len(cell) > 64 for cell in row):
+                raise ValueError("daily CSV exceeds its declared shape")
+            stamp = manifest["start_ms"] + index * 86_400_000
+            if row[0] != datetime.fromtimestamp(stamp / 1000, timezone.utc).isoformat():
+                raise ValueError("daily CSV is not the identical closed UTC grid")
+            values = [float(cell) for cell in row[1:]]
+            op, high, low, close, volume = values
+            if (any(not math.isfinite(value) for value in values) or min(values[:4]) <= 0
+                    or volume < 0 or high < max(op, close) or low > min(op, close)):
+                raise ValueError("invalid daily candle")
+            rows.append([stamp, *values])
+        if len(rows) != days or _runtime_closed_ohlc(
+                rows, since_ms=manifest["start_ms"], now_ms=manifest["end_ms"]) != rows:
+            raise ValueError("daily basket contains missing, forming or invalid candles")
+        closes[symbol] = [row[4] for row in rows]
+    if native.verify_snapshot(directory) != manifest:
+        raise ValueError("native sizing snapshot changed during read")
+    return manifest, closes
+
+
+def _sizing_diagnostic_report(directory, params, *, size, cap, lookback,
+                              registry_root=None, trial_id=None):
+    """Conditional requested quotes, never cash allocations or a backtest."""
+    import hashlib
+    from trading.trend_signal import bars_required, has_full_history, is_in_trend
+    from trading.vol_target import realized_vol, basket_median_vol, vol_target_multiplier
+    from tools.simulation_workspace import register_planned_trial, validate_trial_registry_options
+
+    validate_trial_registry_options(registry_root, trial_id)
+    size, cap, lookback = _sizing_values(size, cap, lookback)
+    supplied_signal = {key: getattr(params, field) for key, field in _RUNTIME_FIELDS}
+    if _params_from_snapshot(supplied_signal) != params:
+        raise ValueError("invalid effective signal parameters")
+    sources = _sizing_source_hashes()
+    manifest, series = _sizing_inputs(directory)
+    inputs = {"signal_params": supplied_signal,
+              "sizing_params": dict(zip(_SIZING_FIELDS, (size, cap, lookback))),
+              "native_manifest": manifest}
+    encoded_inputs = json.dumps(inputs, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    trials = []
+    if registry_root is not None:
+        for target in (False, True):
+            suffix = "on" if target else "off"
+            trials.append(register_planned_trial(registry_root, trial_id + ":" + suffix,
+                experiment_name="trend_requested_quote_sizing", sources=sources,
+                dataset={"native_manifest": manifest, "inputs_sha256": hashlib.sha256(encoded_inputs).hexdigest()},
+                controls={"signal_params": supplied_signal, "size": size, "cap": cap,
+                          "lookback": lookback, "vol_target": target},
+                baseline={"vol_target": False, "size": size, "cap": cap, "signal_params": supplied_signal},
+                split_policy={"method": "not_applicable_conditional_quote_sizing",
+                              "portfolio_or_pnl_evaluation": False, "independent_holdout_verified": False}))
+    day = 86_400_000
+    count = (manifest["end_ms"] - manifest["start_ms"]) // day
+    window = max(bars_required(params), lookback + 1) + 6
+    rows = []
+    for index in range(count):
+        histories = {symbol: values[max(0, index + 1 - window):index + 1]
+                     for symbol, values in series.items()}
+        # Runtime computes the median before held/signal/claim gates. Do not
+        # filter the declared basket to today's entry candidates.
+        try:
+            vols = {symbol: realized_vol(values, lookback) for symbol, values in histories.items()}
+        except (ArithmeticError, AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("invalid runtime volatility inputs") from exc
+        median = basket_median_vol(list(vols.values()))
+        for symbol, history in histories.items():
+            ready = has_full_history(history, params)
+            signal, votes, _detail = is_in_trend(history, params, currently_held=False) if ready else (False, 0, {})
+            multiplier = vol_target_multiplier(vols[symbol], median)
+            baseline, targeted = size, size * multiplier
+            if cap > 0:
+                baseline, targeted = min(baseline, cap), min(targeted, cap)
+            if (not all(math.isfinite(value) and value > 0 for value in (baseline, targeted))
+                    or not 0.33 <= multiplier <= 1.0 or targeted > baseline):
+                raise ValueError("invalid bounded runtime sizing result")
+            rows.append({"decision_ms": manifest["start_ms"] + (index + 1) * day,
+                "symbol": symbol, "closed_bars_available": index + 1,
+                "history_bars_used": len(history), "full_signal_history": ready,
+                "entry_signal_if_unheld": signal, "votes": votes,
+                "realized_vol": vols[symbol], "basket_median_vol": median,
+                "multiplier": multiplier,
+                "baseline_requested_quote": baseline if signal else None,
+                "voltarget_requested_quote": targeted if signal else None,
+                "reason": "conditional_entry_quote" if signal else "no_entry_signal" if ready else "warmup"})
+    result = {"schema_version": 1, "kind": "trend_requested_quote_sizing_diagnostic",
+        "variants": ["vol_target_off", "vol_target_on"],
+        "inputs_sha256": hashlib.sha256(encoded_inputs).hexdigest(), "inputs": inputs,
+        "universe": list(series), "decision_time": "UTC_daily_bar_close",
+        "quote_condition": "unheld, entry signal true, all other runtime entry gates allow",
+        "historical_universe_verified": False, "historical_configuration_verified": False,
+        "portfolio_parity": False, "pnl_simulated": False, "promotion_eligible": False,
+        "rows": rows}
+    if trials:
+        result["trial_registration"] = trials
+    result["source_sha256"] = sources
+    result["experiment_identity_sha256"] = hashlib.sha256(json.dumps(
+        {"inputs_sha256": result["inputs_sha256"], "source_sha256": sources},
+        sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+    from tools.native_ohlcv_snapshot import verify_snapshot
+    if verify_snapshot(directory) != manifest:
+        raise ValueError("native sizing snapshot changed during calculation")
+    if _sizing_source_hashes() != sources:
+        raise ValueError("sizing source changed during calculation")
+    if len(json.dumps(result, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()) > MAX_SIZING_REPORT_BYTES:
+        raise ValueError("sizing report byte budget exceeded")
+    return result
+
+
+def _sizing_diagnostic_main(arguments):
+    import argparse
+    import hashlib
+    from bot_utils.atomic_publish import atomic_create_bytes
+    from tools.native_ohlcv_snapshot import _plain_path
+
+    parser = argparse.ArgumentParser(description="Offline TREND conditional quote sizing; no portfolio/PnL simulation")
+    parser.add_argument("--sizing-snapshot", required=True, type=Path)
+    parser.add_argument("--sizing-params", required=True, help="POSITION_SIZE,POSITION_SIZE_MAX,LOOKBACK")
+    parser.add_argument("--output", required=True, type=Path, help="fresh immutable JSON report")
+    from tools.simulation_workspace import add_trial_registry_arguments, validate_trial_registry_options
+    add_trial_registry_arguments(parser)
+    try:
+        remaining, params = _extract_runtime_options(arguments)
+        args = parser.parse_args(remaining)
+        validate_trial_registry_options(args.registry_root, args.trial_id)
+        if params is None:
+            raise ValueError("sizing requires six explicit effective runtime signal parameters")
+        if len(args.sizing_params) > 128:
+            raise ValueError("oversized sizing parameters")
+        values = args.sizing_params.split(",")
+        if len(values) != 3 or not values[2].isascii() or not values[2].isdigit():
+            raise ValueError("sizing params require size,cap,integer-lookback")
+        output = _plain_path(args.output)
+        if output.exists():
+            raise ValueError("sizing output must be fresh")
+        report = _sizing_diagnostic_report(args.sizing_snapshot, params,
+            size=float(values[0]), cap=float(values[1]), lookback=int(values[2]),
+            registry_root=args.registry_root, trial_id=args.trial_id)
+        raw = json.dumps(report, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+        if len(raw) > MAX_SIZING_REPORT_BYTES:
+            raise ValueError("sizing report byte budget exceeded")
+        if not atomic_create_bytes(output, raw):
+            raise ValueError("sizing output already exists")
+        print(json.dumps({"report": str(output), "sha256": hashlib.sha256(raw).hexdigest(),
+                          "decision_rows": len(report["rows"]), "promotion_eligible": False}, sort_keys=True))
+        return 0
+    except SystemExit as exc:
+        return int(exc.code)
+    except (OSError, ValueError, TypeError, OverflowError, UnicodeError, RuntimeError) as exc:
+        print(f"Invalid sizing diagnostic: {_safe_exc(exc)}")
+        return 2
+
+
+def _event_trace_input(path):
+    """Bounded, stable, link-free input; duplicate keys never select a winner."""
+    from tools.native_ohlcv_snapshot import _plain_path
+    from tools.backtester import TREND_EVENT_MAX_BYTES
+
+    path = _plain_path(path)
+    with path.open("rb") as stream:
+        before = os.fstat(stream.fileno())
+        raw = stream.read(TREND_EVENT_MAX_BYTES + 1)
+        after = os.fstat(stream.fileno())
+    if (not raw or len(raw) > TREND_EVENT_MAX_BYTES or len(raw) != before.st_size
+            or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)):
+        raise ValueError("event trace changed during read or exceeds byte budget")
+    _plain_path(path)
+
+    def unique(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("duplicate event trace key")
+            result[key] = value
+        return result
+
+    def invalid_constant(_value):
+        raise ValueError("nonfinite event trace number")
+
+    try:
+        trace = json.loads(raw.decode("utf-8-sig"), object_pairs_hook=unique,
+                           parse_constant=invalid_constant)
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError("invalid event trace JSON") from exc
+    return raw, trace
+
+
+def _event_source_hashes():
+    from tools.backtester import _trend_event_code_hashes
+    return {**_sizing_source_hashes(), **_trend_event_code_hashes()}
+
+
+def _event_replay_report(path, *, compare_vol_target=False, registry_root=None, trial_id=None):
+    """Explicit paper accounting, with no historical scheduler/account grant."""
+    import hashlib
+    from copy import deepcopy
+    from tools.backtester import _trend_event_encode, simulate_trend_events
+    from tools.simulation_workspace import register_planned_trial, validate_trial_registry_options
+
+    validate_trial_registry_options(registry_root, trial_id)
+    if type(compare_vol_target) is not bool:
+        raise ValueError("event comparison flag must be boolean")
+    suffixes = ("off", "on") if compare_vol_target else ("explicit",)
+    if registry_root is not None:
+        for suffix in suffixes:
+            validate_trial_registry_options(registry_root, trial_id + ":" + suffix)
+    sources = _event_source_hashes()
+    raw, trace = _event_trace_input(path)
+    if (type(trace) is not dict or type(trace.get("strategy_params")) is not dict
+            or type(trace["strategy_params"].get("vol_target")) is not bool
+            or type(trace.get("signal_params")) is not dict
+            or type(trace.get("execution_model")) is not dict):
+        raise ValueError("event trace requires explicit strategy, signal and execution parameters")
+    canonical = _trend_event_encode(trace)
+    file_sha = hashlib.sha256(raw).hexdigest()
+    comparable = deepcopy(trace)
+    if compare_vol_target:
+        comparable["strategy_params"].pop("vol_target")
+    dataset = {"input_file_sha256": file_sha,
+               "canonical_trace_sha256": hashlib.sha256(canonical).hexdigest(),
+               "comparison_inputs_sha256": hashlib.sha256(_trend_event_encode(comparable)).hexdigest()}
+    variants = []
+    for suffix in suffixes:
+        variant = deepcopy(trace)
+        if compare_vol_target:
+            variant["strategy_params"]["vol_target"] = suffix == "on"
+        variants.append((suffix, variant))
+    baseline = {"policy": "fixed_off" if compare_vol_target else "explicit_trace_no_comparison",
+                "strategy_params": variants[0][1]["strategy_params"],
+                "no_benchmark_performance_claim": True}
+    trials = []
+    if registry_root is not None:
+        for suffix, variant in variants:
+            trials.append(register_planned_trial(registry_root, trial_id + ":" + suffix,
+                experiment_name="trend_explicit_event_replay", sources=sources, dataset=dataset,
+                controls={name: variant[name] for name in ("strategy_params", "signal_params", "execution_model")},
+                baseline=baseline,
+                split_policy={"method": "explicit_ordered_trace_exploratory_only",
+                              "historical_trace_provenance_verified": False,
+                              "independent_holdout_verified": False}))
+    results = [{"variant": suffix, "result": simulate_trend_events(variant)}
+               for suffix, variant in variants]
+    if _trend_event_encode(trace) != canonical or _event_trace_input(path)[0] != raw:
+        raise ValueError("event trace changed during calculation")
+    if _event_source_hashes() != sources:
+        raise ValueError("event replay source changed during calculation")
+    identity = {"dataset": dataset, "sources": sources,
+                "variants": [{"name": suffix, "strategy_params": variant["strategy_params"]}
+                             for suffix, variant in variants]}
+    report = {"schema_version": 1, "kind": "trend_explicit_event_replay",
+              "verdict": "NO_GO", "promotion_eligible": False,
+              "historical_configuration_verified": False,
+              "historical_trace_provenance_verified": False,
+              "independent_holdout_verified": False,
+              "comparison_policy": baseline["policy"], "dataset": dataset,
+              "source_sha256": sources,
+              "experiment_identity_sha256": hashlib.sha256(_trend_event_encode(identity)).hexdigest(),
+              "variants": results}
+    if trials:
+        report["trial_registration"] = trials
+    _trend_event_encode(report)
+    return report
+
+
+def _event_replay_main(arguments):
+    import argparse
+    import hashlib
+    import sqlite3
+    from bot_utils.atomic_publish import atomic_create_bytes
+    from tools.native_ohlcv_snapshot import _plain_path
+    from tools.backtester import _trend_event_encode
+    from tools.simulation_workspace import add_trial_registry_arguments, validate_trial_registry_options
+
+    parser = argparse.ArgumentParser(description="Offline TREND explicit event replay; research only")
+    parser.add_argument("--event-trace", required=True, type=Path)
+    parser.add_argument("--output", required=True, type=Path, help="fresh immutable JSON report")
+    parser.add_argument("--compare-vol-target", action="store_true")
+    add_trial_registry_arguments(parser)
+    try:
+        args = parser.parse_args(arguments)
+        validate_trial_registry_options(args.registry_root, args.trial_id)
+        output = _plain_path(args.output)
+        if output.exists():
+            raise ValueError("event replay output must be fresh")
+        report = _event_replay_report(args.event_trace, compare_vol_target=args.compare_vol_target,
+                                     registry_root=args.registry_root, trial_id=args.trial_id)
+        raw = _trend_event_encode(report)
+        if not atomic_create_bytes(output, raw):
+            raise ValueError("event replay output already exists")
+        print(json.dumps({"report": str(output), "sha256": hashlib.sha256(raw).hexdigest(),
+                          "variants": len(report["variants"]), "promotion_eligible": False}, sort_keys=True))
+        return 0
+    except SystemExit as exc:
+        return int(exc.code)
+    except (OSError, ValueError, TypeError, OverflowError, RecursionError, RuntimeError, sqlite3.Error) as exc:
+        print(f"Invalid event replay: {_safe_exc(exc)}")
+        return 2
+
+
 def main():
-    args = sys.argv[1:]
+    if any(arg in {"--event-trace", "--compare-vol-target"} for arg in sys.argv[1:]):
+        return _event_replay_main(sys.argv[1:])
+    if any(arg in {"--sizing-snapshot", "--sizing-params"} for arg in sys.argv[1:]):
+        return _sizing_diagnostic_main(sys.argv[1:])
+    try:
+        args, runtime_params = _extract_runtime_options(sys.argv[1:])
+    except (OSError, ValueError, TypeError):
+        print("  Invalid runtime signal input: supply six effective values or a sanitized snapshot")
+        return 2
     unknown_options = [arg for arg in args if arg.startswith("--") and arg != "--sweep"]
     if unknown_options:
         print(f"  Unknown option: {unknown_options[0]}")
         return 2
     do_sweep = "--sweep" in args
+    if do_sweep and runtime_params is not None:
+        print("  Runtime signal mode and research sweep must run separately")
+        return 2
     pos = [a for a in args if not a.startswith("--")]
     if pos:
         try:
@@ -398,6 +902,12 @@ def main():
             return 2
     else:
         days = DEFAULT_DAYS
+    if runtime_params is not None:
+        from trading.trend_signal import bars_required
+
+        if days < bars_required(runtime_params):
+            print(f"  Invalid days argument: runtime history requires {bars_required(runtime_params)} closed bars")
+            return 2
     coins = [a.upper() for a in pos[1:]] if len(pos) > 1 else DEFAULT_COINS
     if (
         not 1 <= len(coins) <= MAX_TREND_COINS
@@ -414,10 +924,26 @@ def main():
         return 2
 
     print("=" * 90)
-    print("  TREND-FOLLOWING EDGE CHECK (long/flat, vs buy-and-hold)")
+    configs = CONFIGS
+    if runtime_params is not None:
+        def runtime_signal(closes, _highs, _lows):
+            return np.asarray([decision[0] for decision in _runtime_signal_trace(closes, runtime_params)], dtype=bool)
+
+        configs = [("Runtime TREND", runtime_signal)]
+        values = ",".join(str(getattr(runtime_params, field)) for _key, field in _RUNTIME_FIELDS)
+        print("  TREND RUNTIME SIGNAL COMPARISON (explicit parameter snapshot)")
+        print(f"  effective fast,slow,cross_fast,cross_slow,vote_min,exit_vote={values}")
+        print(f"  history guard: {bars_required(runtime_params)} closed daily bars; initial warmup stays flat")
+        print("  Signal parity only: daily-close returns and switch costs are a proxy.")
+        print("  No execution parity: voltarget/sizing, cooldown/reentry, 20s safety,")
+        print("  killswitch/recovery, fees/fills/claims and portfolio effects are not simulated.")
+        print("  This supplied snapshot is not proof of historical runtime configuration.")
+    else:
+        print("  TREND RESEARCH VARIANTS (long/flat daily proxies, vs buy-and-hold)")
+        print("  Generic rules/sweeps do not reproduce the configured runtime strategy.")
     print(
         f"  {days}d daily | cost {COST * 100:.2f}%/switch | "
-        f"rules: {', '.join(n for n, _ in CONFIGS)}"
+        f"rules: {', '.join(n for n, _ in configs)}"
     )
     print("=" * 90)
 
@@ -447,12 +973,30 @@ def main():
         if sym not in markets:
             print(f"  {coin}: no spot market  skipped")
             continue
-        ohlc = _fetch_ohlc(ex, sym, days)
+        if runtime_params is not None:
+            market = markets[sym]
+            if (
+                not isinstance(market, dict) or market.get("spot") is not True
+                or market.get("type") not in (None, "spot")
+                or any(market.get(flag) is not None and market.get(flag) is not False
+                       for flag in ("swap", "future", "contract"))
+                or market.get("symbol") not in (None, sym)
+            ):
+                print(f"  {coin}: no confirmed spot market  skipped")
+                continue
+            ohlc = _fetch_ohlc(ex, sym, days, runtime_signal=True)
+        else:
+            ohlc = _fetch_ohlc(ex, sym, days)
         if len(ohlc) < days:
             print(f"  {coin}: only {len(ohlc)} daily bars  skipped")
             continue
-        arr = np.array(ohlc, dtype=float)
-        data[coin] = (arr[:, 4], arr[:, 2], arr[:, 3])  # close, high, low
+        if runtime_params is not None:
+            # Runtime signal truth uses closes only; do not invent high/low
+            # values or impose an unrelated OHLC strategy's validation rules.
+            data[coin] = (np.asarray([float(row[4]) for row in ohlc]), None, None)
+        else:
+            arr = np.array(ohlc, dtype=float)
+            data[coin] = (arr[:, 4], arr[:, 2], arr[:, 3])  # close, high, low
         print(f"   {coin}: {len(ohlc)} daily bars")
 
     if not data:
@@ -467,7 +1011,7 @@ def main():
     print("  " + "-" * 86)
 
     summary = []
-    for name, fn in CONFIGS:
+    for name, fn in configs:
         per = [_backtest_trend(c, h, low, fn) for c, h, low in data.values()]
         avg = {k: float(np.mean([p[k] for p in per])) for k in per[0]}
         v = _verdict(avg["strat_ret"], avg["bh_ret"], avg["strat_dd"], avg["bh_dd"])
@@ -479,26 +1023,11 @@ def main():
         )
     print("  " + "-" * 86)
 
-    beats = [s for s in summary if s[2] in ("BEATS B&H", "SAFER", "HIGHER RET")]
-    print("\n  READ-OUT")
-    if len(beats) >= 3:
-        print(
-            f"  Trend-following looks PROMISING: {len(beats)}/{len(summary)} "
-            f"rules beat or de-risked buy-and-hold ROBUSTLY (not one cherry-"
-        )
-        print("    picked setting). Next step: build the long/flat trend bot on")
-        print("    the majors, validate in SIM. This is a real candidate.")
-    elif beats:
-        print(f"  MIXED: only {len(beats)}/{len(summary)} rules helped. Could be")
-        print("    a specific-rule effect, not a robust edge. Borderline.")
-    else:
-        print("  NO trend edge here: every rule underperformed buy-and-hold on")
-        print("    both return AND drawdown. On this universe/period, even trend-")
-        print("  following doesn't add value  the honest answer is paper/flat.")
+    print("\n  READ-OUT: historical signal-proxy comparisons; no profitability or execution claim.")
 
     if do_sweep:
         print("\n" + "=" * 90)
-        print("  ROBUSTNESS SWEEP")
+        print("  RESEARCH PARAMETER SWEEP (not runtime parity)")
         print("=" * 90)
         _print_sweep(data)
 

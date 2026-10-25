@@ -1,5 +1,5 @@
 """
-dashboard.py  Obsidian Trading Terminal v5.0
+dashboard.py  Obsidian Trading Terminal
 Comprehensive analytics for Spot + Futures bots
 
 Tabs:
@@ -43,6 +43,7 @@ from sqlite_safety import harden_sqlite_connection
 from bot_utils.atomic_publish import atomic_write_bytes
 from bot_utils.config import parse_explicit_bool
 from bot_utils.order_utils import explicit_trade_symbol_matches
+from core.version import APP_NAME, APP_VERSION
 from bot_utils.pnl_view import (
     futures_state_age_sec,
     futures_unrealized_from_row,
@@ -57,7 +58,7 @@ import plotly.graph_objects as go
 
 #  Page Setup
 st.set_page_config(
-    page_title="Obsidian Terminal",
+    page_title=f"{APP_NAME} v{APP_VERSION}",
     layout="wide",
     page_icon="",
     initial_sidebar_state="expanded",
@@ -319,8 +320,15 @@ BOT_SUBTITLES = {
 st.markdown(
     """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@400;500;600;700;800&display=swap');
-
+:root {
+    --terminal-bg: #0a0810;
+    --terminal-panel: #16131f;
+    --terminal-raised: #201c2b;
+    --terminal-border: #2b2740;
+    --terminal-text: #e9e7f2;
+    --terminal-muted: #a39db8;
+    --terminal-accent: #b9a9f5;
+}
 .stApp {
     background:
         radial-gradient(ellipse 80% 60% at 15% 0%, rgba(106,92,192,0.06) 0%, transparent 60%),
@@ -328,35 +336,60 @@ st.markdown(
         radial-gradient(ellipse 60% 50% at 50% 100%, rgba(106,92,192,0.03) 0%, transparent 60%),
         #0a0810 !important;
     color: #e9e7f2;
-    font-family: 'Inter', sans-serif;
+    font-family: 'Segoe UI', Inter, system-ui, sans-serif;
 }
-header[data-testid="stHeader"]   { display: none !important; }
+/* Keep Streamlit's sidebar toggle reachable on narrow screens. */
+header[data-testid="stHeader"] { background: transparent; }
+[data-testid="stToolbar"] { right: 0.75rem; }
+.block-container { padding-top: 3.5rem; max-width: 1800px; }
 [data-testid="stStatusWidget"]   { display: none !important; }
-[data-stale="true"]              { opacity: 1 !important; filter: none !important; }
 section[data-testid="stSidebar"] {
-    background: rgba(8,11,16,0.85) !important;
-    border-right: 1px solid rgba(255,255,255,0.05);
-    backdrop-filter: blur(20px);
+    background: #121019 !important;
+    border-right: 1px solid var(--terminal-border);
 }
+.workspace-heading { margin: 18px 0 6px; font-size: 1.5rem; font-weight: 700; letter-spacing: -0.03em; }
+.workspace-description { color: var(--terminal-muted); font-size: 0.9rem; margin-bottom: 18px; }
+.st-key-workspace_navigation {
+    background: var(--terminal-panel); border: 1px solid var(--terminal-border);
+    border-radius: 12px; padding: 8px;
+}
+.surface-card, .metric-card, .bot-summary {
+    background: var(--terminal-panel); border: 1px solid var(--terminal-border);
+    border-radius: 14px; padding: 20px; margin-bottom: 12px;
+}
+.metric-card { position: relative; overflow: hidden; min-height: 142px; }
+.metric-card::before {
+    content: ''; position: absolute; left: 20px; right: 20px; top: 0;
+    height: 3px; background: var(--metric-accent, #6a5cc0); border-radius: 0 0 4px 4px;
+}
+.bot-summary-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.bot-summary-name { font-size: 1.05rem; font-weight: 700; color: var(--terminal-text); }
+.bot-summary-subtitle { color: var(--terminal-muted); font-size: 0.8rem; margin-top: 4px; }
+.bot-summary-net { font-size: 1.8rem; font-weight: 700; margin: 14px 0; font-variant-numeric: tabular-nums; }
+.bot-summary-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px 8px; }
+.bot-summary-grid span { display: block; color: var(--terminal-muted); font-size: 0.73rem; }
+.bot-summary-grid b { display: block; color: var(--terminal-text); font-size: 0.9rem; margin-top: 3px; font-variant-numeric: tabular-nums; }
+.bot-summary-net, .bot-summary-grid b { overflow-wrap: anywhere; }
 
 .kpi-label {
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.65rem;
-    color: #64748b;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    font-size: 0.75rem;
+    color: #a39db8;
     text-transform: uppercase;
-    letter-spacing: 0.14em;
+    letter-spacing: 0.06em;
     margin-bottom: 6px;
     font-weight: 600;
 }
 .kpi-value {
-    font-size: 2.1rem;
-    font-weight: 800;
-    line-height: 1.1;
+    font-size: 2rem;
+    font-weight: 700;
+    line-height: 1.2;
     letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums;
 }
 .kpi-sub {
-    font-size: 0.75rem;
-    color: #64748b;
+    font-size: 0.8rem;
+    color: #a39db8;
     margin-top: 6px;
     font-weight: 500;
 }
@@ -376,7 +409,7 @@ section[data-testid="stSidebar"] {
 .stTabs [data-baseweb="tab"] {
     background: transparent;
     border-radius: 8px;
-    color: #64748b;
+    color: #a39db8;
     padding: 10px 22px;
     font-weight: 600;
     font-size: 0.85rem;
@@ -438,15 +471,37 @@ h1, h2, h3 { letter-spacing: -0.02em; }
 ::-webkit-scrollbar-thumb:hover { background: rgba(106,92,192,0.5); }
 
 .section-title {
-    font-size: 0.7rem;
-    color: #64748b;
+    font-size: 0.8rem;
+    color: #b9a9f5;
     text-transform: uppercase;
-    letter-spacing: 0.18em;
+    letter-spacing: 0.08em;
     font-weight: 700;
     margin: 24px 0 12px 0;
     padding-bottom: 8px;
     border-bottom: 1px solid rgba(255,255,255,0.06);
 }
+.stButton > button { min-height: 2.5rem; }
+.stButton > button:focus-visible {
+    outline: 2px solid #b9a9f5;
+    outline-offset: 3px;
+}
+.research-grid {
+    display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 10px; margin: 8px 0 16px;
+}
+.research-cell {
+    background: #16131f; border: 1px solid #2b2740; border-radius: 12px;
+    padding: 12px 14px; min-width: 0;
+}
+.research-value { font-size: 1.05rem; font-weight: 650; color: #e9e7f2; margin: 6px 0; }
+.research-detail { font-size: 0.8rem; color: #a39db8; line-height: 1.5; }
+.research-evidence { margin-top: 8px; }
+.research-evidence summary { color: var(--terminal-accent); cursor: pointer; font-size: 0.75rem; }
+.research-evidence summary:focus-visible { outline: 2px solid var(--terminal-accent); outline-offset: 3px; }
+.research-evidence[open] summary { margin-bottom: 8px; }
+.research-value, .research-detail { overflow-wrap: anywhere; }
+@media (max-width: 1100px) { .research-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 480px) { .research-grid { grid-template-columns: 1fr; } }
 
 /*  DataFrame / Tabellen Dark-Theme  */
 [data-testid="stDataFrame"],
@@ -528,6 +583,10 @@ h1, h2, h3 { letter-spacing: -0.02em; }
     .block-container { padding-left: 0.75rem !important; padding-right: 0.75rem !important; }
     .kpi-value { overflow-wrap: anywhere; }
     [role="radiogroup"] { flex-wrap: wrap !important; }
+    .st-key-workspace_navigation [data-testid="stColumn"] {
+        min-width: 0 !important; flex: 1 1 28% !important;
+    }
+    .st-key-workspace_navigation .stButton > button { padding: 0.4rem; font-size: 0.8rem; }
 }
 [data-testid="stAlert"] {
     background: rgba(12,17,26,0.9) !important;
@@ -541,7 +600,7 @@ h1, h2, h3 { letter-spacing: -0.02em; }
     border-bottom: 1px solid rgba(255,255,255,0.06) !important;
 }
 [data-baseweb="tab"] {
-    color: #64748b !important;
+    color: #a39db8 !important;
 }
 [data-baseweb="tab"][aria-selected="true"] {
     color: #b3a8e8 !important;
@@ -557,10 +616,7 @@ h1, h2, h3 { letter-spacing: -0.02em; }
 
 def _card(content: str, border_color: str = "rgba(255,255,255,0.07)") -> str:
     return (
-        f'<div style="background:rgba(12,17,26,0.9); border-radius:14px; '
-        f"border:1px solid rgba(255,255,255,0.07); "
-        f"border-left:4px solid {border_color}; "
-        f'padding:20px; margin-bottom:14px;">'
+        f'<div class="surface-card" style="border-top:2px solid {border_color};">'
         f"{content}</div>"
     )
 
@@ -589,7 +645,7 @@ def _render_dark_table(
         st.markdown(
             '<div style="background:rgba(12,17,26,0.9); border-radius:10px; '
             "border:1px dashed rgba(255,255,255,0.08); padding:30px; "
-            'text-align:center; color:#64748b; font-size:0.85rem;">'
+            'text-align:center; color:#a39db8; font-size:0.85rem;">'
             "No data to display."
             "</div>",
             unsafe_allow_html=True,
@@ -697,17 +753,42 @@ def _kpi_card(
     suffix_html = html.escape(str(suffix))
     sub_html = html.escape(str(sub))
     return (
-        f'<div style="position:relative; background:rgba(15,20,29,0.6); '
-        f"backdrop-filter:blur(12px); border-radius:14px; "
-        f"border:1px solid rgba(255,255,255,0.06); padding:20px 22px; "
-        f'overflow:hidden;">'
-        f'  <div style="position:absolute; top:0; left:0; right:0; height:2px; '
-        f'background:linear-gradient(90deg, {accent_color}, transparent);"></div>'
-        f'  <div class="kpi-label" style="color:{accent_color};">{label_html}</div>'
-        f'  <div class="kpi-value {css}">{value_html} <span style="font-size:0.85rem; color:#475569; font-weight:600;">{suffix_html}</span></div>'
+        f'<div class="metric-card" style="--metric-accent:{accent_color};">'
+        f'  <div class="kpi-label">{label_html}</div>'
+        f'  <div class="kpi-value {css}">{value_html} <span style="font-size:0.85rem; color:#a39db8; font-weight:600;">{suffix_html}</span></div>'
         f'  <div class="kpi-sub">{sub_html}</div>'
         f"</div>"
     )
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_training_status() -> dict:
+    """Read the published research report, independently of trading sources."""
+    try:
+        from trading.training_status import read_training_ui_status
+        return read_training_ui_status(_PROJECT_ROOT)
+    except Exception:
+        return {}
+
+
+def _render_training_status(status: dict) -> None:
+    from launcher.ui.training_presenter import training_status_cards
+
+    _section("Training & model readiness")
+    st.caption("Research evidence · Bot SIM/LIVE modes remain separate from model approval.")
+    cards = []
+    for card in training_status_cards(status):
+        title, value, detail = (html.escape(card[key], quote=True)
+                                for key in ("title", "value", "detail"))
+        cards.append(
+            '<div class="research-cell">'
+            f'<div class="kpi-label">{title}</div>'
+            f'<div class="research-value">{value}</div>'
+            '<details class="research-evidence"><summary>Evidence details</summary>'
+            f'<div class="research-detail">{detail}</div></details></div>'
+        )
+    st.markdown('<div class="research-grid">' + "".join(cards) + '</div>',
+                unsafe_allow_html=True)
 
 
 def _section(text: str):
@@ -1424,8 +1505,11 @@ def build_pnl_snapshot(
             if "mode" not in frame:
                 frame["mode"] = frame.apply(_mode_for_historical_row, axis=1)
             for (bot, mode), rows in frame.groupby(["base_bot", "mode"]):
-                for group in targets(_base_bot_name(bot), str(mode).upper()):
-                    group["positions"] += len(aggregate_positions(rows))
+                groups = targets(_base_bot_name(bot), str(mode).upper())
+                if groups:
+                    position_count = len(aggregate_positions(rows))
+                    for group in groups:
+                        group["positions"] += position_count
 
     future_status = getattr(open_fut_df, "attrs", {}).get("snapshot_status", "ok")
     if future_status != "ok":
@@ -1622,13 +1706,12 @@ def compute_metrics(trades_df: pd.DataFrame, history_df: pd.DataFrame | None = N
 #  Header
 
 st.markdown(
-    """
-    <div style="display:flex; align-items:center; gap:14px; margin-bottom:6px;">
-        <span style="font-size:1.8rem; color:#6a5cc0;"></span>
-        <span style="font-size:1.5rem; font-weight:800; letter-spacing:-0.02em;">OBSIDIAN <span style="color:#94a3b8;">TERMINAL</span></span>
-        <span style="font-size:0.7rem; color:#64748b; background:rgba(106,92,192,0.1); padding:3px 9px; border-radius:6px; margin-left:6px; font-family:'JetBrains Mono'; font-weight:600;">v5.0</span>
+    f"""
+    <div style="display:flex; flex-wrap:wrap; align-items:center; gap:12px; margin-bottom:8px;">
+        <span style="font-size:1.6rem; font-weight:750; letter-spacing:-0.03em;">Obsidian <span style="color:#a39db8;">Terminal</span></span>
+        <span style="font-size:0.75rem; color:#b9a9f5; background:#322a5e; padding:4px 10px; border-radius:6px; font-weight:600;">v{html.escape(APP_VERSION)}</span>
     </div>
-    <div style="color:#64748b; font-size:0.85rem; margin-bottom:24px;">Spot &amp; Futures bot suite  Real-time analytics</div>
+    <div style="color:#a39db8; font-size:0.9rem; margin-bottom:20px;">Spot &amp; Futures · Operations, performance &amp; research</div>
     """,
     unsafe_allow_html=True,
 )
@@ -1642,7 +1725,8 @@ with st.sidebar:
     auto_refresh = st.checkbox("Auto-refresh (10s)", value=True)
     if st.button("  Refresh now", use_container_width=True):
         for loader in (load_all_trades, load_futures_live, load_open_spot_trades,
-                       get_live_prices, load_bot_params, load_learning_log, load_market_regime):
+                       get_live_prices, load_bot_params, load_learning_log, load_market_regime,
+                       load_training_status):
             loader.clear()
         st.rerun()
 
@@ -1658,7 +1742,7 @@ with st.sidebar:
     st.markdown(
         '<div style="margin-top:24px; padding:14px; background:rgba(15,20,29,0.6); '
         'border-radius:10px; border:1px solid rgba(255,255,255,0.05); font-size:0.75rem;">'
-        f'<div style="color:#64748b;">UI refresh</div>'
+        f'<div style="color:#a39db8;">UI refresh</div>'
         f'<div style="color:#cbd5e1; font-family:JetBrains Mono; font-weight:600; margin-top:4px;">'
         f"{datetime.now().strftime('%H:%M:%S')}</div></div>",
         unsafe_allow_html=True,
@@ -1705,14 +1789,30 @@ selected_view = st.session_state.get("dashboard_active_view", "Overview")
 if selected_view not in dashboard_views:
     selected_view = "Overview"
     st.session_state.dashboard_active_view = selected_view
-navigation_columns = st.columns(len(dashboard_views))
-for navigation_column, view in zip(navigation_columns, dashboard_views):
-    with navigation_column:
-        st.button(view,
-                  key="dashboard_view_" + view.lower(),
-                  type="primary" if view == selected_view else "secondary",
-                  on_click=_select_dashboard_view, args=(view,), use_container_width=True)
+with st.container(key="workspace_navigation"):
+    navigation_columns = st.columns(len(dashboard_views))
+    for navigation_column, view in zip(navigation_columns, dashboard_views):
+        with navigation_column:
+            st.button(view,
+                      key="dashboard_view_" + view.lower(),
+                      type="primary" if view == selected_view else "secondary",
+                      on_click=_select_dashboard_view, args=(view,), use_container_width=True)
 needs_position_sources = selected_view in {"Overview", "Positions"}
+view_titles = {
+    "Overview": ("Portfolio overview", "Recorded performance and current position evidence, grouped by trading mode."),
+    "Trades": ("Trade journal", "Inspect recorded executions, partial exits and position history."),
+    "Positions": ("Position monitor", "Tracked positions with valuation quality and source freshness."),
+    "Performance": ("Performance analysis", "Review historical returns, drawdowns and trade distributions."),
+    "Bots": ("Bot research & parameters", "Compare recorded bot performance, research status and parameter adjustments."),
+}
+view_title, view_description = view_titles[selected_view]
+st.markdown(
+    f'<div class="workspace-heading">{html.escape(view_title)}</div>'
+    f'<div class="workspace-description">{html.escape(view_description)}</div>',
+    unsafe_allow_html=True,
+)
+if selected_view in {"Overview", "Bots"}:
+    _render_training_status(load_training_status())
 
 #  Separate LIVE (real money) from SIM (paper)
 # The headline number is LIVE-only (real money, matches the exchange); SIM
@@ -1890,7 +1990,7 @@ if selected_view == "Overview":
         )
 
     #  Per-Bot Summary
-    _section("Per-Bot Performance")
+    _section("Performance by bot & mode")
     bot_cols = st.columns(min(3, len(ALL_BOTS)))
     bot_trade_col = (
         "base_bot" if not trades.empty and "base_bot" in trades.columns else "bot_name"
@@ -1943,24 +2043,20 @@ if selected_view == "Overview":
             badge = _mode_badge(bot_mode)
 
             bot_card_html = (
-                f'<div style="background:rgba(15,20,29,0.6); border-radius:14px; '
-                f"border:1px solid rgba(255,255,255,0.06); border-left:4px solid {accent}; "
-                f'padding:18px 22px;">'
-                f'<div style="display:flex; justify-content:space-between; align-items:baseline;">'
-                f'<span style="font-size:1.1rem; font-weight:700; color:{accent};">{bot} {badge}</span>'
-                f'<span style="font-size:0.7rem; color:#64748b; font-family:JetBrains Mono;">{BOT_SUBTITLES[bot]}</span>'
-                f"</div>"
-                f'<div style="font-size:1.9rem; font-weight:800; color:{pnl_color}; margin-top:10px; letter-spacing:-0.02em;">'
-                f'{_money_text(net)} <span style="font-size:0.85rem; color:#475569;">USDT net</span>'
-                f"</div>"
-                f'<div style="display:flex; flex-wrap:wrap; gap:14px; margin-top:14px; font-size:0.75rem; color:#94a3b8; font-family:JetBrains Mono;">'
-                f'<span>Real <b style="color:#e2e8f0;">{_money_text(pnl)}</b></span>'
-                f'<span>Open <b style="color:#e2e8f0;">{_money_text(unr)}</b>/{open_n}</span>'
-                f'<span>Pos <b style="color:#e2e8f0;">{n}</b></span>'
-                f'<span>WR <b style="color:#e2e8f0;">{wr_b:.0f}%</b></span>'
-                f'<span>Avg <b style="color:#e2e8f0;">{bot_metrics.get("avg_trade", 0):+.2f}</b></span>'
-                f"</div>"
-                f"</div>"
+                f'<div class="bot-summary" style="border-top:3px solid {accent};">'
+                '<div class="bot-summary-heading">'
+                f'<span class="bot-summary-name">{html.escape(bot)}</span>{badge}</div>'
+                f'<div class="bot-summary-subtitle">{html.escape(BOT_SUBTITLES[bot])}</div>'
+                f'<div class="bot-summary-net" style="color:{pnl_color};">{_money_text(net)} '
+                '<span class="kpi-sub">USDT net</span></div>'
+                '<div class="bot-summary-grid">'
+                f'<div><span>Realized</span><b>{_money_text(pnl)}</b></div>'
+                f'<div><span>Unrealized</span><b>{_money_text(unr)}</b></div>'
+                f'<div><span>Open positions</span><b>{open_n}</b></div>'
+                f'<div><span>Closed positions</span><b>{n}</b></div>'
+                f'<div><span>Win rate</span><b>{wr_b:.0f}%</b></div>'
+                f'<div><span>Avg trade</span><b>{bot_metrics.get("avg_trade", 0):+.2f}</b></div>'
+                '</div></div>'
             )
             st.markdown(bot_card_html, unsafe_allow_html=True)
 
@@ -2057,7 +2153,7 @@ if selected_view == "Overview":
             fig_dd.update_layout(
                 title=dict(
                     text="Drawdown over time",
-                    font=dict(size=12, color="#64748b"),
+                    font=dict(size=12, color="#a39db8"),
                     x=0.01,
                 ),
                 height=200,
@@ -2393,7 +2489,7 @@ if selected_view == "Positions":
                     f'<div style="display:flex; justify-content:space-between;">'
                     f"<div>"
                     f'<span style="font-size:1.1rem; font-weight:700; color:#e2e8f0;">{sym_html}</span>'
-                    f'<span style="font-size:0.7rem; color:#64748b; margin-left:8px;">{bot_html}</span>'
+                    f'<span style="font-size:0.7rem; color:#a39db8; margin-left:8px;">{bot_html}</span>'
                     f"{mode_badge}"
                     f"{partial_badge}"
                     f"</div>"
@@ -2403,7 +2499,7 @@ if selected_view == "Positions":
                     f"</div>"
                     f"</div>"
                     f'<div style="display:flex; gap:14px; margin-top:14px; font-size:0.72rem; '
-                    f'font-family:JetBrains Mono; color:#64748b; flex-wrap:wrap;">'
+                    f'font-family:JetBrains Mono; color:#a39db8; flex-wrap:wrap;">'
                     f'<span>Entry <b style="color:#94a3b8;">{entry_text}</b></span>'
                     f'<span>Now <b style="color:#e2e8f0;">{live_text}</b></span>'
                     f'<span>Size <b style="color:#94a3b8;">{size_text}</b></span>'
@@ -2487,7 +2583,7 @@ if selected_view == "Positions":
                     f"</div>"
                     f"</div>"
                     f'<div style="display:flex; gap:14px; margin-top:14px; font-size:0.72rem; '
-                    f'font-family:JetBrains Mono; color:#64748b; flex-wrap:wrap;">'
+                    f'font-family:JetBrains Mono; color:#a39db8; flex-wrap:wrap;">'
                     f'<span>Entry <b style="color:#94a3b8;">{row.entry_price:.6f}</b></span>'
                     f'<span>Mark <b style="color:#e2e8f0;">{row.current_price:.6f}</b></span>'
                     f'<span>Margin <b style="color:#94a3b8;">{row.margin_usdt:.2f}</b></span>'
@@ -2497,7 +2593,7 @@ if selected_view == "Positions":
                     f"border-radius:8px; border-left:3px solid {liq_color}; "
                     f'display:flex; justify-content:space-between; align-items:center;">'
                     f"<div>"
-                    f'<div style="font-size:0.62rem; color:#64748b; text-transform:uppercase; '
+                    f'<div style="font-size:0.62rem; color:#a39db8; text-transform:uppercase; '
                     f'letter-spacing:0.14em; font-weight:600;">Liquidation</div>'
                     f'<div style="color:#cbd5e1; font-family:JetBrains Mono; font-size:0.78rem; font-weight:700;">'
                     f"{row.liquidation_price:.6f}"
@@ -2761,7 +2857,7 @@ if selected_view == "Performance":
             fig_h.update_layout(
                 title=dict(
                     text="By hour of day (UTC)",
-                    font=dict(size=12, color="#64748b"),
+                    font=dict(size=12, color="#a39db8"),
                     x=0.01,
                 ),
                 height=300,
@@ -2814,7 +2910,7 @@ if selected_view == "Performance":
             )
             fig_d.update_layout(
                 title=dict(
-                    text="By weekday", font=dict(size=12, color="#64748b"), x=0.01
+                    text="By weekday", font=dict(size=12, color="#a39db8"), x=0.01
                 ),
                 height=300,
                 margin=dict(l=20, r=20, t=40, b=20),
@@ -2897,7 +2993,7 @@ if selected_view == "Performance":
             )
             fig_r.update_layout(
                 title=dict(
-                    text="Frequency", font=dict(size=12, color="#64748b"), x=0.01
+                    text="Frequency", font=dict(size=12, color="#a39db8"), x=0.01
                 ),
                 height=320,
                 margin=dict(l=20, r=20, t=40, b=20),
@@ -2926,7 +3022,7 @@ if selected_view == "Performance":
             )
             fig_rp.update_layout(
                 title=dict(
-                    text="P&L per reason", font=dict(size=12, color="#64748b"), x=0.01
+                    text="P&L per reason", font=dict(size=12, color="#a39db8"), x=0.01
                 ),
                 height=320,
                 margin=dict(l=20, r=20, t=40, b=20),
@@ -3061,7 +3157,7 @@ if selected_view == "Bots":
                 rows_html = ""
                 if bot_params.empty:
                     rows_html = (
-                        '<div style="color:#64748b; padding:8px; font-size:0.8rem;">'
+                        '<div style="color:#a39db8; padding:8px; font-size:0.8rem;">'
                         "No dynamic parameters yet</div>"
                     )
                 else:
@@ -3096,7 +3192,8 @@ if selected_view == "Bots":
                 st.markdown(bot_card_html, unsafe_allow_html=True)
 
     #  Learning Log
-    _section("AI Learning Timeline")
+    _section("Risk parameter adjustment history")
+    st.caption("RiskManager adjustments recorded in learning_log. Offline model training is shown above.")
     learning_df = load_learning_log()
     if learning_df.empty:
         st.info("No learning events yet  Risk Manager will adapt parameters over time.")

@@ -78,6 +78,8 @@ _CLAIM_EXTRA_FIELDS = frozenset((
     "accounting_pending_profit_usdt", "accounting_pending_invested_usdt",
     "accounting_pending_fees_usdt", "accounting_pending_reason",
     "accounting_pending_funding_paid",
+    "accounting_pending_funding_evidence", "funding_close_time",
+    "funding_partial_close_time",
     "accounting_pending_cooldown_until",
     "accounting_pending_blacklist_decision", "accounting_pending_blacklist_checked",
     "pending_close_filled_amount", "pending_close_notional_sum", "pending_close_price",

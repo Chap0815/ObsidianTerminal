@@ -2833,6 +2833,12 @@ class TrendFuturesBot(FuturesBot):
             _defer_verified_flat_close(self, base, d, reason, log_event)
             return
 
+        from bot_utils.futures_funding import freeze_funding_close_time
+        sell_time = freeze_funding_close_time(self.state, base, d, _utc())
+        if sell_time is None:
+            log_event(f"[{self.BOT_NAME}] {base}: funding cutoff is not durable; accounting deferred", "ERROR")
+            return
+
         #  Book realized PnL 
         profit_usdt = 0.0
         if entry > 0 and close_price > 0 and margin > 0:
@@ -2841,6 +2847,8 @@ class TrendFuturesBot(FuturesBot):
             partial_sold = bool(d.get("partial_sold"))
             funding = _finite_float(d.get("funding_paid"), 0.0)
             funding_resolution_pending = False
+            funding_evidence = None
+            funding_resolution = {}
             funding_requires_history = (
                 d.get("entry_funding_window_unverified") is True
                 or d.get("accounting_pending_funding_unverified") is True
@@ -2865,6 +2873,9 @@ class TrendFuturesBot(FuturesBot):
                             full,
                             d.get("buy_time"),
                             notional_usdt=notional,
+                            until_time_str=sell_time,
+                            _history_evidence=funding_resolution,
+                            _expected_position_type=pos_type,
                         )
                     else:
                         from bot_utils.futures_funding import (
@@ -2875,22 +2886,44 @@ class TrendFuturesBot(FuturesBot):
                             self.ex, full, d.get("buy_time"),
                             notional_usdt=notional, pos_type=pos_type,
                             fallback_state_value=funding,
+                            until_time_str=sell_time,
+                            _resolution_evidence=funding_resolution,
                         )
                     fresh_funding = _finite_float(fresh_funding, None)
                     funding_resolution_pending = fresh_funding is None
                     if funding_requires_history:
                         funding_history_resolved = fresh_funding is not None
+                    if funding_resolution.get("source") == "private_account_payments" and fresh_funding is not None:
+                        from bot_utils.futures_funding import allocate_private_funding_remaining
+                        fresh_funding = allocate_private_funding_remaining(fresh_funding, d)
+                        if fresh_funding is None:
+                            funding_resolution_pending = True
                     if fresh_funding is not None:
                         funding = fresh_funding
                 except Exception:
                     funding_resolution_pending = True
-            if partial_sold and original_amount > 0:
+            else:
+                from bot_utils.futures_funding import sim_fragment_funding
+                funding, funding_evidence = sim_fragment_funding(
+                    self.ex, bot_name=self.BOT_NAME, symbol=base, row=d,
+                    sell_time=sell_time, closed_amount=amt, contract_size=cs,
+                    exchange_order_id=exch_oid,
+                )
+            if (not self.simulation and partial_sold and original_amount > 0
+                    and funding_resolution.get("source") != "private_account_payments"):
                 funding = safe_remaining_funding(
                     funding, amt, original_amount, partial_sold=True,
                     booked_on_partials=funding_booked,
                     booked_on_partials_known=(
                         d.get("funding_booked_on_partials_known") is True
                     ),
+                )
+            if not self.simulation:
+                from bot_utils.futures_funding import live_close_funding_evidence
+                funding_evidence = live_close_funding_evidence(
+                    bot_name=self.BOT_NAME, symbol=base, row=d, sell_time=sell_time,
+                    closed_amount=amt, contract_size=cs, booked_cost=funding,
+                    resolution=funding_resolution, exchange_order_id=exch_oid,
                 )
             entry_fee = safe_proportional_fee(initial_entry_fee, amt,
                                               original_amount,
@@ -2922,7 +2955,6 @@ class TrendFuturesBot(FuturesBot):
                            entry_quality_reasons=d.get("entry_quality_reasons"))
             except Exception:
                 pass
-            sell_time = _utc()
             from bot_utils.trade_state import (
                 validated_close_accounting_mode_or_none,
             )
@@ -2946,6 +2978,7 @@ class TrendFuturesBot(FuturesBot):
                 "accounting_pending_mode_is_sim": accounting_mode_is_sim,
                 "accounting_pending_fees_usdt": entry_fee + close_fee,
                 "accounting_pending_funding_paid": funding,
+                "accounting_pending_funding_evidence": funding_evidence,
                 "accounting_pending_exchange_order_id": exch_oid,
                 "accounting_pending_mfe_pct": mfe_pct,
                 "accounting_pending_mae_pct": mae_pct,
@@ -3016,7 +3049,8 @@ class TrendFuturesBot(FuturesBot):
                     sell_time=sell_time, profit_pct=move, profit_usdt=profit_usdt,
                     invested_usdt=margin, reason=f"Trend {reason}",
                     is_futures=True, position_type=pos_type, leverage=lev,
-                    funding_paid=funding, fees_usdt=entry_fee + close_fee,
+                    funding_paid=funding, funding_evidence=funding_evidence,
+                    fees_usdt=entry_fee + close_fee,
                     exchange_order_id=exch_oid,
                     mfe_pct=mfe_pct, mae_pct=mae_pct,
                     giveback_pct=giveback_pct,

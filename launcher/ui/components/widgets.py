@@ -255,6 +255,80 @@ def safe_geometry(
 #  Sparkline (mini PnL trend line in each bot card)
 
 
+class TrainingStatusPanel(ctk.CTkFrame):
+    """Compact evidence overview; all text remains visible at narrow widths."""
+
+    def __init__(self, parent):
+        super().__init__(parent, fg_color=COLORS["panel_alt"], corner_radius=12,
+                         border_width=1, border_color=COLORS["border"])
+        self.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(self, text="Training & model readiness",
+                    font=ctk.CTkFont(FONT_BODY, 13, "bold"),
+                    text_color=COLORS["text"], anchor="w").grid(
+                        row=0, column=0, sticky="ew", padx=14, pady=(8, 0))
+        self.details_visible = False
+        self.details_button = keyboard_button(
+            self, text="Details", width=90, height=26, corner_radius=6,
+            font=ctk.CTkFont(FONT_BODY, 11, "bold"), fg_color="transparent",
+            hover_color=COLORS["panel_hover"], text_color=COLORS["accent_text"],
+            border_width=1, border_color=COLORS["border"], command=self._toggle_details)
+        self.details_button.grid(row=0, column=1, sticky="e", padx=12, pady=(8, 0))
+        ctk.CTkLabel(self, text="Research evidence · Bot SIM/LIVE modes are shown on each bot card",
+                    font=ctk.CTkFont(FONT_BODY, 11), text_color=COLORS["text_muted"],
+                    anchor="w", justify="left", wraplength=480).grid(
+                        row=1, column=0, columnspan=2, sticky="ew", padx=14, pady=(0, 2))
+        self.body = ctk.CTkFrame(self, fg_color="transparent", height=1)
+        self.body.grid(row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 6))
+        self.cells = []
+        for _ in range(4):
+            frame = ctk.CTkFrame(self.body, fg_color=COLORS["panel"], corner_radius=8)
+            labels = []
+            for size, weight, color in ((10, "bold", "text_muted"),
+                                        (12, "bold", "text"), (10, "normal", "text_dim")):
+                label = ctk.CTkLabel(frame, text="", anchor="w", justify="left",
+                                    font=ctk.CTkFont(FONT_BODY, size, weight),
+                                    text_color=COLORS[color], wraplength=220)
+                label.pack(fill="x", padx=10, pady=(4, 0))
+                labels.append(label)
+            labels[-1].pack_configure(pady=(2, 8))
+            labels[-1].pack_forget()
+            labels[1].pack_configure(pady=(2, 6))
+            self.cells.append((frame, labels))
+        self._layout_signature = None
+        self.body.bind("<Configure>", self._resize, add="+")
+
+    def set_cards(self, cards):
+        for (_frame, labels), card in zip(self.cells, cards):
+            for label, key in zip(labels, ("title", "value", "detail")):
+                label.configure(text=card[key])
+
+    def _toggle_details(self):
+        """Only explanatory research text folds; all four statuses stay visible."""
+        self.details_visible = not self.details_visible
+        for _frame, labels in self.cells:
+            if self.details_visible:
+                labels[-1].pack(fill="x", padx=10, pady=(2, 8))
+            else:
+                labels[-1].pack_forget()
+        self.details_button.configure(text="Hide details" if self.details_visible else "Details")
+
+    def _resize(self, event):
+        width = event.width / self._get_widget_scaling()
+        columns = 4 if width >= 800 else 2
+        wrap = max(100, int(width / columns) - 36)
+        signature = (columns, wrap)
+        if signature == self._layout_signature:
+            return
+        self._layout_signature = signature
+        for i in range(4):
+            self.body.grid_columnconfigure(i, weight=1 if i < columns else 0,
+                                           uniform="training" if i < columns else "")
+        for i, (frame, labels) in enumerate(self.cells):
+            frame.grid(row=i // columns, column=i % columns, sticky="nsew", padx=4, pady=4)
+            for label in labels:
+                label.configure(wraplength=wrap)
+
+
 class Sparkline(tk.Frame):
     """Small trend line for cumulative PnL over the last trades.
 
@@ -286,7 +360,10 @@ class Sparkline(tk.Frame):
 
     def set_values(self, values: list) -> None:
         """Set a new cumulative PnL series (oldest first) and redraw."""
-        self._values = list(values) if values else []
+        updated = list(values) if values else []
+        if updated == self._values:
+            return
+        self._values = updated
         self._redraw()
 
     def _redraw(self) -> None:

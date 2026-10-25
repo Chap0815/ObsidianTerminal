@@ -1828,6 +1828,7 @@ def _verify_sealed_report(
     *,
     expected_day: date | str,
     verification_cache: dict[str, tuple] | None = None,
+    require_cached: bool = False,
 ) -> None:
     if (
         not isinstance(report, dict)
@@ -2276,6 +2277,8 @@ def _verify_sealed_report(
         if verification_cache is None or verification_cache.get(
             cache_key
         ) != signature:
+            if require_cached:
+                raise CaptureScanChanged("capture scan verification fingerprint changed")
             if _sha256(path) != item.get("sha256"):
                 if verification_cache is not None:
                     verification_cache.pop(cache_key, None)
@@ -2349,6 +2352,50 @@ def _prune_verification_cache(
             verification_cache.pop(cache_key, None)
 
 
+class CaptureScanChanged(RuntimeError):
+    """Discard an optimistic scan; the existing integrity worker retries it."""
+
+
+def _capture_scan_path_signature(path: Path):
+    try:
+        observed = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    return (*_file_signature(observed), observed.st_mode,
+            getattr(observed, "st_file_attributes", 0))
+
+
+def _read_capture_report_generation(path: Path) -> tuple[dict, tuple]:
+    """Bind the bounded decoded report to its actual, nonempty generation."""
+    before = _capture_scan_path_signature(path)
+    if before is None or before[0] == 0:
+        raise CaptureScanChanged("capture report generation is missing or empty")
+    report = _read_integrity_report(path)
+    if _capture_scan_path_signature(path) != before:
+        raise CaptureScanChanged("capture report generation changed during read")
+    return report, before
+
+
+def _capture_day_scan_snapshot(root: Path, day: date) -> dict:
+    """Bind all fixed artifact names, including absent partitions/sidecars.
+
+    This is the same local filesystem fingerprint trust boundary as the
+    verification cache, not a defense against malicious metadata restoration.
+    """
+    paths = [root / stream / f"{day.isoformat()}.sqlite3{suffix}"
+             for stream in CORE_STREAMS for suffix in ("", "-wal", "-shm")]
+    paths.append(root / "integrity" / f"{day.isoformat()}.json")
+    return {str(path): _capture_scan_path_signature(path) for path in paths}
+
+
+def _check_capture_scan_cancelled(cancelled) -> None:
+    if cancelled is None:
+        return
+    value = cancelled()
+    if type(value) is not bool or value:
+        raise RuntimeError("capture integrity scan cancelled or invalid cancellation state")
+
+
 def seal_closed_capture_days(
     root: str | Path,
     *,
@@ -2357,6 +2404,7 @@ def seal_closed_capture_days(
     l2_sample_interval_seconds: float,
     partition_guard=None,
     verification_cache: dict[str, tuple] | None = None,
+    cancelled=None,
 ) -> dict:
     _capture_policy_gaps(
         max_symbols=max_symbols,
@@ -2402,22 +2450,27 @@ def seal_closed_capture_days(
     days = sorted(days_to_seal)
     reports = []
     for day in days:
-        guard = (
-            partition_guard(day)
-            if callable(partition_guard)
-            else nullcontext()
-        )
-        with guard:
+        _check_capture_scan_cancelled(cancelled)
+
+        def guard():
+            return partition_guard(day) if callable(partition_guard) else nullcontext()
+
+        # Only checkpoint/close and bounded metadata reads own the writer
+        # lock. The potentially multi-GB SQL/hash scan must not stop today's
+        # REST/L2/trade commits, even on a first verification-cache miss.
+        with guard():
             report_path = root / "integrity" / f"{day.isoformat()}.json"
-            if report_path.exists():
-                report = _read_integrity_report(report_path)
-                _verify_sealed_report(
-                    root,
-                    report,
-                    expected_day=day,
-                    verification_cache=verification_cache,
-                )
-            else:
+            snapshot = _capture_day_scan_snapshot(root, day)
+            existing = snapshot[str(report_path)] is not None
+            report = None
+            if existing:
+                report, report_generation = _read_capture_report_generation(report_path)
+                if report_generation != snapshot[str(report_path)]:
+                    raise CaptureScanChanged("capture report generation changed before scan")
+        scan_cache = dict(verification_cache or {}) if existing else {}
+        try:
+            _check_capture_scan_cancelled(cancelled)
+            if not existing:
                 report = validate_capture_day(
                     root,
                     day,
@@ -2425,21 +2478,58 @@ def seal_closed_capture_days(
                     micro_interval_seconds=micro_interval_seconds,
                     l2_sample_interval_seconds=l2_sample_interval_seconds,
                 )
+            _check_capture_scan_cancelled(cancelled)
+            _verify_sealed_report(root, report, expected_day=day,
+                                  verification_cache=scan_cache)
+        except Exception as exc:
+            if _capture_day_scan_snapshot(root, day) != snapshot:
+                raise CaptureScanChanged("capture artifacts changed during scan; retry required") from exc
+            raise
+        _check_capture_scan_cancelled(cancelled)
+        with guard():
+            # This includes ABSENCE: a newly created missing partition, WAL,
+            # retention move, foreign checkpoint or competing create-once seal
+            # invalidates the entire scan. Never turn that race into a seal.
+            if _capture_day_scan_snapshot(root, day) != snapshot:
+                raise CaptureScanChanged("capture artifacts changed during scan; retry required")
+            _check_capture_scan_cancelled(cancelled)
+            # A cache miss here must abort, never hash under the root guard.
+            _verify_sealed_report(root, report, expected_day=day,
+                                  verification_cache=scan_cache, require_cached=True)
+            publication_snapshot = snapshot
+            if not existing:
                 if report.get("status") in {"valid", "usable_with_gaps"}:
                     _remove_empty_sidecars(root, report)
+                    cleaned = _capture_day_scan_snapshot(root, day)
+                    allowed = dict(snapshot)
+                    for name, signature in snapshot.items():
+                        if (name.endswith(("-wal", "-shm")) and signature is not None
+                                and signature[0] == 0 and cleaned[name] is None):
+                            allowed[name] = None
+                    if cleaned != allowed:
+                        raise CaptureScanChanged("capture artifacts changed during sidecar cleanup")
+                    publication_snapshot = cleaned
+                _check_capture_scan_cancelled(cancelled)
                 _atomic_create(report_path, report)
-                # The validation hashes precede publication. Re-read the
-                # create-once artifact and force an uncached verification while
-                # the official writer is still excluded by the day guard, so a
-                # concurrent/non-cooperating filesystem mutation cannot be
-                # reported healthy for one integrity cycle.
-                report = _read_integrity_report(report_path)
-                _verify_sealed_report(
-                    root,
-                    report,
-                    expected_day=day,
-                    verification_cache=None,
-                )
+                published, report_generation = _read_capture_report_generation(report_path)
+                if published != report:
+                    raise RuntimeError("sealed capture report changed")
+                report = published
+            after = _capture_day_scan_snapshot(root, day)
+            expected_after = dict(publication_snapshot)
+            if not existing:
+                # Only our create-once report is new. All DB/sidecar absences
+                # remain bound, including for invalid/missing-stream reports.
+                expected_after[str(report_path)] = report_generation
+            if after != expected_after:
+                raise CaptureScanChanged("capture artifacts changed during publication")
+            _verify_sealed_report(root, report, expected_day=day,
+                                  verification_cache=scan_cache, require_cached=True)
+            if _capture_day_scan_snapshot(root, day) != after:
+                raise CaptureScanChanged("capture artifacts changed after publication verification")
+            _check_capture_scan_cancelled(cancelled)
+            if verification_cache is not None:
+                verification_cache.update(scan_cache)
         reports.append(report)
     invalid = [
         report["day"]

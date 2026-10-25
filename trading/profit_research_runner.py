@@ -654,6 +654,30 @@ def _complete_expectancy_campaign(
     }, None
 
 
+def _campaign_funding_rejection_reason(campaign, *, normalized_bot: str) -> str | None:
+    """Only the label producer calls this; descriptive cashflows stay visible."""
+    from trading.funding_evidence import funding_net_label_is_trusted, funding_quality_for_trade
+
+    for row in campaign:
+        row_keys = row.keys()
+        is_futures = (
+            row["is_futures"] == 1 if row["is_futures"] is not None
+            else normalized_bot in {"FUTURES", "FUTREND", "CROSS"}
+        )
+        quality = funding_quality_for_trade(
+            row["funding_evidence_json"] if "funding_evidence_json" in row_keys else None,
+            bot_name=row["bot_name"], mode_is_sim=row["is_sim"] == 1,
+            symbol=row["symbol"], entry_id=row["entry_id"],
+            buy_time=row["buy_time"], sell_time=row["sell_time"],
+            is_futures=is_futures, is_partial=row["is_partial"] == 1,
+            exchange_order_id=row["exchange_order_id"] if "exchange_order_id" in row_keys else None,
+            funding_paid=row["funding_paid"] if "funding_paid" in row_keys else None,
+        )
+        if not funding_net_label_is_trusted(quality):
+            return "funding_evidence_untrusted"
+    return None
+
+
 def build_expectancy_candidates(
     root: str | Path,
     *,
@@ -693,7 +717,10 @@ def build_expectancy_candidates(
         trade_columns = {
             str(row["name"]) for row in conn.execute("PRAGMA table_info(trades)")
         }
-        optional_columns = ("reason", "symbol", "is_futures", "position_type")
+        optional_columns = (
+            "reason", "symbol", "is_futures", "position_type",
+            "funding_evidence_json", "funding_paid", "exchange_order_id",
+        )
         optional_sql = [
             name if name in trade_columns else f"NULL AS {name}"
             for name in optional_columns
@@ -771,6 +798,11 @@ def build_expectancy_candidates(
                 break
             features[name] = value
         if len(features) != len(feature_order):
+            continue
+        funding_rejection = _campaign_funding_rejection_reason(campaign, normalized_bot=normalized_bot)
+        if funding_rejection is not None:
+            if rejection_counts is not None:
+                rejection_counts[funding_rejection] += 1
             continue
         labels.append(
                 CandidateLabel(
@@ -2149,11 +2181,81 @@ def build_exit_evidence_report(root: str | Path) -> dict:
     }
 
 
+def build_settled_funding_diagnostics(root: str | Path, provider) -> dict:
+    """Detached FUTURES SIM costs, never an expectancy label or readiness grant."""
+    from trading.settled_funding_model import (
+        MAX_TRADE_ROWS, diagnose_campaign, read_model_candidates, require_provider,
+    )
+    from trading.capture_replay_validation import (
+        _start_evidence_read_budget, _finish_bounded_read_transaction,
+    )
+    require_provider(provider)
+    results, rejected = [], Counter()
+    conn = budget = primary_error = None
+    try:
+        conn = _read_connection(Path(root) / "data" / "trading_bot.db")
+        budget = _start_evidence_read_budget(conn)
+        conn.execute("BEGIN")
+        candidates = read_model_candidates(conn)
+        rows = conn.execute("""SELECT rowid AS _row_id,entry_id,bot_name,buy_time,sell_time,
+            profit_usdt,invested_usdt,is_partial,is_sim,reason,symbol,is_futures,
+            position_type,funding_evidence_json,funding_paid,exchange_order_id,buy_price,leverage
+            FROM trades WHERE entry_id IN (SELECT entry_id FROM expectancy_candidates
+                WHERE bot_name='FUTURES' AND mode='SIM') ORDER BY sell_time,rowid LIMIT ?""",
+            (MAX_TRADE_ROWS + 1,)).fetchall()
+        if len(rows) > MAX_TRADE_ROWS:
+            raise ValueError("model_trade_row_budget_exceeded")
+        campaigns = defaultdict(list)
+        for row in rows:
+            campaigns[row["entry_id"]].append(row)
+        for identity, campaign in campaigns.items():
+            event = candidates.get(identity)
+            if event is None:
+                continue
+            complete, reason = _complete_expectancy_campaign(
+                campaign, normalized_bot="FUTURES", expected_is_sim=1)
+            try:
+                if reason is not None or complete is None:
+                    raise ValueError(reason or "invalid_model_campaign")
+                if event["candidate_time"] > complete["opened_at"]:
+                    raise ValueError("noncausal_candidate_entry")
+                results.append(diagnose_campaign(conn, provider, campaign, event))
+            except (ValueError, TypeError, KeyError, OverflowError) as exc:
+                rejected[str(exc) if isinstance(exc, ValueError) else "invalid_model_campaign"] += 1
+    except FileNotFoundError:
+        rejected["model_original_database_unavailable"] += 1
+    except sqlite3.Error as exc:
+        if getattr(exc, "sqlite_errorcode", None) in {sqlite3.SQLITE_TOOBIG, sqlite3.SQLITE_INTERRUPT}:
+            primary_error = exc
+            raise
+        rejected["model_original_evidence_schema_unavailable"] += 1
+        results.clear()
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        if conn is not None:
+            _finish_bounded_read_transaction(conn, primary_error)
+    result = {**provider.provenance(), "cohort": "FUTURES SIM no-addon complete campaigns",
+            "account_pnl": False, "journal_mutated": False,
+            "diagnostic_campaigns": len(results), "training_eligible": False,
+            "rejections": dict(sorted(rejected.items())),
+            "totals": {field: math.fsum(getattr(item, field) for item in results)
+                       for field in ("net_profit", "funding_cost", "funding_stress_low", "funding_stress_high")},
+            "campaign_facts_sha256": hashlib.sha256(json.dumps(
+                [item.proof_sha256 for item in results], separators=(",", ":")
+            ).encode()).hexdigest()}
+    if budget is not None:
+        budget.check()
+    return result
+
+
 def build_research_status(
     root: str | Path,
     *,
     minimum_cost_samples: int = 50,
     minimum_expectancy_rows: int = 1_200,
+    settled_funding_provider=None,
 ) -> dict:
     required_expectancy_rows = _positive_integer(
         minimum_expectancy_rows, "minimum_expectancy_rows"
@@ -2199,6 +2301,8 @@ def build_research_status(
         "expectancy": expectancy,
         "exit_evidence": build_exit_evidence_report(project),
         "experiments": _registry_status(project),
+        **({"funding_cost_diagnostics": build_settled_funding_diagnostics(project, settled_funding_provider)}
+           if settled_funding_provider is not None else {}),
         "safety": {
             "writes_live_model": False,
             "changes_orders": False,

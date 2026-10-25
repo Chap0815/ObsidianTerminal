@@ -1374,7 +1374,15 @@ def _close_single_position_impl(*,
             partial_sold=partial_sold_flag
         )
 
+        from bot_utils.futures_funding import freeze_funding_close_time
+        sell_time = freeze_funding_close_time(state, sym, d, _utc_now_str())
+        if sell_time is None:
+            log_event(f"  {sym}: emergency funding cutoff not durable; accounting deferred", "ERROR")
+            return sym, "failed", 0.0, "close funding cutoff not durable"
+
         funding_pd = _finite_or_default(d.get("funding_paid", 0.0), 0.0)
+        funding_evidence = None
+        funding_resolution = {}
         funding_booked = _finite_or_default(
             d.get("funding_booked_on_partials", 0.0), 0.0)
         if partial_sold_flag:
@@ -1403,12 +1411,17 @@ def _close_single_position_impl(*,
                         symbol_full,
                         d.get("buy_time"),
                         notional_usdt=notional,
+                        until_time_str=sell_time,
+                        _history_evidence=funding_resolution,
+                        _expected_position_type=pos_type,
                     )
                 else:
                     realized = fetch_or_estimate_funding(
                         ex, symbol_full, d.get("buy_time"),
                         notional_usdt=notional, pos_type=pos_type,
                         fallback_state_value=funding_pd,
+                        until_time_str=sell_time,
+                        _resolution_evidence=funding_resolution,
                     )
                 funding_resolution_pending = realized is None
                 if realized is not None:
@@ -1417,7 +1430,12 @@ def _close_single_position_impl(*,
                         realized = None
                         funding_resolution_pending = True
                 if realized is not None:
-                    if partial_sold_flag:
+                    if funding_resolution.get("source") == "private_account_payments":
+                        from bot_utils.futures_funding import allocate_private_funding_remaining
+                        realized = allocate_private_funding_remaining(realized, d)
+                        if realized is None:
+                            funding_resolution_pending = True
+                    elif partial_sold_flag:
                         realized = safe_remaining_funding(
                             realized, amount, original_amount,
                             partial_sold=True,
@@ -1427,15 +1445,28 @@ def _close_single_position_impl(*,
                                 is True
                             ),
                         )
-                    funding_pd = realized
+                    if realized is not None:
+                        funding_pd = realized
             except Exception:
                 funding_resolution_pending = True
+            from bot_utils.futures_funding import live_close_funding_evidence
+            funding_evidence = live_close_funding_evidence(
+                bot_name=bot_name, symbol=sym, row=d, sell_time=sell_time,
+                closed_amount=amount, contract_size=_cs, booked_cost=funding_pd,
+                resolution=funding_resolution, exchange_order_id=exch_oid,
+            )
+        else:
+            from bot_utils.futures_funding import sim_fragment_funding
+            funding_pd, funding_evidence = sim_fragment_funding(
+                ex, bot_name=bot_name, symbol=sym, row=d, sell_time=sell_time,
+                closed_amount=amount, contract_size=simulation_contract_size,
+                exchange_order_id=exch_oid,
+            )
 
         slice_fees = proportional_entry_fee + close_fee
         profit_usdt = round(pnl_usdt - slice_fees - funding_pd, 2)
 
         buy_time = d.get("buy_time", _utc_now_str())
-        sell_time = _utc_now_str()
         trade_reason = f"Emergency Close ({reason}) [fill_src={fill_source}]"
         mfe_pct = _finite_or_default(d.get("max_profit_pct"), move_pct)
         mae_pct = _finite_or_default(d.get("min_profit_pct"), move_pct)
@@ -1450,6 +1481,7 @@ def _close_single_position_impl(*,
             "accounting_pending_mode_is_sim": simulation,
             "accounting_pending_fees_usdt": slice_fees,
             "accounting_pending_funding_paid": funding_pd,
+            "accounting_pending_funding_evidence": funding_evidence,
             "accounting_pending_exchange_order_id": exch_oid,
             "accounting_pending_mfe_pct": mfe_pct,
             "accounting_pending_mae_pct": mae_pct,
@@ -1543,6 +1575,7 @@ def _close_single_position_impl(*,
                 liquidation_price=_finite_or_default(
                     d.get("liquidation_price", 0), 0.0),
                 funding_paid=funding_pd,
+                funding_evidence=funding_evidence,
                 fees_usdt=slice_fees,
                 exchange_order_id=exch_oid,
                 mfe_pct=mfe_pct,

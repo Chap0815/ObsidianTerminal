@@ -3542,6 +3542,7 @@ class VenueRecorder:
                 ),
                 partition_guard=partition_guard,
                 verification_cache=self._integrity_verification_cache,
+                cancelled=self._integrity_shutdown_event.is_set,
             )
         except Exception as exc:
             self._record_integrity_failure(exc)

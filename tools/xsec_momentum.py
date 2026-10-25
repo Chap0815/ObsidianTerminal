@@ -12,6 +12,7 @@ Run: PYTHONIOENCODING=utf-8 python -m tools.xsec_momentum [days]
 # ruff: noqa: E402  # update barrier must run before project/runtime imports
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -36,9 +37,12 @@ from tools.backtester import connect_exchange, get_top_volume_coins, fetch_histo
 from tools.simulation_workspace import load_history_dataset, read_dataset_market_identity
 from tools.trend_check import _safe_exc
 from trading.xsec_signal import (
+    TargetBook,
     XSecParams,
     advance_crash_history,
     compute_target_book,
+    lookback_return,
+    select_retained_ranked_symbols,
 )
 
 DEFAULT_DAYS = 180
@@ -466,8 +470,11 @@ def run_stateful_replay(
     crash_window: int = 4,
     initial_recent_returns: list[float] | None = None,
     liquidate_at_end: bool = True,
+    selection_variant: str = "baseline",
 ) -> dict:
-    """Replay the live CROSS signal as an anchored, stateful portfolio."""
+    """Replay CROSS; optional retention is a fixed research-only alternative."""
+    if selection_variant not in ("baseline", "retention_buffer3"):
+        raise ValueError("selection_variant must be baseline or retention_buffer3")
     integers = (lookback, rebalance, k, crash_window)
     if any(isinstance(value, bool) or not isinstance(value, int) for value in integers):
         raise ValueError("CROSS replay periods and K must be integers")
@@ -519,6 +526,7 @@ def run_stateful_replay(
         crash_window=crash_window,
     )
     previous_weights: dict[str, float] = {}
+    completed_crash_flat_slot = False
     periods = []
     index = lookback
     while index + rebalance < len(prices):
@@ -526,7 +534,30 @@ def run_stateful_replay(
             symbol: prices[symbol].iloc[: index + 1].tolist()
             for symbol in prices.columns
         }
-        book = compute_target_book(histories, recent, params)
+        book = compute_target_book(
+            histories, recent, params,
+            completed_crash_flat_slot=completed_crash_flat_slot,
+        )
+        if selection_variant == "retention_buffer3" and book.exposure_mult > 0.0:
+            past_returns = {
+                symbol: lookback_return(history, lookback)
+                for symbol, history in histories.items()
+            }
+            descending = sorted(
+                (symbol for symbol, value in past_returns.items() if value is not None),
+                key=lambda symbol: past_returns[symbol], reverse=True,
+            )
+            # Preserve the baseline's stable tie order. The shared helper
+            # accepts an ascending ranking; ordinary ASC sorting would reverse
+            # tied long/short membership even before any retention occurred.
+            ranked = list(reversed(descending))
+            longs, shorts = select_retained_ranked_symbols(ranked, previous_weights, k, 3)
+            # Membership comes only from the helper. Canonical baseline order
+            # also preserves reporting and floating-point summation for K>1.
+            long_members, short_members = set(longs), set(shorts)
+            longs = [symbol for symbol in descending if symbol in long_members]
+            shorts = [symbol for symbol in descending if symbol in short_members]
+            book = TargetBook(longs=longs, shorts=shorts, exposure_mult=book.exposure_mult)
         target = _target_weights(book, k)
         entry = prices.iloc[index]
         exit_row = prices.iloc[index + rebalance]
@@ -562,10 +593,11 @@ def run_stateful_replay(
                 "net": net,
             },
         )
+        completed_crash_flat_slot = book.exposure_mult <= 0.0
         recent = advance_crash_history(
             recent,
             gross if target else None,
-            was_crash_flat=not target,
+            was_crash_flat=completed_crash_flat_slot,
             slot_advanced=True,
         )
         previous_weights = target
@@ -652,8 +684,72 @@ def _replay_metrics(periods: list[dict]) -> dict:
     }
 
 
+_RETENTION_SOURCE_FILES = (
+    "tools/xsec_momentum.py", "trading/xsec_signal.py", "tools/simulation_workspace.py",
+)
+MAX_RETENTION_SOURCE_BYTES = 2 * 1024 * 1024
+
+
+def _retention_source_identity(source_root=None, *, include_registry=False):
+    """Bounded file identities for the actual replay, signal and data validators."""
+    root = Path(__file__).resolve().parents[1] if source_root is None else Path(source_root)
+    sources = {}
+    names = _RETENTION_SOURCE_FILES
+    if include_registry:
+        names += ("trading/profit_research_runner.py", "trading/experiment_registry_contract.py",
+                  "sqlite_safety.py")
+    for name in names:
+        path = _absolute_without_links(root / name, label="retention experiment source")
+        if not path.is_file():
+            raise ValueError("retention experiment source is missing")
+        with path.open("rb") as stream:
+            data = stream.read(MAX_RETENTION_SOURCE_BYTES + 1)
+        if not data or len(data) > MAX_RETENTION_SOURCE_BYTES:
+            raise ValueError("retention experiment source byte budget exceeded")
+        sources[name] = {"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+    return sources
+
+
+def _retention_experiment_identity(manifest, parameters, sources):
+    def encoded(value):
+        return json.dumps(value, allow_nan=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+    identity = {
+        "schema_version": 1,
+        "sources": sources,
+        "source_identity_basis": "file_bytes_observed_before_and_after_replays",
+        "dataset": {
+            "dataset_fingerprint": manifest["dataset_fingerprint"],
+            "manifest_sha256": hashlib.sha256(encoded(manifest)).hexdigest(),
+            "manifest_hash_basis": "canonical_verified_manifest_json_utf8",
+        },
+        "effective_parameters": dict(parameters),
+        "frozen_policies": {
+            "variants": ["baseline", "retention_buffer3"],
+            "hold_rank_buffer": 3,
+            "baseline_signal": "compute_target_book_rank_and_select",
+            "retention_selection": "shared_select_retained_ranked_symbols_long_first_disjoint",
+            "tie_order": "stable_baseline_descending_with_baseline_side_order",
+            "initial_state": "independent_empty_weights_and_crash_history",
+            "crash_history": "own_past_gross_returns_with_completed_flat_slot_proof",
+            "execution": "hourly_close_returns_without_orderbook_or_runtime_gates",
+            "costs": "weight_turnover_times_fixed_one_way_fee",
+            "funding": "fixed_daily_drag_per_active_holding_period",
+            "split": "shared_chronological_60_20_20_slices_not_independent_holdout",
+            "terminal_liquidation": "charge_once_on_last_period",
+        },
+        "promotion_eligible": False,
+    }
+    return {**identity, "experiment_sha256": hashlib.sha256(encoded(identity)).hexdigest()}
+
+
 def _offline_replay(argv: list[str]) -> dict:
+    from tools.simulation_workspace import (
+        add_trial_registry_arguments, validate_trial_registry_options,
+        register_planned_trial, verify_history_dataset,
+    )
     parser = argparse.ArgumentParser(description="Immutable MEXC CROSS replay")
+    add_trial_registry_arguments(parser)
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--exchange", default="mexc")
     parser.add_argument("--lookback", type=int, default=24)
@@ -663,13 +759,50 @@ def _offline_replay(argv: list[str]) -> dict:
     parser.add_argument("--funding-per-day", type=float, default=0.0006)
     parser.add_argument("--crash-window", type=int, default=4)
     parser.add_argument("--no-crash-filter", action="store_true")
+    parser.add_argument("--compare-retention-buffer3", action="store_true")
     parser.add_argument("--output")
     args = parser.parse_args(argv)
+    try:
+        validate_trial_registry_options(args.registry_root, args.trial_id)
+        if args.trial_id is not None:
+            for role in (("baseline", "variant") if args.compare_retention_buffer3 else ("baseline",)):
+                validate_trial_registry_options(args.registry_root, args.trial_id + ":" + role)
+    except ValueError as exc:
+        parser.error(str(exc))
 
+    registered = args.registry_root is not None
+    sources = (_retention_source_identity(include_registry=True) if registered
+               else _retention_source_identity() if args.compare_retention_buffer3 else None)
     history, manifest = load_history_dataset(args.dataset)
     provenance = _validate_xsec_dataset_manifest(manifest, args.exchange)
+    panel = _panel_from_history(history)
+    parameters = {
+        "lookback_hours": args.lookback, "rebalance_hours": args.rebalance, "k_per_side": args.k,
+        "fee_one_way": args.fee_one_way, "funding_per_day": args.funding_per_day,
+        "crash_filter": not args.no_crash_filter, "crash_window": args.crash_window,
+        "liquidate_at_end": True,
+    }
+    trial_receipts = None
+    if registered:
+        identity = _retention_experiment_identity(manifest, parameters, sources)
+        baseline = {"name": "baseline", "selection_variant": "baseline", "parameters": parameters,
+                    "initial_state": "independent_empty_weights_and_crash_history"}
+        split = {"fractions": [0.6, 0.2, 0.2], "method": "shared_chronological_60_20_20_slices",
+            "boundary_rule": "train=max(1,int(N*.6));validation=min(N,max(train+1,int(N*.8)))",
+            "reference_schedule": "continuous_stateful_replay_before_slicing",
+            "embargo": "none_existing_exploratory_slices", "independent_holdout_verified": False}
+        trial_receipts = [register_planned_trial(args.registry_root, args.trial_id + ":" + role,
+            experiment_name="cross_retention_reference", sources=sources, dataset=identity["dataset"],
+            controls={**parameters, "role": role,
+                "selection_variant": "baseline" if role == "baseline" else "retention_buffer3",
+                "hold_rank_buffer": 0 if role == "baseline" else 3},
+            baseline=baseline, split_policy=split)
+            for role in (("baseline", "variant") if args.compare_retention_buffer3 else ("baseline",))]
+        if (verify_history_dataset(args.dataset) != manifest
+                or _retention_source_identity(include_registry=True) != sources):
+            raise ValueError("registered CROSS replay inputs changed before evaluation")
     replay = run_stateful_replay(
-        _panel_from_history(history),
+        panel,
         args.lookback,
         args.rebalance,
         args.k,
@@ -687,16 +820,7 @@ def _offline_replay(argv: list[str]) -> dict:
         "classification": "exploratory_only",
         "dataset_fingerprint": manifest["dataset_fingerprint"],
         "dataset": provenance,
-        "parameters": {
-            "lookback_hours": args.lookback,
-            "rebalance_hours": args.rebalance,
-            "k_per_side": args.k,
-            "fee_one_way": args.fee_one_way,
-            "funding_per_day": args.funding_per_day,
-            "crash_filter": not args.no_crash_filter,
-            "crash_window": args.crash_window,
-            "liquidate_at_end": True,
-        },
+        "parameters": parameters,
         "metrics": {
             "all": _replay_metrics(periods),
             "train": _replay_metrics(periods[:train_end]),
@@ -713,6 +837,60 @@ def _offline_replay(argv: list[str]) -> dict:
             "close_only_execution_without_orderbook_depth",
         ],
     }
+    if args.compare_retention_buffer3:
+        # Fresh invocation owns its weights and crash state. No selection is
+        # made from the validation/holdout metrics of either fixed variant.
+        retained = run_stateful_replay(
+            panel, args.lookback, args.rebalance, args.k,
+            fee_one_way=args.fee_one_way, funding_per_day=args.funding_per_day,
+            crash_filter=not args.no_crash_filter, crash_window=args.crash_window,
+            selection_variant="retention_buffer3",
+        )
+        def variant_report(result):
+            rows = result["periods"]
+            return {
+                "periods": rows,
+                "terminal_turnover": result["terminal_turnover"],
+                "metrics": {
+                    "all": _replay_metrics(rows),
+                    "train": _replay_metrics(rows[:train_end]),
+                    "validation": _replay_metrics(rows[train_end:validation_end]),
+                    "holdout": _replay_metrics(rows[validation_end:]),
+                },
+            }
+        report["retention_comparison"] = {
+            "schema_version": 1,
+            "classification": "exploratory_only",
+            "decision": "NO_GO",
+            "fixed_variant": "retention_buffer3",
+            "runtime_retention_proven": False,
+            "actual_costs_proven": False,
+            "baseline": variant_report(replay),
+            "retention_buffer3": variant_report(retained),
+            "limitations": [
+                "fixed_variant_not_selected_from_holdout",
+                "chronological_slices_not_registered_independent_holdout",
+                "fees_and_funding_are_fixed_proxies",
+                "runtime_claims_partials_and_retention_not_replayed",
+                "point_in_time_universe_and_execution_costs_not_proven",
+            ],
+        }
+        if (_retention_source_identity(include_registry=True) if registered
+                else _retention_source_identity()) != sources:
+            raise ValueError("retention experiment sources changed during replay")
+        report["retention_comparison"]["experiment_identity"] = _retention_experiment_identity(
+            manifest, report["parameters"], sources,
+        )
+    if registered:
+        if (verify_history_dataset(args.dataset) != manifest
+                or _retention_source_identity(include_registry=True) != sources):
+            raise ValueError("registered CROSS replay inputs changed during evaluation")
+        report["trial_registrations"] = trial_receipts
+        report["trial_registration_scope"] = {
+            "counting_unit": "policy_reference_evaluation_package", "planned_evaluation_units": len(trial_receipts),
+            "horizons_and_slices": "contained_in_each_package_not_additional_independent_trials",
+            "independent_trial_count_verified": False,
+        }
     raw = json.dumps(report, allow_nan=False, separators=(",", ":"), sort_keys=True)
     if args.output:
         _write_immutable_report(Path(args.output), raw.encode("utf-8"))

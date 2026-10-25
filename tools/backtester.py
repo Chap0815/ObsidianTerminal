@@ -2432,6 +2432,331 @@ def _decode_validation_argument(token, *, parameters=False):
     return value
 
 
+TREND_EVENT_MAX_EVENTS = 10_000
+TREND_EVENT_MAX_BASKET = 32
+TREND_EVENT_MAX_BARS = 200_000
+TREND_EVENT_MAX_BYTES = 16 * 1024 * 1024
+TREND_EVENT_MAX_SECONDS = 30.0
+_TREND_EVENT_CODE_FILES = (
+    "tools/backtester.py", "trading/trend_signal.py", "trading/vol_target.py",
+    "core/trend_bot.py", "core/constants.py",
+)
+
+
+def _trend_event_encode(value):
+    try:
+        raw = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        raise ValueError("invalid finite TREND event JSON") from exc
+    if len(raw) > TREND_EVENT_MAX_BYTES:
+        raise ValueError("TREND event byte budget exceeded")
+    return raw
+
+
+def _trend_event_keys(value, keys, label):
+    if type(value) is not dict or set(value) != set(keys.split()):
+        raise ValueError(f"invalid TREND event {label} fields")
+
+
+def _trend_event_number(value, label, *, minimum=0.0, maximum=1e15, positive=False, integer=False):
+    try:
+        valid = (type(value) in (int, float) and math.isfinite(value)
+                 and minimum <= value <= maximum and (not positive or value > 0)
+                 and (not integer or type(value) is int))
+    except (TypeError, ValueError, OverflowError):
+        valid = False
+    if not valid:
+        raise ValueError(f"invalid TREND event {label}")
+    return value
+
+
+def _trend_event_code_hashes():
+    import hashlib
+    from pathlib import Path
+
+    root = Path(__file__).absolute().parents[1]
+    result = {}
+    for name in _TREND_EVENT_CODE_FILES:
+        path = root / name
+        if any(part.is_symlink() or part.is_junction() for part in (path, *path.parents)):
+            raise ValueError("TREND event code must be link-free")
+        with path.open("rb") as stream:
+            before = os.fstat(stream.fileno())
+            raw = stream.read(2 * 1024 * 1024 + 1)
+            after = os.fstat(stream.fileno())
+        if (not raw or len(raw) > 2 * 1024 * 1024 or len(raw) != before.st_size
+                or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)):
+            raise ValueError("TREND event code changed or exceeds byte budget")
+        result[name] = hashlib.sha256(raw).hexdigest()
+    return result
+
+
+def simulate_trend_events(trace: dict) -> dict:
+    """Replay explicitly ordered decisions using shared TREND policy math.
+
+    Quotes are observed input assertions, never inferred from OHLC extrema.
+    Cash, quote-currency fees and adverse fills are an explicit paper model;
+    runtime SIM does not have this cash gate. No account or tick provenance is
+    certified here. Existing simulate_fast and command-line routes are unchanged.
+    """
+    import hashlib
+    from bisect import bisect_right
+    from trading.trend_signal import TrendParams, bars_required, has_full_history, is_in_trend
+    from trading.vol_target import realized_vol, basket_median_vol, vol_target_multiplier
+
+    started = last = _time.monotonic()
+    if type(started) not in (int, float) or not math.isfinite(started):
+        raise TimeoutError("invalid TREND event monotonic clock")
+
+    def check():
+        nonlocal last
+        now = _time.monotonic()
+        if (type(now) not in (int, float) or not math.isfinite(now)
+                or now < last or now - started >= TREND_EVENT_MAX_SECONDS):
+            raise TimeoutError("TREND event operation time budget exceeded")
+        last = now
+
+    _trend_event_keys(trace, "schema_version input_kind venue market_type ordered_basket signal_params "
+                      "strategy_params execution_model initial_holdings daily_bars events", "trace")
+    if (type(trace["schema_version"]) is not int or trace["schema_version"] != 1
+            or type(trace["input_kind"]) is not str or trace["input_kind"] not in {"synthetic", "observed"}
+            or trace["venue"] != "mexc" or trace["market_type"] != "spot"):
+        raise ValueError("unsupported TREND event contract")
+    basket = trace["ordered_basket"]
+    if (type(basket) is not list or not 1 <= len(basket) <= TREND_EVENT_MAX_BASKET
+            or any(type(sym) is not str or not sym.isascii() or not sym.isalnum()
+                   or sym != sym.upper() or not 1 <= len(sym) <= 24 for sym in basket)
+            or len(set(basket)) != len(basket)):
+        raise ValueError("invalid frozen TREND basket")
+    if type(trace["events"]) is not list or not 1 <= len(trace["events"]) <= TREND_EVENT_MAX_EVENTS:
+        raise ValueError("TREND event count budget exceeded")
+    if (type(trace["daily_bars"]) is not dict or set(trace["daily_bars"]) != set(basket)
+            or any(type(rows) is not list for rows in trace["daily_bars"].values())
+            or sum(map(len, trace["daily_bars"].values())) > TREND_EVENT_MAX_BARS):
+        raise ValueError("TREND daily basket/count contract is invalid")
+    raw = _trend_event_encode(trace)
+    input_sha = hashlib.sha256(raw).hexdigest()
+    data = json.loads(raw)
+    codes = _trend_event_code_hashes()
+    check()
+    signal = data["signal_params"]
+    _trend_event_keys(signal, "sma_fast sma_slow cross_fast cross_slow vote_min exit_vote", "signal")
+    for key, value in signal.items():
+        _trend_event_number(value, key, minimum=0 if key.endswith("vote") or key == "vote_min" else 1,
+                            maximum=3 if key.endswith("vote") or key == "vote_min" else 2000, integer=True)
+    params = TrendParams(**signal)
+    needed = bars_required(params)
+    strategy = data["strategy_params"]
+    _trend_event_keys(strategy, "position_size position_size_max vol_target vol_lookback max_open_trades disaster_stop_pct", "strategy")
+    _trend_event_number(strategy["position_size"], "position size", positive=True, maximum=1e9)
+    _trend_event_number(strategy["position_size_max"], "size cap", maximum=1e9)
+    _trend_event_number(strategy["vol_lookback"], "vol lookback", minimum=2, maximum=2000, integer=True)
+    _trend_event_number(strategy["max_open_trades"], "max open", maximum=TREND_EVENT_MAX_BASKET, integer=True)
+    stop = _trend_event_number(strategy["disaster_stop_pct"], "disaster stop", minimum=-100, maximum=0)
+    if not -100 < stop < 0:
+        raise ValueError("invalid effective TREND disaster stop")
+    if type(strategy["vol_target"]) is not bool:
+        raise ValueError("TREND vol target must be boolean")
+    model = data["execution_model"]
+    _trend_event_keys(model, "initial_cash_usdt fee_bps_per_side slippage_bps_per_side max_quote_age_ms", "execution model")
+    cash = float(_trend_event_number(model["initial_cash_usdt"], "initial cash"))
+    fee_rate = _trend_event_number(model["fee_bps_per_side"], "fee", maximum=1000) / 10_000.0
+    slip_rate = _trend_event_number(model["slippage_bps_per_side"], "slippage", maximum=1000) / 10_000.0
+    max_age = _trend_event_number(model["max_quote_age_ms"], "quote age", positive=True, maximum=600_000)
+    if type(data["initial_holdings"]) is not dict or not set(data["initial_holdings"]) <= set(basket):
+        raise ValueError("invalid TREND initial holdings")
+    holdings = {}
+    for sym in basket:
+        if sym not in data["initial_holdings"]:
+            continue
+        position = data["initial_holdings"][sym]
+        _trend_event_keys(position, "base_amount entry_price cost_basis_usdt", "holding")
+        for key, value in position.items():
+            _trend_event_number(value, key, positive=True)
+        holdings[sym] = dict(position)
+    initial_capital = math.fsum([cash, *(pos["cost_basis_usdt"] for pos in holdings.values())])
+    day = 86_400_000
+    daily, closed_times = {}, {}
+    for sym in basket:
+        previous = -1
+        rows = data["daily_bars"][sym]
+        for bar in rows:
+            check()
+            _trend_event_keys(bar, "open_ms close_ms available_by_ms close", "daily bar")
+            opened = _trend_event_number(bar["open_ms"], "daily open", integer=True)
+            closed = _trend_event_number(bar["close_ms"], "daily close time", integer=True)
+            available = _trend_event_number(bar["available_by_ms"], "daily availability")
+            _trend_event_number(bar["close"], "daily price", positive=True)
+            if opened % day or opened <= previous or closed != opened + day or available < closed:
+                raise ValueError("invalid TREND daily chronology")
+            previous = opened
+        daily[sym], closed_times[sym] = rows, [row["close_ms"] for row in rows]
+
+    def history(sym, count, now):
+        end = bisect_right(closed_times[sym], now)
+        rows = daily[sym][max(0, end - (count + 6)):end]
+        if (not rows or rows[-1]["close_ms"] != now - now % day
+                or any(row["available_by_ms"] > now for row in rows)
+                or any(right["open_ms"] - left["open_ms"] != day for left, right in zip(rows, rows[1:]))):
+            return []
+        return [row["close"] for row in rows]
+
+    frames, closed_trades = [], []
+    previous_sequence, previous_time, total_fees = 0, -1, 0.0
+    peak, max_dd, complete_equity = initial_capital, 0.0, True
+    for event in data["events"]:
+        check()
+        _trend_event_keys(event, "sequence decision_ms kind evaluate_trend blocked_entry_symbols quotes", "decision")
+        sequence = _trend_event_number(event["sequence"], "sequence", positive=True, integer=True)
+        now = _trend_event_number(event["decision_ms"], "decision time")
+        if (sequence <= previous_sequence or now < previous_time or type(event["kind"]) is not str
+                or event["kind"] not in {"scan", "monitor"}
+                or type(event["evaluate_trend"]) is not bool
+                or (event["kind"] == "scan" and event["evaluate_trend"])):
+            raise ValueError("invalid ordered TREND decision events")
+        previous_sequence, previous_time = sequence, now
+        blocked = event["blocked_entry_symbols"]
+        if (type(blocked) is not list or any(type(sym) is not str or sym not in basket for sym in blocked)
+                or len(set(blocked)) != len(blocked) or (event["kind"] == "monitor" and blocked)):
+            raise ValueError("invalid explicit TREND entry blocks")
+        if type(event["quotes"]) is not dict or not set(event["quotes"]) <= set(basket):
+            raise ValueError("invalid TREND quote basket")
+        prices = {}
+        for sym, quote in event["quotes"].items():
+            _trend_event_keys(quote, "price source_ms received_ms read_ms", "quote")
+            for key, value in quote.items():
+                _trend_event_number(value, key, positive=key == "price")
+            if (quote["source_ms"] <= quote["received_ms"] <= quote["read_ms"] <= now
+                    and now - quote["source_ms"] <= max_age and now - quote["received_ms"] <= max_age):
+                prices[sym] = quote["price"]
+        actions, votes = [], {}
+        if event["kind"] == "scan":
+            vols = {}
+            if strategy["vol_target"]:
+                for sym in basket:
+                    closes = history(sym, max(needed, strategy["vol_lookback"] + 1), now)
+                    vol = realized_vol(closes, strategy["vol_lookback"])
+                    if vol:
+                        vols[sym] = vol
+            median = basket_median_vol(list(vols.values()))
+            for sym in basket:
+                check()
+                action = {"symbol": sym, "action": "skip"}
+                if sym in blocked:
+                    action["reason"] = "explicit_entry_block"
+                elif sym in holdings:
+                    action["reason"] = "already_held"
+                else:
+                    closes = history(sym, needed, now)
+                    known = has_full_history(closes, params)
+                    inside, count, _detail = is_in_trend(closes, params) if known else (False, 0, {})
+                    votes[sym] = {"votes": count, "history_known": known}
+                    notional = strategy["position_size"] * (vol_target_multiplier(vols.get(sym), median)
+                                                            if strategy["vol_target"] else 1.0)
+                    if strategy["position_size_max"] > 0:
+                        notional = min(notional, strategy["position_size_max"])
+                    if not known:
+                        action["reason"] = "unknown_daily_history"
+                    elif not inside:
+                        action["reason"] = "not_in_trend"
+                    elif len(holdings) >= strategy["max_open_trades"]:
+                        action["reason"] = "max_open_trades"
+                    elif sym not in prices:
+                        action["reason"] = "unavailable_quote"
+                    else:
+                        fee = notional * fee_rate
+                        debit = notional + fee
+                        if debit > cash:
+                            action["reason"] = "insufficient_paper_cash"
+                        else:
+                            fill = prices[sym] * (1.0 + slip_rate)
+                            amount = notional / fill
+                            _trend_event_number(amount, "paper fill quantity", positive=True)
+                            cash -= debit
+                            total_fees += fee
+                            holdings[sym] = {"base_amount": amount, "entry_price": fill, "cost_basis_usdt": debit}
+                            action = {"symbol": sym, "action": "buy", "notional_usdt": notional,
+                                      "fill_price": fill, "base_amount": amount, "fee_usdt": fee}
+                actions.append(action)
+        else:
+            median = None
+            for sym in list(holdings):
+                check()
+                position = holdings[sym]
+                if sym not in prices:
+                    actions.append({"symbol": sym, "action": "hold", "reason": "unavailable_quote"})
+                    continue
+                price = prices[sym]
+                reason = None
+                if (price / position["entry_price"] - 1.0) * 100.0 <= strategy["disaster_stop_pct"]:
+                    reason = "disaster_stop"
+                elif event["evaluate_trend"]:
+                    closes = history(sym, needed, now)
+                    known = has_full_history(closes, params)
+                    inside, count, detail = is_in_trend(closes, params, currently_held=True) if known else (True, 0, {})
+                    votes[sym] = {"votes": count, "history_known": known}
+                    if known and detail and not inside:
+                        reason = "trend_exit"
+                    elif not known:
+                        actions.append({"symbol": sym, "action": "hold", "reason": "unknown_daily_history"})
+                        continue
+                if reason is None:
+                    actions.append({"symbol": sym, "action": "hold", "reason": "in_trend_or_daily_not_due"})
+                    continue
+                fill = price * (1.0 - slip_rate)
+                gross = position["base_amount"] * fill
+                fee = gross * fee_rate
+                credit = gross - fee
+                cash = math.fsum((cash, credit))
+                total_fees += fee
+                trade = {"symbol": sym, "sequence": sequence, "decision_ms": now, "reason": reason,
+                         "fill_price": fill, "base_amount": position["base_amount"], "fee_usdt": fee,
+                         "net_profit_usdt": credit - position["cost_basis_usdt"]}
+                closed_trades.append(trade)
+                del holdings[sym]
+                actions.append({**trade, "action": "sell"})
+        all_marked = all(sym in prices for sym in holdings)
+        equity = math.fsum([cash, *(pos["base_amount"] * prices[sym] for sym, pos in holdings.items())]) if all_marked else None
+        if equity is None:
+            complete_equity = False
+        else:
+            peak = max(peak, equity)
+            max_dd = max(max_dd, (peak - equity) / peak * 100.0 if peak > 0 else 0.0)
+        if not math.isfinite(cash) or cash < 0 or (equity is not None and not math.isfinite(equity)):
+            raise ValueError("nonfinite TREND paper portfolio")
+        frames.append({"sequence": sequence, "decision_ms": now, "kind": event["kind"], "actions": actions,
+                       "votes": votes, "basket_median_vol": median, "cash_usdt": cash,
+                       "equity_usdt": equity, "held_symbols": list(holdings)})
+    check()
+    if hashlib.sha256(_trend_event_encode(trace)).hexdigest() != input_sha or _trend_event_code_hashes() != codes:
+        raise ValueError("TREND event input or code changed during replay")
+    result = {
+        "schema_version": 1, "status": "NO_GO", "research_only": True,
+        "input_kind": data["input_kind"], "input_sha256": input_sha, "source_sha256": codes,
+        "experiment_identity_sha256": hashlib.sha256(_trend_event_encode({
+            "schema_version": 1, "input_sha256": input_sha, "source_sha256": codes,
+            "policy": "explicit_event_order_paper_portfolio_v1",
+        })).hexdigest(),
+        "observed_trace_provenance_verified": False, "full_runtime_execution_verified": False,
+        "historical_account_truth": False, "independent_oos_verified": False, "promotion_eligible": False,
+        "decision_conformance": "shared_signal_voltarget_math_with_explicit_decision_events",
+        "portfolio_model": "paper_cash_quote_fee_adverse_slippage_v1",
+        "runtime_sim_balance_parity": False, "scheduler_reconstructed": False,
+        "quote_fills_venue_verified": False, "terminal_liquidation": False,
+        "fee_contract": "declared_quote_currency_fee_on_each_filled_side_v1",
+        "initial_capital_usdt": initial_capital, "final_cash_usdt": cash, "total_fees_usdt": total_fees,
+        "final_holdings": holdings, "closed_trades": closed_trades, "frames": frames,
+        "portfolio_equity_complete": complete_equity,
+        "max_drawdown_pct": max_dd if complete_equity else None,
+        "limits": {"events": TREND_EVENT_MAX_EVENTS, "daily_bars": TREND_EVENT_MAX_BARS,
+                   "bytes": TREND_EVENT_MAX_BYTES, "seconds": TREND_EVENT_MAX_SECONDS},
+    }
+    _trend_event_encode(result)
+    check()
+    return result
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
     if not args or args[0] not in STRATEGY_DEFAULTS:

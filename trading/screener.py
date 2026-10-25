@@ -542,118 +542,13 @@ def _is_noncrypto(symbol: str) -> bool:
 
 
 def _compute_indicators(bars, *, last_index: int = -2) -> dict:
-    """Pure indicator math  kein I/O, kein Logging. Wirft bei input errors.
+    """Shared pure math with the runtime's existing TA injection seams."""
+    from trading.mechanical_entry_features import compute_mechanical_entry_features
 
-    Look-Ahead / Repainting vermeiden:
-    ``fetch_ohlcv`` liefert als letztes Element die AKTUELL LAUFENDE, noch
-    nicht geschlossene Kerze. Auf ``iloc[-1]`` gerechnete Indikatoren wrden
-    bis zum Kerzen-Close repainten". Alle Indikatoren werden daher konsistent
-    auf der letzten GESCHLOSSENEN Kerze gerechnet, passend zu Volumen/Body.
-    Der Fetchpfad bestimmt ihren Index anhand des validierten Zeitrasters;
-    der pure Altvertrag verwendet -2, wenn kein expliziter Index vorliegt.
-    """
-    df = pd.DataFrame(
-        bars, columns=["timestamp", "open", "high", "low", "close", "volume"]
+    return compute_mechanical_entry_features(
+        bars, last_index=last_index, rsi_fn=_ta_rsi,
+        macd_signal_fn=_ta_macd_signal, atr_fn=_ta_atr, ema_fn=_ta_ema,
     )
-
-    # Brauchen mindestens 2 Zeilen, damit eine geschlossene Kerze existiert.
-    if len(df) < 2:
-        return {}
-    LAST = last_index
-
-    rsi_raw = _ta_rsi(df["close"], length=14)
-    if (
-        rsi_raw is None
-        or rsi_raw.empty
-        or len(rsi_raw) < 2
-        or pd.isna(rsi_raw.iloc[LAST])
-    ):
-        return {}
-    rsi = float(rsi_raw.iloc[LAST])
-
-    try:
-        # Signallinie  repliziert das frhere df.ta.macd(...).iloc[-1,-1]
-        macd_series = _ta_macd_signal(df["close"], fast=12, slow=26, signal=9)
-        if macd_series is not None and len(macd_series) >= 2:
-            macd_last = macd_series.iloc[LAST]
-            macd_h = float(macd_last) if not pd.isna(macd_last) else 0.0
-        else:
-            macd_h = 0.0
-    except Exception:
-        macd_h = 0.0
-
-    try:
-        atr_series = _ta_atr(df["high"], df["low"], df["close"], length=14)
-        atr_last = (
-            atr_series.iloc[LAST]
-            if atr_series is not None and len(atr_series) >= 2
-            else None
-        )
-        if atr_last is None or pd.isna(atr_last):
-            atr_pct = 0.0
-        else:
-            curr_pr = float(df["close"].iloc[LAST])
-            atr_pct = (float(atr_last) / curr_pr * 100) if curr_pr > 0 else 0.0
-    except Exception:
-        atr_pct = 0.0
-
-    try:
-        ema_series = _ta_ema(df["close"], length=50)
-        ema_last = (
-            ema_series.iloc[LAST]
-            if ema_series is not None and len(ema_series) >= 2
-            else None
-        )
-        curr_pr = float(df["close"].iloc[LAST])
-        if ema_last is None or pd.isna(ema_last) or float(ema_last) <= 0:
-            ema_ratio = 0.0
-        else:
-            ema_ratio = (curr_pr / float(ema_last) - 1) * 100
-    except Exception:
-        ema_ratio = 0.0
-
-    try:
-        if len(df) >= 22:
-            signal_index = LAST if LAST >= 0 else len(df) + LAST
-            vol_curr = float(df["volume"].iloc[signal_index])
-            vol_avg20 = float(df["volume"].iloc[max(0, signal_index - 20):signal_index].mean())
-            if vol_avg20 > 0 and not pd.isna(vol_avg20) and not pd.isna(vol_curr):
-                vol_surge = vol_curr / vol_avg20
-            else:
-                vol_surge = 1.0
-        else:
-            vol_surge = 1.0
-    except Exception:
-        vol_surge = 1.0
-
-    try:
-        o = float(df["open"].iloc[LAST])
-        h = float(df["high"].iloc[LAST])
-        low = float(df["low"].iloc[LAST])
-        c = float(df["close"].iloc[LAST])
-        if (
-            not all(math.isfinite(value) for value in (o, h, low, c))
-            or h <= low
-            or h < max(o, c)
-            or low > min(o, c)
-        ):
-            return {}
-        candle_range = h - low
-        body = abs(c - o)
-        body_ratio = body / candle_range
-        candle_dir = -1.0 if c < o else (1.0 if c > o else 0.0)
-    except Exception:
-        return {}
-
-    return {
-        "rsi": rsi,
-        "macd_hist": macd_h,
-        "atr_pct": atr_pct,
-        "ema_ratio": ema_ratio,
-        "vol_surge": vol_surge,
-        "body_ratio": body_ratio,
-        "candle_dir": candle_dir,
-    }
 
 
 def _handle_ohlcv_exception(symbol, timeframe, e, bot_name):

@@ -54,6 +54,9 @@ _STANDARD_POOL_SUBMIT_CODE = _STANDARD_POOL_SUBMIT.__code__
 _TRADE_UPDATE_MAX_ROWS = 20_000
 _TRADE_PERSIST_RETRY_INITIAL_SECONDS = 0.1
 _TRADE_PERSIST_RETRY_MAX_SECONDS = 5.0
+_PUBLIC_MARKET_CACHE_SECONDS = 300.0
+_SNAPSHOT_RECOVERY_ATTEMPTS = 2
+_SNAPSHOT_BUDGET_ENDPOINT = "l2_snapshot_fetch_order_book"
 _MAX_CONNECTION_EPOCH = (1 << 63) - 1
 _PUBLIC_CREDENTIAL_OPTION_KEYS = frozenset({
     "accesstoken",
@@ -105,6 +108,102 @@ def _consume_async_task_result(task: asyncio.Future) -> None:
         task.exception()
     except BaseException:
         pass
+
+
+class _MexcSnapshotOwner:
+    """Own only native CCXT snapshot spawns on one public capture client."""
+
+    def __init__(self, exchange) -> None:
+        from ccxt.async_support.base.exchange import Exchange
+
+        self.exchange = exchange
+        self._original_spawn = exchange.spawn
+        self._original_fetch_order_book = exchange.fetch_order_book
+        self._snapshot_function = Exchange.load_order_book
+        self._tasks: set[asyncio.Task] = set()
+        self._closing = False
+        self._budget_waiting: dict[asyncio.Task, str] = {}
+
+    def budget_wait_covers(self, symbols) -> bool:
+        waiting = {
+            symbol for task, symbol in self._budget_waiting.items()
+            if task in self._tasks and not task.done()
+        }
+        return bool(symbols) and set(symbols) <= waiting
+
+    async def fetch_order_book(self, symbol, limit=None, params=None):
+        # Pinned CCXT fetch2 consumes this option before signing the request.
+        # Its inner retries cannot bypass admission: load_order_book owns the
+        # existing recursive retry, which enters this wrapper afresh each time.
+        snapshot_params = dict(params) if params is not None else {}
+        snapshot_params["maxRetriesOnFailure"] = 0
+        task = asyncio.current_task()
+        try:
+            while not self._closing:
+                try:
+                    reservation = try_consume_api_call(
+                        _SNAPSHOT_BUDGET_ENDPOINT, return_reservation=True,
+                    )
+                except Exception:
+                    reservation = None
+                if reservation:
+                    self._budget_waiting.pop(task, None)
+                    if self._closing:
+                        raise asyncio.CancelledError
+                    try:
+                        return await self._original_fetch_order_book(symbol, limit, snapshot_params)
+                    except Exception:
+                        if isinstance(reservation, ApiCallReservation):
+                            try:
+                                record_api_error(_SNAPSHOT_BUDGET_ENDPOINT, reservation)
+                            except Exception:
+                                pass
+                        raise
+                self._budget_waiting[task] = symbol
+                await asyncio.sleep(0.1)
+            raise asyncio.CancelledError
+        finally:
+            self._budget_waiting.pop(task, None)
+
+    def spawn(self, method, *args):
+        if (
+            getattr(method, "__self__", None) is not self.exchange
+            or getattr(method, "__func__", None) is not self._snapshot_function
+        ):
+            return self._original_spawn(method, *args)
+        from ccxt.async_support.base.ws.future import Future
+
+        future = Future()
+        future.add_done_callback(_consume_async_task_result)
+        if self._closing:
+            future.cancel()
+            return future
+        task = asyncio.get_running_loop().create_task(method(*args))
+        self._tasks.add(task)
+
+        def completed(done):
+            self._tasks.discard(done)
+            if done.cancelled():
+                future.cancel()
+                return
+            error = done.exception()
+            if error is None:
+                future.resolve(done.result())
+            else:
+                future.reject(error)
+
+        task.add_done_callback(completed)
+        return future
+
+    async def drain(self) -> None:
+        # This runs in the shielded, exact close-owner task. A snapshot which
+        # defers cancellation must finish before native close or owner release.
+        self._closing = True
+        pending = tuple(self._tasks)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
 
 def _capture_write_confirmed(result) -> bool:
@@ -209,6 +308,10 @@ async def close_public_async_exchange(
 
 class _MexcSubscriptionRefresh(Exception):
     """A removed public subscription requires a fresh MEXC transport owner."""
+
+
+class _MexcSnapshotBudgetStall(Exception):
+    """Every stale stream is waiting for local snapshot budget, not HTTP."""
 
 
 class OrderBookValidationError(ValueError):
@@ -683,6 +786,7 @@ class L2ShadowCollector:
         self._stop_event = threading.Event()
         self._async_clients_lock = threading.Lock()
         self._async_clients: list[object] = []
+        self._snapshot_owners: dict[int, _MexcSnapshotOwner] = {}
         self._persist_work_lock = threading.Lock()
         self._persist_work_states: dict[object, dict] = {}
         self._owned_writer_close_lock = threading.Lock()
@@ -1627,12 +1731,32 @@ class L2ShadowCollector:
         with self._async_clients_lock:
             if not any(exchange is client for client in self._async_clients):
                 self._async_clients.append(exchange)
+        if self.exchange_id == "mexc" and exchange is not self.exchange:
+            from ccxt.async_support.base.exchange import Exchange
+
+            if isinstance(exchange, Exchange) and exchange.id == "mexc":
+                if id(exchange) not in self._snapshot_owners:
+                    from ccxt.async_support.mexc import mexc as Mexc
+
+                    fetch = exchange.fetch_order_book
+                    if (
+                        getattr(fetch, "__self__", None) is not exchange
+                        or getattr(fetch, "__func__", None) is not Mexc.fetch_order_book
+                        or getattr(exchange.load_order_book, "__self__", None) is not exchange
+                        or getattr(exchange.load_order_book, "__func__", None) is not Exchange.load_order_book
+                    ):
+                        raise ValueError("unsupported public MEXC snapshot fetch override")
+                    owner = _MexcSnapshotOwner(exchange)
+                    exchange.spawn = owner.spawn
+                    exchange.fetch_order_book = owner.fetch_order_book
+                    self._snapshot_owners[id(exchange)] = owner
 
     def _release_async_client(self, exchange) -> None:
         with self._async_clients_lock:
             self._async_clients = [
                 client for client in self._async_clients if client is not exchange
             ]
+        self._snapshot_owners.pop(id(exchange), None)
 
     def _persist_registry(self) -> tuple[threading.Lock, dict[object, dict]]:
         """Return the exact accepted-work registry, including legacy probes."""
@@ -1697,6 +1821,9 @@ class L2ShadowCollector:
         cancelled = False
 
         async def invoke_close() -> bool:
+            owner = self._snapshot_owners.get(id(exchange))
+            if owner is not None and owner.exchange is exchange:
+                await owner.drain()
             close = getattr(exchange, "close", None)
             if not callable(close):
                 return True
@@ -1859,11 +1986,36 @@ class L2ShadowCollector:
             raise asyncio.CancelledError
 
     async def _watch_symbol(self, async_exchange, symbol: str) -> None:
+        snapshot_retries = 0
         while not self._should_stop() and symbol in self._symbol_snapshot():
-            observed_book = await async_exchange.watch_order_book(
-                symbol,
-                self.depth_levels,
-            )
+            try:
+                observed_book = await async_exchange.watch_order_book(
+                    symbol,
+                    self.depth_levels,
+                )
+            except Exception as exc:
+                if (
+                    self.exchange_id != "mexc"
+                    or snapshot_retries >= _SNAPSHOT_RECOVERY_ATTEMPTS
+                    or not self._snapshot_retry_in_progress(async_exchange, symbol, exc)
+                ):
+                    raise
+                # CCXT's snapshot loader rejects this watch future before
+                # retrying the REST snapshot itself. Re-await that existing
+                # subscription instead of tearing down both public transports.
+                snapshot_retries += 1
+                self._mark_l2_unhealthy(symbol, type(exc).__name__)
+                try:
+                    from core.logger import log_struct
+                    log_struct(
+                        "l2_shadow_snapshot_retry", exchange=self.exchange_id,
+                        symbol=symbol, error_type=type(exc).__name__,
+                        retry_attempt=snapshot_retries,
+                    )
+                except Exception:
+                    pass
+                continue
+            snapshot_retries = 0
             received_ms = _capture_now_ms()
             observed_at_monotonic = time.monotonic()
             try:
@@ -2079,6 +2231,8 @@ class L2ShadowCollector:
                         now - since >= self._health_startup_grace_seconds
                         for since in mexc_stale_since.values()
                     ):
+                        if self._snapshot_budget_covers_stale(l2_exchange, stale):
+                            raise _MexcSnapshotBudgetStall()
                         raise TimeoutError(
                             "L2 watcher stale for " + ",".join(sorted(stale))
                         )
@@ -2097,6 +2251,8 @@ class L2ShadowCollector:
                     symbol for kind, symbol in tasks if kind == "l2"
                 }
                 if stale and set(stale) == desired_l2:
+                    if self._snapshot_budget_covers_stale(l2_exchange, stale):
+                        raise _MexcSnapshotBudgetStall()
                     raise TimeoutError(
                         "L2 watcher stale for " + ",".join(sorted(stale))
                     )
@@ -2169,6 +2325,15 @@ class L2ShadowCollector:
         while not self._should_stop() and time.monotonic() < deadline:
             await asyncio.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
 
+    def _snapshot_budget_covers_stale(self, exchange, stale) -> bool:
+        if self.exchange_id != "mexc":
+            return False
+        owner = self._snapshot_owners.get(id(exchange))
+        return (
+            owner is not None and owner.exchange is exchange
+            and owner.budget_wait_covers(stale)
+        )
+
     def _handle_loop_exception(self, loop, context: dict) -> None:
         """Hide the known ccxt callback cancellation, delegate every other fault."""
         source = f"{context.get('message', '')} {context.get('handle', '')}"
@@ -2196,11 +2361,59 @@ class L2ShadowCollector:
             self._persist_executor = None
             executor.shutdown(wait=True, cancel_futures=True)
 
+    @staticmethod
+    def _snapshot_retry_in_progress(exchange, symbol: str, exc: Exception) -> bool:
+        from ccxt.base.errors import ExchangeNotAvailable, RequestTimeout
+
+        if not isinstance(exc, (ExchangeNotAvailable, RequestTimeout)):
+            return False
+        trace = exc.__traceback__
+        while trace is not None:
+            frame = trace.tb_frame
+            if (
+                frame.f_globals.get("__name__") == "ccxt.async_support.base.exchange"
+                and frame.f_code.co_name == "load_order_book"
+                and frame.f_locals.get("self") is exchange
+                and frame.f_locals.get("symbol") == symbol
+            ):
+                return True
+            trace = trace.tb_next
+        return False
+
+    def _public_market_snapshot(self, exchange):
+        # Capture-only, detached public data: never retain a closed transport
+        # or borrow mutable metadata from the trading client's exchange.
+        if (
+            self.exchange_id != "mexc"
+            or getattr(exchange, "id", None) != "mexc"
+            or not callable(getattr(exchange, "set_markets", None))
+        ):
+            return None
+        markets = getattr(exchange, "markets", None)
+        currencies = getattr(exchange, "currencies", None)
+        if not isinstance(markets, dict) or not markets or not isinstance(currencies, dict):
+            return None
+        if not all(
+            isinstance(markets.get(symbol), dict)
+            and markets[symbol].get("symbol") == symbol
+            and isinstance(markets[symbol].get("id"), str)
+            and bool(markets[symbol]["id"])
+            for symbol in self._symbol_snapshot()
+        ):
+            return None
+        try:
+            return copy.deepcopy((markets, currencies))
+        except Exception:
+            # The cache is optional; a successful fresh load remains usable.
+            return None
+
     async def _run_async(self) -> None:
         backoff = 2.0
         last_error_type: str | None = None
         reconnect_attempts = 0
         last_warning_at = 0.0
+        market_cache = None
+        market_cache_at = 0.0
         while not self._should_stop():
             if self.exchange_id == "mexc" and not self._symbol_snapshot():
                 await self._interruptible_sleep(0.25)
@@ -2208,26 +2421,45 @@ class L2ShadowCollector:
             l2_exchange = None
             trade_exchange = None
             refresh_requested = False
+            budget_stalled = False
             cancelled_during_cleanup = False
             try:
+                use_cached_markets = (
+                    self.exchange_id == "mexc"
+                    and market_cache is not None
+                    and 0.0 <= time.monotonic() - market_cache_at < _PUBLIC_MARKET_CACHE_SECONDS
+                    and set(self._symbol_snapshot()).issubset(market_cache[0])
+                )
                 endpoint = "l2_stream_load_markets"
-                try:
-                    reservation = try_consume_api_call(
-                        endpoint,
-                        return_reservation=True,
-                    )
-                except Exception as budget_exc:
-                    raise RuntimeError(
-                        "l2 load_markets API budget gate unavailable"
-                    ) from budget_exc
-                if not reservation:
-                    raise RuntimeError("l2 load_markets API budget exhausted")
+                if not use_cached_markets:
+                    try:
+                        reservation = try_consume_api_call(
+                            endpoint,
+                            return_reservation=True,
+                        )
+                    except Exception as budget_exc:
+                        raise RuntimeError(
+                            "l2 load_markets API budget gate unavailable"
+                        ) from budget_exc
+                    if not reservation:
+                        raise RuntimeError("l2 load_markets API budget exhausted")
                 l2_exchange = self._make_async_exchange(new_updates=False)
                 self._register_async_client(l2_exchange)
                 try:
-                    await l2_exchange.load_markets()
+                    if use_cached_markets:
+                        try:
+                            if getattr(l2_exchange, "id", None) != self.exchange_id:
+                                raise ValueError("cached market exchange identity mismatch")
+                            l2_exchange.set_markets(*copy.deepcopy(market_cache))
+                        except Exception:
+                            market_cache = None
+                            raise
+                    else:
+                        await l2_exchange.load_markets()
+                        market_cache = self._public_market_snapshot(l2_exchange)
+                        market_cache_at = time.monotonic()
                 except Exception:
-                    if isinstance(reservation, ApiCallReservation):
+                    if not use_cached_markets and isinstance(reservation, ApiCallReservation):
                         try:
                             record_api_error(endpoint, reservation)
                         except Exception:
@@ -2243,8 +2475,8 @@ class L2ShadowCollector:
                         "trade transport cannot share loaded market metadata"
                     )
                 # Two transports remain independently owned for MEXC stream
-                # isolation, but their immutable market metadata is loaded
-                # exactly once per connection epoch.
+                # isolation, sharing only public market metadata loaded once
+                # or restored from this collector's bounded detached cache.
                 share_markets(l2_exchange)
                 self._begin_connection_epoch(
                     error_type=last_error_type,
@@ -2267,7 +2499,16 @@ class L2ShadowCollector:
             except _MexcSubscriptionRefresh:
                 refresh_requested = True
                 self._log("capture subscription set changed; refreshing public transports", "INFO")
+            except _MexcSnapshotBudgetStall:
+                budget_stalled = True
+                with self._health_lock:
+                    self._health_last_interruption_wall_ts = _capture_now_ms() / 1000.0
+                self._log("L2 snapshot waiting for local API budget; capture remains degraded", "WARN")
             except Exception as exc:
+                if market_cache is not None:
+                    from ccxt.base.errors import ArgumentsRequired, BadRequest
+                    if isinstance(exc, (ArgumentsRequired, BadRequest)):
+                        market_cache = None
                 error_type, error_detail = _safe_exception_summary(exc)
                 interruption_wall_ts = _capture_now_ms() / 1000.0
                 with self._health_lock:
@@ -2325,7 +2566,10 @@ class L2ShadowCollector:
                         self._health_session_active = False
                     cancelled_during_cleanup = await self._drain_persist_work_async()
                     self._begin_health_check(
-                        error_type=("SubscriptionRefresh" if refresh_requested else last_error_type),
+                        error_type=(
+                            "SnapshotBudgetStall" if budget_stalled else
+                            "SubscriptionRefresh" if refresh_requested else last_error_type
+                        ),
                         reconnect_attempts=reconnect_attempts,
                     )
                 exchanges = []
@@ -2342,6 +2586,9 @@ class L2ShadowCollector:
             ):
                 break
             if refresh_requested:
+                continue
+            if budget_stalled:
+                await self._interruptible_sleep(1.0)
                 continue
             wait = min(backoff * random.uniform(0.75, 1.25), self.reconnect_max_seconds)
             await self._interruptible_sleep(max(1.0, wait))

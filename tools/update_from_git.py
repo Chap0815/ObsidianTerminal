@@ -1977,12 +1977,31 @@ def _install_dependencies_if_present(
         )
     _print("Pruefe/aktualisiere Python-Abhaengigkeiten ...")
     dep_python = _dependency_python()
-    install_cmd = [
-        str(dep_python), "-m", "pip", "install", "--require-hashes",
-    ]
+    helper_cmd = [str(dep_python), "-I", "-B", str(ROOT / "tools" / "install_locked_dependencies.py"),
+                  "--lock", str(req)]
+    capability = run_bounded_capture(
+        [*helper_cmd, "--capabilities"], cwd=str(ROOT), timeout=15,
+        wrapper_python=sys.executable, **_hidden_kwargs(),
+    )
+    try:
+        supported = _loads_bounded_json_text(capability.stdout or "", 4096, "dependency installer capabilities")
+        valid = (type(supported) is dict
+            and set(supported) == {"schema_version", "installer_api_version", "offline_pip_bootstrap",
+                                   "require_hashes", "no_build_isolation", "force_reinstall"}
+            and type(supported["schema_version"]) is int and supported["schema_version"] == 1
+            and type(supported["installer_api_version"]) is int and supported["installer_api_version"] == 2
+            and all(type(supported[key]) is bool and supported[key] is True for key in
+                    ("offline_pip_bootstrap", "require_hashes", "no_build_isolation", "force_reinstall")))
+    except (ValueError, TypeError, RecursionError):
+        valid = False
+    if capability.returncode != 0 or not valid:
+        raise RuntimeError(
+            "Dependency-Installer unterstuetzt den sicheren Bootstrap nicht. "
+            "Paketinstallation ohne unsicheren Legacy-Fallback abgebrochen."
+        )
+    install_cmd = list(helper_cmd)
     if force_reinstall:
         install_cmd.append("--force-reinstall")
-    install_cmd.extend(["-r", str(req)])
     r = run_bounded_capture(
         install_cmd,
         cwd=str(ROOT),

@@ -72,7 +72,18 @@ def should_cooldown_after_exit(reason: str, profit_usdt: float) -> bool:
     r = str(reason or "")
     if "Liq" in r:
         return True
-    if not any(s in r for s in _STOP_EXIT_REASONS):
+    legacy_stop = any(s in r for s in _STOP_EXIT_REASONS)
+    if any(label in r for label in ("Failed-Entry Stop", "Disaster stop")) and not legacy_stop:
+        # These additional protective exits pause only on a known realized
+        # loss. Existing stop-family protection retains priority.
+        if isinstance(profit_usdt, bool):
+            return False
+        try:
+            profit = float(profit_usdt)
+        except Exception:
+            return False
+        return math.isfinite(profit) and profit < 0.0
+    if not legacy_stop:
         return False
     if isinstance(profit_usdt, bool):
         return True

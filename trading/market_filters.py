@@ -704,52 +704,17 @@ def fg_label(value: Optional[int]) -> str:
 
 
 def _closed_daily_bars(bars: list) -> list:
-    """Return only completed 1d candles.
-
-    CCXT commonly includes the currently-forming daily candle as the last bar.
-    Regime gates must not repaint on that candle. If timestamps are missing or
-    malformed, conservatively drop the last bar.
-    """
+    """Existing runtime clock adapter for the shared closed-daily window."""
     if not bars:
         return []
     out = list(bars)
     try:
         from core.clock import now_ms
-
-        last_ts = int(float(out[-1][0]))
-        current_ms = int(now_ms())
-        day_ms = 24 * 60 * 60 * 1000
-        today_start_ms = (current_ms // day_ms) * day_ms
-        if last_ts >= today_start_ms:
-            out = out[:-1]
+        current_ms = now_ms()
     except Exception:
         return []
-    # A syntactically valid OHLCV response can still be stale, duplicated or
-    # reordered. Regime decisions require the latest eight completed UTC days
-    # as one contiguous causal history, not merely eight rows.
-    if len(out) < 8:
-        return out
-    try:
-        recent_timestamps = []
-        for row in out[-8:]:
-            raw_timestamp = row[0]
-            if isinstance(raw_timestamp, bool):
-                return []
-            timestamp = int(float(raw_timestamp))
-            if timestamp != float(raw_timestamp):
-                return []
-            recent_timestamps.append(timestamp)
-        expected_last = today_start_ms - day_ms
-        if recent_timestamps[-1] != expected_last:
-            return []
-        if any(
-            right - left != day_ms
-            for left, right in zip(recent_timestamps, recent_timestamps[1:])
-        ):
-            return []
-    except (IndexError, TypeError, ValueError, OverflowError):
-        return []
-    return out
+    from trading.mechanical_entry_features import closed_daily_bars_at
+    return closed_daily_bars_at(out, current_ms)
 
 
 def get_market_regime(exchange) -> dict:
@@ -871,12 +836,8 @@ def get_market_regime(exchange) -> dict:
             if btc_24h is None or not math.isfinite(btc_24h):
                 raise RuntimeError("market-regime 24h change is unavailable")
 
-            if len(closed_bars) >= 8:
-                btc_7d = (
-                    (closed_prices[-1] - closed_prices[-8]) / closed_prices[-8]
-                ) * 100
-            else:
-                btc_7d = 0.0
+            from trading.mechanical_entry_features import btc_seven_day_change
+            btc_7d = btc_seven_day_change(closed_bars)
 
             fg = get_fear_greed()
 

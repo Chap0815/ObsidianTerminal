@@ -675,6 +675,16 @@ class FuturesScanMixin:
                                               safe_set_margin_mode,
                                               entry_params)
 
+        consumed_regime = None
+        try:
+            regime_witness_scope = bool(self.simulation) and self.BOT_NAME == "FUTURES" and type(regime) is dict
+            if regime_witness_scope:
+                # Bind the same local, flat producer DTO throughout this pass;
+                # a later cache refresh must not substitute its gate operands.
+                regime = regime.copy()
+        except Exception:
+            regime_witness_scope = False
+
         if getattr(self, "_entry_recovery_blocked", False):
             log_event(
                 f"[{self.BOT_NAME}] new entries blocked by unresolved order intent",
@@ -908,22 +918,42 @@ class FuturesScanMixin:
             from core.constants import FUT_REGIME_BEAR_7D, FUT_REGIME_BULL_7D
             _bear_7d = FUT_REGIME_BEAR_7D
             _bull_7d = FUT_REGIME_BULL_7D
-            # A "clear" trend = explicit regime OR 7d move past the threshold.
-            # The milder -3%..-5% zone is handled by the existing margin-
-            # damping below (dampen, don't block) so the bot still trades in
-            # light headwind but won't fight a clear downtrend.
-            clear_bear = (_reg == "BEAR") or (_btc7 <= _bear_7d)
-            clear_bull = (_reg == "BULL") and (_btc7 >= _bull_7d)
-            if clear_bear and direction == "LONG" and _conf != "HIGH":
+            from trading.mechanical_entry_signal import FuturesRegimePolicy, assess_futures_regime_gate
+            _regime_policy = FuturesRegimePolicy(_gate_on, _bear_7d, _bull_7d)
+            _allowed_regime, _blocked_regime = assess_futures_regime_gate(
+                direction, _conf, _reg, _btc7, _regime_policy)
+            if not _allowed_regime and _blocked_regime == "BEAR":
                 log_event(
                     f"{sym}: LONG blocked  BEAR regime (BTC 7d {_btc7:+.1f}%), "
                     f"counter-trend needs HIGH conf (got {_conf})", "WAIT")
                 return
-            if clear_bull and direction == "SHORT" and _conf != "HIGH":
+            if not _allowed_regime and _blocked_regime == "BULL":
                 log_event(
                     f"{sym}: SHORT blocked  BULL regime (BTC 7d {_btc7:+.1f}%), "
                     f"counter-trend needs HIGH conf (got {_conf})", "WAIT")
                 return
+
+        if regime_witness_scope:
+            try:
+                from trading.candidate_feature_evidence import normalize_consumed_regime_snapshot
+                # These are observations of the already-frozen producer DTO.
+                # In particular an inactive gate gains no mandatory float()
+                # conversion or new trading prerequisite from telemetry.
+                if any(type(regime.get(key)) not in (int, float) for key in ("btc_24h", "btc_7d")):
+                    raise ValueError("regime witness numeric operands unavailable")
+                if not _gate_on:
+                    from core.constants import FUT_REGIME_BEAR_7D, FUT_REGIME_BULL_7D
+                    _bear_7d, _bull_7d = FUT_REGIME_BEAR_7D, FUT_REGIME_BULL_7D
+                consumed_regime = normalize_consumed_regime_snapshot({
+                    "schema_version": 1, "policy_version": "futures_regime_direction_gate_v1",
+                    "observation_basis": "actual_runtime_gate_operands", "regime": regime["regime"],
+                    "btc_24h": btc_chg, "btc_7d": _btc7 if _gate_on else regime["btc_7d"],
+                    "confidence": _conf if _gate_on else str(confidence).upper(),
+                    "gate_enabled": _gate_on, "bear_7d_threshold": _bear_7d,
+                    "bull_7d_threshold": _bull_7d,
+                })
+            except Exception:
+                consumed_regime = None
 
         # Quality filters
         allow, why = self._quality_filters(sym, r, direction, confidence,
@@ -1090,6 +1120,25 @@ class FuturesScanMixin:
         }
         from trading.expectancy_telemetry import emit_expectancy_candidate
 
+        feature_receipt_out = {}
+        feature_fact_context = None
+        if self.simulation and self.BOT_NAME == "FUTURES":
+            try:
+                from trading.candidate_microstructure import _simulated_execution_scope
+                from trading.candidate_feature_evidence import (
+                    FEATURE_POLICY_VERSION_V2, normalize_feature_context,
+                )
+                if consumed_regime is None:
+                    raise ValueError("actual consumed regime witness unavailable")
+                scope = _simulated_execution_scope(self.ex, symbol_full)
+                feature_fact_context = normalize_feature_context({
+                    "schema_version": 2, "bot_name": "FUTURES", "mode": "SIM",
+                    "symbol": sym, "venue_symbol": symbol_full, "venue": scope["venue"],
+                    "market_type": scope["market_type"], "direction": direction,
+                    "feature_policy_version": FEATURE_POLICY_VERSION_V2,
+                    "consumed_regime": consumed_regime})
+            except Exception:
+                feature_fact_context = None
         emit_expectancy_candidate(
             bot=self.BOT_NAME,
             entry_id=entry_id,
@@ -1098,6 +1147,8 @@ class FuturesScanMixin:
             direction=direction,
             features=expectancy_features,
             venue_symbol=symbol_full,
+            **({"feature_fact_context": feature_fact_context, "feature_receipt_out": feature_receipt_out}
+               if feature_fact_context is not None else {}),
             quality_decision={
                 "score": float(quality.score),
                 "minimum_score": float(self._entry_quality_min_score()),
@@ -1288,15 +1339,27 @@ class FuturesScanMixin:
         fees_paid = 0.0
         entry_verified = bool(self.simulation)
         entry_time = _utc_now_str()
+        sim_tca_pending = None
+        sim_arrival_book = None
+        sim_arrival_received_at_ms = None
 
         if self.simulation:
+            # Capture the current-process receipt and interval BEFORE actual
+            # SIM notional/contracts/fee calculations, not after the fill.
+            feature_prefill = None
+            if feature_fact_context is not None:
+                from trading.expectancy_telemetry import capture_prefill_feature_observation
+                feature_prefill = capture_prefill_feature_observation(
+                    entry_id=entry_id, receipt=feature_receipt_out.get("receipt"),
+                    context=feature_fact_context)
             try:
                 notional = float(margin_usdt) * float(leverage)
                 contract_size = self._get_contract_size(symbol_full)
                 coins = (notional / entry_price) if entry_price > 0 else 0.0
                 amount = coins / max(contract_size, 1e-9)
                 from bot_utils.fee_math import taker_fee_rate
-                fees_paid = notional * taker_fee_rate(self.ex, symbol_full)
+                fee_rate = taker_fee_rate(self.ex, symbol_full)
+                fees_paid = notional * fee_rate
             except (TypeError, ValueError, ZeroDivisionError):
                 amount = 0.0
                 fees_paid = 0.0
@@ -1307,6 +1370,55 @@ class FuturesScanMixin:
                     stage="aborted", mode=entry_mode,
                     reason="invalid_sim_amount")
                 return
+            # Capture the actual public book before freezing this SIM fill.
+            # Its quantities and the position amount are both CONTRACTS.
+            try:
+                from trading.candidate_microstructure import prepare_simulated_entry_book
+
+                unavailable_reason = "capture_contract_size_unavailable"
+                if (not isinstance(contract_size, bool)
+                        and isinstance(contract_size, (int, float))
+                        and math.isfinite(contract_size) and contract_size > 0):
+                    prepared = prepare_simulated_entry_book(
+                        exchange=self.ex, symbol=symbol_full,
+                        side="buy" if direction == "LONG" else "sell", amount=amount,
+                        contract_size=contract_size,
+                        depth_levels=int(self.C("TCA_DEPTH_LEVELS", 20)),
+                    )
+                    unavailable_reason = "entry_orderbook_unavailable"
+                    if prepared is not None:
+                        sim_arrival_book, sim_arrival_received_at_ms = prepared
+                        unavailable_reason = None
+                from datetime import datetime, timezone
+                from core.clock import now_ms
+
+                fill_time_ms = float(now_ms())
+                if not math.isfinite(fill_time_ms) or fill_time_ms <= 0:
+                    raise ValueError("SIM fill time is invalid")
+                entry_time = datetime.fromtimestamp(
+                    fill_time_ms / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                capture_anchor = datetime.fromtimestamp(
+                    math.ceil(fill_time_ms / 1000), timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                feature_capsule = None
+                if feature_prefill is not None:
+                    try:
+                        from trading.candidate_feature_evidence import bind_prefill_observation
+                        feature_capsule = bind_prefill_observation(feature_prefill, fill_time_ms=fill_time_ms)
+                    except Exception:
+                        pass
+                sim_tca_pending = self._new_simulated_entry_tca_pending(
+                    entry_id=entry_id, symbol=symbol_full,
+                    side="buy" if direction == "LONG" else "sell", amount=amount,
+                    fill_price=fill_price, fee_rate=fee_rate,
+                    notional_usdt=amount * contract_size * fill_price,
+                    filled_at=capture_anchor, fill_time_ms=fill_time_ms,
+                    arrival_unavailable_reason=unavailable_reason,
+                    **({"feature_capsule": feature_capsule} if feature_capsule is not None else {}),
+                )
+            except Exception as capture_exc:
+                from bot_utils.silent_log import silent_log
+
+                silent_log("FUTURES SIM entry arrival preparation", capture_exc)
         else:
             # mm_rate + liq_price already computed above with the real tier.
             margin_mode = str(self.C("MARGIN_MODE", "isolated") or "isolated").lower()
@@ -2584,6 +2696,8 @@ class FuturesScanMixin:
             "provisional": not entry_verified,
             "entry_price_unverified": not entry_verified,
         }
+        if sim_tca_pending is not None:
+            trade_data[self._SIM_TCA_PENDING_FIELD] = sim_tca_pending
         # Merge instead of replace: update_many keeps monitor-set fields that
         # the Monitor-Thread may have written between the provisional add and
         # this point (a plain state.add would wipe them).
@@ -2674,6 +2788,11 @@ class FuturesScanMixin:
                 stage="state_failed", mode=entry_mode,
                 reason="post_fill_state_write")
         if state_ok is not False:
+            if sim_tca_pending is not None:
+                self._finalize_simulated_entry_tca(
+                    sym, sim_tca_pending, arrival_book=sim_arrival_book,
+                    arrival_received_at_ms=sim_arrival_received_at_ms,
+                )
             emit_entry_lifecycle(
                 entry_id, bot=self.BOT_NAME, symbol=sym,
                 stage="opened", mode=entry_mode, fill_price=fill_price,
@@ -2804,71 +2923,12 @@ class FuturesScanMixin:
             except (ValueError, TypeError, OverflowError):
                 return default
 
-        try:
-            rsi_15 = float(r.get("rsi_15m", 50))
-            rsi_h = float(r.get("rsi_1h", 50))
-            rsi_4  = float(r.get("rsi_4h", 50))
-        except (TypeError, ValueError):
-            rsi_15 = rsi_h = rsi_4 = 50.0
-        ema_ratio = float(r.get("ema_ratio", 0.0) or 0.0)
-        vol_surge = float(r.get("vol_surge", 1.0) or 1.0)
-        chg       = float(r.get("change_percent", 0.0) or 0.0)
-        is_long   = direction == "LONG"
-        score     = 0
+        from trading.mechanical_entry_signal import FuturesSignalPolicy, assess_futures_entry_signal
 
-        # Base: multi-TF RSI continuation alignment (0..3).
-        if is_long:
-            score += sum(1 for v in (rsi_15, rsi_h, rsi_4) if 50 <= v <= 75)
-        else:
-            score += sum(1 for v in (rsi_15, rsi_h, rsi_4) if 25 <= v <= 50)
-
-        # #2 Extension/pullback via distance from EMA50. Far above EMA on a LONG
-        # = chasing a vertical move (bad entry  forces a wide stop). Block only
-        # the parabolic extreme; reward entries NEAR the EMA (continuation).
-        if _on("FUT_EXT_FILTER"):
-            max_ext = _f("FUT_MAX_EXT_PCT", 18.0)
-            ext = ema_ratio if is_long else -ema_ratio
-            if ext > max_ext:
-                return False, "LOW", f"over-extended {ext:+.1f}% vs EMA50 (chasing)"
-            if 0.0 <= ext <= max_ext * 0.45:
-                score += 1
-
-        # #5 Volume surge on the impulse. The screener already requires a base
-        # surge, so this only ADDS confidence for strong flow + blocks the rare
-        # sub-threshold leftover.
-        if _on("FUT_VOL_FILTER"):
-            min_vs = _f("FUT_MIN_VOL_SURGE", 1.0)
-            if vol_surge < min_vs:
-                return False, "LOW", f"weak volume (surge {vol_surge:.2f} < {min_vs:g})"
-            if vol_surge >= 1.8:
-                score += 1
-
-        # #3 Relative strength vs BTC (same 24h window). LONG should outperform
-        # BTC, SHORT underperform. Lenient floor  only blocks clear counter-RS.
-        if _on("FUT_RS_FILTER"):
-            min_rs = _f("FUT_MIN_RS_PCT", -2.0)
-            rs = (chg - btc_chg) if is_long else (btc_chg - chg)
-            if rs < min_rs:
-                return False, "LOW", f"weak rel-strength vs BTC ({rs:+.1f}%)"
-            if rs >= 3.0:
-                score += 1
-
-        # #4 Funding as an edge (soft tilt only; funding_oi_filter still hard-
-        # blocks crowded extremes). You'd rather be PAID funding than pay it:
-        # LONG favoured when funding <= 0, SHORT when funding >= 0. Deadband so
-        # negligible funding tilts nothing.
-        if _on("FUT_FUNDING_EDGE"):
-            f = float(funding_rate or 0.0)
-            if abs(f) >= 0.0001:
-                paying = (f > 0) if is_long else (f < 0)   # your side PAYS funding
-                score += -1 if paying else 1
-
-        # Map score  confidence. Tuned LENIENT (a normal pumping candidate with
-        # aligned RSI lands MEDIUM+), so only genuinely weak setups go LOW.
-        if score >= 4:
-            conf = "HIGH"
-        elif score >= 2:
-            conf = "MEDIUM"
-        else:
-            conf = "LOW"
-        return True, conf, ""
+        policy = FuturesSignalPolicy(
+            ext_filter=_on("FUT_EXT_FILTER"), max_ext_pct=_f("FUT_MAX_EXT_PCT", 18.0),
+            vol_filter=_on("FUT_VOL_FILTER"), min_vol_surge=_f("FUT_MIN_VOL_SURGE", 1.0),
+            rs_filter=_on("FUT_RS_FILTER"), min_rs_pct=_f("FUT_MIN_RS_PCT", -2.0),
+            funding_edge=_on("FUT_FUNDING_EDGE"),
+        )
+        return assess_futures_entry_signal(r, direction, funding_rate, btc_chg, policy)

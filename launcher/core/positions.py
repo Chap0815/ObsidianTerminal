@@ -601,19 +601,25 @@ def _clamp_sim_cross_close_costs(
 def _launcher_futures_close_funding(
     ex, symbol_full: str, row: dict, *, amount: float,
     original_amount: float, notional: float, until_time: str,
+    _resolution_evidence: dict | None = None,
 ) -> float | None:
     """Resolve the complete close window before freezing realized accounting."""
     from bot_utils.futures_funding import fetch_or_estimate_funding, fetch_realized_funding
     from bot_utils.fee_math import safe_remaining_funding
 
     opened = row.get("opened_at") or row.get("buy_time")
+    resolution = _resolution_evidence if isinstance(_resolution_evidence, dict) else {}
+    resolution.clear()
     full_notional = notional * original_amount / amount
     if not math.isfinite(full_notional) or full_notional <= 0:
         return None
-    if row.get("entry_funding_window_unverified") is True:
+    if (row.get("entry_funding_window_unverified") is True
+            or row.get("accounting_pending_funding_unverified") is True):
         funding = fetch_realized_funding(
             ex, symbol_full, opened, until_time_str=until_time,
             notional_usdt=full_notional,
+            _history_evidence=resolution,
+            _expected_position_type=row.get("position_type"),
         )
     else:
         funding = fetch_or_estimate_funding(
@@ -621,10 +627,14 @@ def _launcher_futures_close_funding(
             row.get("position_type"),
             fallback_state_value=_finite_float(row.get("funding_paid")) or 0.0,
             until_time_str=until_time,
+            _resolution_evidence=resolution,
         )
     funding = _finite_float(funding)
     if funding is None:
         return None
+    if resolution.get("source") == "private_account_payments":
+        from bot_utils.futures_funding import allocate_private_funding_remaining
+        return allocate_private_funding_remaining(funding, row)
     return safe_remaining_funding(
         funding, amount, original_amount,
         partial_sold=bool(row.get("partial_sold")),
@@ -1537,6 +1547,9 @@ def _direct_close_remaining_futures(
             "accounting_pending_profit_usdt": jt.get("accounting_pending_profit_usdt"),
             "accounting_pending_fees_usdt": jt.get("accounting_pending_fees_usdt"),
             "accounting_pending_funding_paid": jt.get("accounting_pending_funding_paid"),
+            "accounting_pending_funding_evidence": jt.get("accounting_pending_funding_evidence"),
+            "funding_close_time": jt.get("funding_close_time"),
+            "funding_partial_close_time": jt.get("funding_partial_close_time"),
             "accounting_pending_funding_unverified": (
                 jt.get("accounting_pending_funding_unverified") is True
             ),
@@ -1597,6 +1610,9 @@ def _direct_close_remaining_futures(
                 "accounting_pending_profit_usdt": j.get("accounting_pending_profit_usdt"),
                 "accounting_pending_fees_usdt": j.get("accounting_pending_fees_usdt"),
                 "accounting_pending_funding_paid": j.get("accounting_pending_funding_paid"),
+                "accounting_pending_funding_evidence": j.get("accounting_pending_funding_evidence"),
+                "funding_close_time": j.get("funding_close_time"),
+                "funding_partial_close_time": j.get("funding_partial_close_time"),
                 "accounting_pending_funding_unverified": (
                     j.get("accounting_pending_funding_unverified") is True
                 ),
@@ -1667,6 +1683,8 @@ def _direct_close_remaining_futures(
                     "funding_booked_on_partials_known",
                     "entry_funding_window_unverified",
                     "accounting_pending_funding_unverified",
+                    "accounting_pending_funding_evidence", "funding_close_time",
+                    "funding_partial_close_time",
                     "accounting_pending_partials", "entry_price_unverified",
                     "entry_basis_pending_closes", "entry_basis_remaining_amount",
                     "futures_entry_client_order_id", "futures_entry_order_id",
@@ -1723,7 +1741,7 @@ def _direct_close_remaining_futures(
                 return False
             updated = dict(current)
             updated.update(fields)
-            basis_checkpoint = any(key in updated for key in (
+            basis_checkpoint = not sim_only and any(key in updated for key in (
                 "entry_price_unverified", "entry_basis_pending_closes"))
             if basis_checkpoint:
                 updated["claim_registry_pending"] = True
@@ -2193,46 +2211,57 @@ def _direct_close_remaining_futures(
                         or p.get("accounting_pending_funding_unverified") is True
                     )
                 ):
+                    from bot_utils.futures_funding import (
+                        freeze_funding_close_time, live_close_funding_evidence,
+                    )
+                    # Recovery must use the captured execution window, never
+                    # substitute NOW when a legacy/incomplete marker lacks it.
+                    close_row = _failed_futures_state(p)
+                    close_row.setdefault("buy_time", pending_buy_time)
+                    raw_cutoff = p.get("accounting_pending_sell_time")
+                    frozen = None
+                    if (type(raw_cutoff) is str and raw_cutoff == pending_sell_time
+                            and pending_margin is not None and pending_leverage is not None):
+                        frozen = freeze_funding_close_time(
+                            manual_state, sym, close_row, raw_cutoff,
+                        )
+                    if frozen is None or frozen != raw_cutoff:
+                        failed_syms.append(sym)
+                        failed_position_updates[sym] = pending_retry_state
+                        log("error", f"{sym}: pending funding cutoff not durable or inconsistent")
+                        continue
+                    pending_retry_state["funding_close_time"] = frozen
+                    p["funding_close_time"] = frozen
+                    resolution = {}
                     try:
-                        from bot_utils.futures_funding import fetch_realized_funding
-
-                        exact_funding = _finite_float(fetch_realized_funding(
-                            ex, symbol_full, pending_buy_time,
-                            until_time_str=pending_sell_time,
-                        ))
+                        funding_row = {**p, "position_type": pos_type}
+                        exact_funding = _launcher_futures_close_funding(
+                            ex, symbol_full, funding_row, amount=pending_amount,
+                            original_amount=_positive_finite(p.get("original_amount")) or pending_amount,
+                            notional=pending_margin * pending_leverage,
+                            until_time=frozen, _resolution_evidence=resolution,
+                        )
                     except Exception:
                         exact_funding = None
                     if exact_funding is None:
                         failed_syms.append(sym)
-                        pending_retry_state[
-                            "accounting_pending_funding_unverified"
-                        ] = True
+                        pending_retry_state["accounting_pending_funding_unverified"] = True
                         failed_position_updates[sym] = pending_retry_state
-                        log(
-                            "error",
-                            f"{sym}: pending futures accounting deferred - "
-                            "exact funding history unavailable",
-                        )
+                        log("error", f"{sym}: exact pending funding or prior partial allocation unavailable")
                         continue
-                    if bool(p.get("partial_sold")):
-                        from bot_utils import safe_remaining_funding
-
-                        exact_funding = safe_remaining_funding(
-                            exact_funding,
-                            pending_amount,
-                            _positive_finite(p.get("original_amount"))
-                            or pending_amount,
-                            partial_sold=True,
-                            booked_on_partials=(
-                                _finite_float(
-                                    p.get("funding_booked_on_partials")
-                                )
-                                or 0.0
-                            ),
-                            booked_on_partials_known=(
-                                p.get("funding_booked_on_partials_known") is True
-                            ),
-                        )
+                    funding_cs = _positive_finite(p.get("entry_contract_size"))
+                    if funding_cs is None:
+                        funding_cs = _positive_finite(p.get("contract_size"))
+                    if funding_cs is None:
+                        market = (getattr(ex, "markets", {}) or {}).get(symbol_full) or {}
+                        funding_cs = _positive_finite(market.get("contractSize"))
+                    pending_retry_state["accounting_pending_funding_evidence"] = live_close_funding_evidence(
+                        bot_name=bot_name, symbol=sym, row=close_row,
+                        sell_time=frozen, closed_amount=pending_amount,
+                        contract_size=funding_cs, booked_cost=exact_funding,
+                        resolution=resolution,
+                        exchange_order_id=p.get("accounting_pending_exchange_order_id"),
+                    )
                     if pending_pnl is not None and pending_funding is not None:
                         pending_pnl = round(
                             pending_pnl + pending_funding - exact_funding, 2
@@ -2313,6 +2342,7 @@ def _direct_close_remaining_futures(
                     leverage=pending_leverage,
                     liquidation_price=pending_liq,
                     funding_paid=pending_funding,
+                    funding_evidence=pending_retry_state.get("accounting_pending_funding_evidence"),
                     fees_usdt=pending_fees,
                     exchange_order_id=p.get("accounting_pending_exchange_order_id"),
                     entry_id=p.get("entry_id"),
@@ -2704,16 +2734,30 @@ def _direct_close_remaining_futures(
 
             # Write to DB  shows up in "Realized Profit"
             buy_time = p.get("opened_at") or p.get("buy_time") or _utc_now_str()
-            sell_time = _utc_now_str()
             p = dict(p)
             manual_state.position = p
             p["opened_at"] = buy_time
+            from bot_utils.futures_funding import freeze_funding_close_time
+            close_row = _failed_futures_state(p)
+            close_row.setdefault("buy_time", buy_time)
+            close_row.setdefault("buy", entry)
+            sell_time = freeze_funding_close_time(
+                manual_state, sym, close_row, _utc_now_str(),
+            )
+            if sell_time is None:
+                failed_syms.append(sym)
+                log("error", f"{sym}: funding cutoff not durable; no DB booking")
+                continue
+            p["funding_close_time"] = sell_time
+            funding_evidence = None
+            funding_resolution = {}
             if not sim_only:
                 try:
                     exact_funding = _launcher_futures_close_funding(
                         ex, symbol_full, p, amount=amount,
                         original_amount=original_amount, notional=notional,
                         until_time=sell_time,
+                        _resolution_evidence=funding_resolution,
                     )
                 except Exception:
                     exact_funding = None
@@ -2763,28 +2807,49 @@ def _direct_close_remaining_futures(
                 )
                 p["entry_funding_window_unverified"] = False
                 p["accounting_pending_funding_unverified"] = False
-            if not sim_only:
-                accounting_wal = {
-                    "buy_time": buy_time,
-                    "accounting_pending": True,
-                    "accounting_pending_reason": reason,
-                    "accounting_pending_sell_price": curr,
-                    "accounting_pending_sell_time": sell_time,
-                    "accounting_pending_profit_pct": price_move,
-                    "accounting_pending_profit_usdt": pnl_usdt,
-                    "accounting_pending_fees_usdt": entry_fee + exit_fee,
-                    "accounting_pending_funding_paid": funding_for_close,
-                    "accounting_pending_exchange_order_id": exchange_order_id,
-                    "accounting_pending_mode_is_sim": False,
-                    "entry_funding_window_unverified": False,
-                    "accounting_pending_funding_unverified": False,
-                }
-                if not manual_state.update_many(
-                    sym, accounting_wal, expected_row=_failed_futures_state(p),
-                ):
-                    failed_syms.append(sym)
-                    log("error", f"{sym}: accounting WAL not durable; no DB booking")
-                    continue
+                from bot_utils.futures_funding import live_close_funding_evidence
+                funding_evidence = live_close_funding_evidence(
+                    bot_name=bot_name, symbol=sym, row=close_row, sell_time=sell_time,
+                    closed_amount=amount, contract_size=contract_size,
+                    booked_cost=funding_for_close, resolution=funding_resolution,
+                    exchange_order_id=exchange_order_id,
+                )
+            else:
+                from bot_utils.futures_funding import sim_fragment_funding
+                model_size = _positive_finite(p.get("entry_contract_size"))
+                if str(bot_name).upper() == "CROSS":
+                    model_size = 1.0  # CROSS paper amount is already base quantity.
+                elif model_size is None:
+                    market = getattr(ex, "markets", {}).get(symbol_full, {})
+                    model_size = _positive_finite(market.get("contractSize"))
+                funding_for_close, funding_evidence = sim_fragment_funding(
+                    ex, bot_name=bot_name, symbol=sym, row=close_row,
+                    sell_time=sell_time, closed_amount=amount, contract_size=model_size,
+                    exchange_order_id=exchange_order_id,
+                )
+                pnl_usdt = round(notional * price_move / 100.0 - entry_fee - exit_fee - funding_for_close, 2)
+            accounting_wal = {
+                "buy_time": buy_time,
+                "accounting_pending": True,
+                "accounting_pending_reason": reason,
+                "accounting_pending_sell_price": curr,
+                "accounting_pending_sell_time": sell_time,
+                "accounting_pending_profit_pct": price_move,
+                "accounting_pending_profit_usdt": pnl_usdt,
+                "accounting_pending_fees_usdt": entry_fee + exit_fee,
+                "accounting_pending_funding_paid": funding_for_close,
+                "accounting_pending_funding_evidence": funding_evidence,
+                "accounting_pending_exchange_order_id": exchange_order_id,
+                "accounting_pending_mode_is_sim": sim_only,
+                "entry_funding_window_unverified": False,
+                "accounting_pending_funding_unverified": False,
+            }
+            if not manual_state.update_many(
+                sym, accounting_wal, expected_row=_failed_futures_state(p),
+            ):
+                failed_syms.append(sym)
+                log("error", f"{sym}: accounting WAL not durable; no DB booking")
+                continue
             saved_ok = save_trade_db(
                 bot_name=bot_name, symbol=sym,
                 buy_price=entry, sell_price=curr,
@@ -2796,6 +2861,7 @@ def _direct_close_remaining_futures(
                 leverage=lev,
                 liquidation_price=p["liquidation_price"],
                 funding_paid=funding_for_close,
+                funding_evidence=funding_evidence,
                 fees_usdt=entry_fee + exit_fee,
                 exchange_order_id=exchange_order_id,
                 entry_id=p.get("entry_id"),
@@ -2818,6 +2884,8 @@ def _direct_close_remaining_futures(
                     "accounting_pending_profit_usdt": pnl_usdt,
                     "accounting_pending_fees_usdt": entry_fee + exit_fee,
                     "accounting_pending_funding_paid": funding_for_close,
+                    "accounting_pending_funding_evidence": funding_evidence,
+                    "accounting_pending_mode_is_sim": sim_only,
                     "accounting_pending_exchange_order_id": exchange_order_id,
                 })
                 failed_position_updates[sym] = retry_state

@@ -281,6 +281,9 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         fee_rate: float,
         notional_usdt: float,
         arrival_unavailable_reason: str | None = None,
+        filled_at: str | None = None,
+        fill_time_ms: float | None = None,
+        feature_capsule: dict | None = None,
     ) -> dict[str, Any]:
         """Build the bounded SIM-evidence WAL committed with position state."""
         from core.logger import _date as _utc_now_str
@@ -295,8 +298,13 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             "fill_price": float(fill_price),
             "fee_rate": float(fee_rate),
             "notional_usdt": float(notional_usdt),
-            "filled_at": _utc_now_str(),
+            "filled_at": filled_at if filled_at is not None else _utc_now_str(),
         }
+        if fill_time_ms is not None:
+            if (type(fill_time_ms) not in (int, float)
+                    or not math.isfinite(fill_time_ms) or fill_time_ms <= 0):
+                raise ValueError("SIM fill time must be finite and positive")
+            pending["fill_time_ms"] = fill_time_ms
         if arrival_unavailable_reason is not None:
             allowed_reasons = {
                 "capture_contract_size_unavailable",
@@ -305,6 +313,11 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
             if arrival_unavailable_reason not in allowed_reasons:
                 raise ValueError("SIM TCA arrival-unavailable reason is invalid")
             pending["arrival_unavailable_reason"] = arrival_unavailable_reason
+        if feature_capsule is not None:
+            from trading.candidate_feature_evidence import feature_capsule_for_pending
+            decoded = feature_capsule_for_pending({**pending, "feature_capsule_v1": feature_capsule})
+            if decoded is not None:
+                pending["feature_capsule_v1"] = decoded
         return pending
 
     def _finalize_simulated_entry_tca(
@@ -314,6 +327,7 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
         *,
         restart_recovery: bool = False,
         arrival_book: dict | None = None,
+        arrival_received_at_ms: float | None = None,
     ) -> bool:
         """Persist post-state SIM evidence; retain WAL until it is durable."""
         context = f"{self.BOT_NAME} {base} SIM TCA durable finalize"
@@ -367,6 +381,8 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                 from trading.candidate_microstructure import (
                     capture_simulated_entry_tca,
                 )
+                from trading.candidate_feature_evidence import feature_capsule_for_pending
+                feature_capsule = feature_capsule_for_pending(pending)
 
                 capture_simulated_entry_tca(
                     exchange=self.ex,
@@ -382,6 +398,11 @@ class FuturesBot(FuturesExitsMixin, FuturesScanMixin,
                     filled_at=pending["filled_at"],
                     depth_levels=int(self.C("TCA_DEPTH_LEVELS", 20)),
                     arrival_book=arrival_book,
+                    **({"arrival_received_at_ms": arrival_received_at_ms}
+                       if arrival_received_at_ms is not None else {}),
+                    **({"fill_time_ms": pending["fill_time_ms"]}
+                       if "fill_time_ms" in pending else {}),
+                    **({"feature_capsule": feature_capsule} if feature_capsule is not None else {}),
                 )
 
             if not has_durable_simulated_entry_tca(

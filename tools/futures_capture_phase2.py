@@ -31,12 +31,13 @@ from tools.futures_capture_replay import _json_safe
 from tools.simulation_workspace import ReproducibleRun, canonical_evidence_sha256
 from core.constants import SIM_CAPTURE_CONTRACT_SCHEMA
 from trading.capture_replay_validation import (
+    _time_number,
     analyze_independent_positions,
     build_temporal_replay_splits,
     calibrated_cost_profiles,
     collect_sim_cost_evidence,
+    require_cost_calibration_scope,
     load_cost_evidence,
-    validate_cost_evidence,
 )
 from trading.futures_capture_replay import (
     build_capture_replay_index,
@@ -95,6 +96,9 @@ _PHASE2_CODE_FILES = (
     "bots/main_bot_futures.py",
     "bot_utils/config.py",
     "trading/capture_replay_validation.py",
+    "trading/sim_evidence_availability.py",
+    "trading/execution_cost_model.py",
+    "sqlite_safety.py",
     "trading/cooldown_utils.py",
     "trading/futures_capture_replay.py",
     "trading/historical_futures_evidence.py",
@@ -108,6 +112,8 @@ _PHASE2_CODE_FILES = (
     "bot_utils/futures_funding.py",
     "bot_utils/futures_math.py",
     "core/constants.py",
+    "trading/profit_research_runner.py",
+    "trading/experiment_registry_contract.py",
 )
 _GIB = 1024**3
 _MIN_WORKER_RSS_BYTES = 512 * 1024**2
@@ -812,11 +818,60 @@ def _summary(
     }
 
 
+def _validation_position_identity(position_id, task: dict, period: dict):
+    if isinstance(position_id, bool) or not isinstance(position_id, (int, str)):
+        raise ValueError("phase-2 position identity is invalid")
+    if isinstance(position_id, str):
+        if not position_id.strip():
+            raise ValueError("phase-2 position identity is invalid")
+        return position_id
+    if position_id <= 0:
+        raise ValueError("phase-2 local simulation position identity is invalid")
+    # simulate_fast restarts its positive integer counter for every fold.
+    # Global string campaign IDs retain their original cross-period identity.
+    return "simulation:" + canonical_evidence_sha256({
+        "identity_type": "positive_local_simulation_integer",
+        "scope": task.get("scope"), "fold_index": task.get("fold_index"),
+        "period_start": _time_number(period.get("start")),
+        "period_end": _time_number(period.get("end")),
+        "local_position_id": position_id,
+    })
+
+
 def build_validation_fragment_inputs(
     records: list[dict], cost_evidence: dict
 ) -> dict:
     """Reconstruct validation producer inputs from raw Phase-2 evidence."""
-    evidence_body = validate_cost_evidence(cost_evidence)
+    evidence_body = require_cost_calibration_scope(
+        cost_evidence, bot_name="FUTURES", venue="mexc", market_type="swap"
+    )
+    training_anchors = {}
+    for record in records:
+        if not isinstance(record, dict) or not isinstance(record.get("task"), dict):
+            raise ValueError("phase-2 validation record is incomplete")
+        task = record["task"]
+        if task.get("scope") != "initial_train":
+            continue
+        profile = task.get("cost_profile")
+        period = record.get("period")
+        if profile not in {"normal", "stressed"} or profile in training_anchors or not isinstance(period, dict):
+            raise ValueError("initial training time anchors are inconsistent")
+        try:
+            bounds = (_time_number(period.get("start")), _time_number(period.get("end")))
+        except ValueError as exc:
+            raise ValueError("initial training time anchor is unavailable") from exc
+        if bounds[0] >= bounds[1]:
+            raise ValueError("initial training time anchors are inconsistent")
+        training_anchors[profile] = bounds
+    if (
+        set(training_anchors) != {"normal", "stressed"}
+        or training_anchors["normal"] != training_anchors["stressed"]
+    ):
+        raise ValueError("initial training time anchors are unavailable or inconsistent")
+    require_cost_calibration_scope(
+        cost_evidence, bot_name="FUTURES", venue="mexc", market_type="swap",
+        not_after=training_anchors["normal"][1],
+    )
     costs = evidence_body.get("costs")
     markouts = evidence_body.get("markouts")
     if not isinstance(costs, dict) or not isinstance(markouts, dict):
@@ -879,6 +934,9 @@ def build_validation_fragment_inputs(
         positions = record.get("positions")
         if not all(isinstance(value, dict) for value in (task, period, stats, positions)):
             raise ValueError("phase-2 validation record is incomplete")
+        if task.get("scope") == "initial_train":
+            # Training metrics are not out-of-sample promotion evidence.
+            continue
         raw_positions = positions.get("positions")
         if positions.get("evidence_valid") is not True or not isinstance(raw_positions, list):
             raise ValueError("phase-2 independent positions are unavailable")
@@ -934,7 +992,9 @@ def build_validation_fragment_inputs(
             "initial_capital": initial_capital,
             "positions": [
                 {
-                    "position_id": row.get("position_id"),
+                    "position_id": _validation_position_identity(
+                        row.get("position_id"), task, period
+                    ),
                     "symbol": row.get("symbol"),
                     "regime": row.get("regime"),
                     "exit_time": row.get("exit_time"),
@@ -964,7 +1024,11 @@ def run_phase2(
     walk_forward_steps: int = 4,
     embargo_bars: int = 24,
     config_evidence: dict | None = None,
+    registry_root: Path | None = None,
+    trial_id: str | None = None,
 ) -> dict:
+    from tools.simulation_workspace import register_planned_trial, validate_trial_registry_options
+    validate_trial_registry_options(registry_root, trial_id)
     normalized_config = _validated_config(config)
     if config_evidence is None:
         config_evidence = {
@@ -984,21 +1048,35 @@ def run_phase2(
         walk_forward_steps=walk_forward_steps,
         embargo_bars=embargo_bars,
     )
+    require_cost_calibration_scope(
+        cost_evidence, bot_name="FUTURES", venue="mexc", market_type="swap",
+        not_after=splits.initial_train[-1],
+    )
     default_cost = calc_round_trip(False, "FUTURES") * 10_000.0
     profiles = calibrated_cost_profiles(
         cost_evidence,
         default_round_trip_bps=default_cost,
     )
+    tasks = _tasks(splits, profiles)
+    run_config = {
+        "method": "mexc_futures_capture_phase2_v1",
+        "strategy_config": normalized_config,
+        "config_evidence": config_evidence,
+        "cost_profiles": profiles,
+        "cost_evidence_sha256": cost_evidence["evidence_sha256"],
+    }
+    if registry_root is not None:
+        registry_root = _absolute_without_links(registry_root, label="explicit phase-2 registry")
+        identities = [trial_id + ":baseline", *(
+            trial_id + ":task-" + str(task["candidate_index"]) for task in tasks)]
+        for identity in identities:
+            validate_trial_registry_options(registry_root, identity)
+        run_config["trial_registration"] = {"protocol": "immutable_original_planned_v1",
+            "registry_root": str(registry_root), "family_id": trial_id}
     run = ReproducibleRun(
         workspace,
         dataset_path,
-        run_config={
-            "method": "mexc_futures_capture_phase2_v1",
-            "strategy_config": normalized_config,
-            "config_evidence": config_evidence,
-            "cost_profiles": profiles,
-            "cost_evidence_sha256": cost_evidence["evidence_sha256"],
-        },
+        run_config=run_config,
         splits=splits.specification,
         seed=seed,
         workers=workers,
@@ -1007,6 +1085,30 @@ def run_phase2(
         resume=resume,
         dataset_verifier=verify_replay_dataset,
     )
+    if dataset_report["dataset_fingerprint"] != run.spec["dataset_fingerprint"]:
+        raise ValueError("loaded phase-2 dataset fingerprint changed before evaluation")
+    trial_receipts = []
+    if registry_root is not None:
+        sources = {row["path"]: {"sha256": row["sha256"], "bytes": row["bytes"]}
+                   for row in run.spec["code"]}
+        if run.spec["dependency_lock"] is not None:
+            sources["requirements.lock.txt"] = run.spec["dependency_lock"]
+        plans = [(trial_id + ":baseline", {"strategy_config": normalized_config, "evaluation": "full_baseline"},
+                  (run.root / "baseline.json").exists())]
+        plans.extend((trial_id + ":task-" + str(task["candidate_index"]),
+                      _task_params(task, normalized_config),
+                      run._checkpoint_path(task["candidate_index"]).exists()) for task in tasks)
+        for identity, _controls, _finished in plans:
+            validate_trial_registry_options(registry_root, identity)
+        for identity, controls, finished in plans:
+            trial_receipts.append(register_planned_trial(registry_root, identity,
+                experiment_name="futures_capture_phase2", sources=sources,
+                dataset={"dataset_fingerprint": dataset_report["dataset_fingerprint"], "run_id": run.run_id},
+                controls=_json_safe(controls), baseline={"strategy_config": normalized_config},
+                split_policy={"specification": _json_safe(splits.specification),
+                              "cost_calibration_as_of": str(splits.initial_train[-1]),
+                              "independent_holdout_verified": False},
+                existing="required" if finished else "resume" if resume else "veto"))
     baseline = run.baseline(normalized_config)
     if baseline is None:
         baseline_stats = _normalized_phase2_stats(simulate_fast(
@@ -1028,7 +1130,6 @@ def run_phase2(
             baseline["result"], indexed, tuple(all_times)
         )
 
-    tasks = _tasks(splits, profiles)
     records: dict[int, dict] = {}
     pending = []
     for task in tasks:
@@ -1082,7 +1183,7 @@ def run_phase2(
         )
     except (KeyError, TypeError, ValueError, OverflowError) as exc:
         validation_fragment_error = f"{type(exc).__name__}: {str(exc)[:160]}"
-    return _json_safe({
+    report = {
         "method": "mexc_futures_capture_phase2_v1",
         "strategy": "FUTURES",
         "run_id": run.run_id,
@@ -1107,7 +1208,13 @@ def run_phase2(
         ),
         "research_only": True,
         "changes_runtime": False,
-    })
+    }
+    if trial_receipts:
+        run._revalidate_sources()
+        if verify_replay_dataset(dataset_path)["dataset_fingerprint"] != run.spec["dataset_fingerprint"]:
+            raise ValueError("registered phase-2 dataset changed during evaluation")
+        report["trial_registration"] = trial_receipts
+    return _json_safe(report)
 
 
 def _sync_phase2_output_directory(path: Path) -> None:
@@ -1365,6 +1472,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     evidence.add_argument("--runtime-root", type=Path, required=True)
     evidence.add_argument("--json-output", type=Path, required=True)
+    evidence.add_argument("--bot", choices=("SPOT", "TREND", "FUTURES", "FUTREND", "CROSS"))
+    evidence.add_argument("--venue")
+    evidence.add_argument("--market-type", choices=("spot", "swap"))
+    evidence.add_argument("--calibration-as-of", help="explicit UTC cutoff, e.g. 2026-08-13T00:00:00Z")
 
     run_parser = sub.add_parser(
         "run", help="run or resume immutable phase-2 replay validation"
@@ -1381,9 +1492,14 @@ def main(argv: list[str] | None = None) -> int:
     run_parser.add_argument("--walk-forward-steps", type=_positive_int, default=4)
     run_parser.add_argument("--embargo-bars", type=_positive_int, default=24)
     run_parser.add_argument("--resume", action="store_true")
+    from tools.simulation_workspace import add_trial_registry_arguments, validate_trial_registry_options
+    add_trial_registry_arguments(run_parser)
     args = parser.parse_args(argv)
     if args.command == "cost-evidence":
-        payload = collect_sim_cost_evidence(args.runtime_root)
+        payload = collect_sim_cost_evidence(
+            args.runtime_root, bot_name=args.bot, venue=args.venue,
+            market_type=args.market_type, calibration_as_of=args.calibration_as_of,
+        )
         output = args.json_output.expanduser().absolute()
         _atomic_json(output, payload)
         print(json.dumps({
@@ -1394,6 +1510,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if not 1 <= args.workers <= 32:
         parser.error("--workers must be between 1 and 32")
+    validate_trial_registry_options(args.registry_root, args.trial_id)
     if args.walk_forward_steps < 2 or args.walk_forward_steps > 12:
         parser.error("--walk-forward-steps must be between 2 and 12")
     if args.runtime_config is not None:
@@ -1415,6 +1532,7 @@ def main(argv: list[str] | None = None) -> int:
         walk_forward_steps=args.walk_forward_steps,
         embargo_bars=args.embargo_bars,
         config_evidence=config_evidence,
+        registry_root=args.registry_root, trial_id=args.trial_id,
     )
     output = args.json_output.expanduser().absolute()
     _atomic_json(output, report)

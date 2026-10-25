@@ -551,6 +551,36 @@ def claim_recovery_metadata(
         entry_id = _safe_entry_id(extra.get("entry_id"))
         if entry_id is not None:
             metadata["entry_id"] = entry_id
+        funding_wal_valid = True
+        for key in ("funding_close_time", "funding_partial_close_time"):
+            if key not in extra:
+                continue
+            value = extra[key]
+            valid = value is None or _canonical_trade_timestamp(value) is not None
+            funding_wal_valid = funding_wal_valid and valid
+            if valid:
+                metadata[key] = value
+        if "accounting_pending_funding_evidence" in extra:
+            value = extra["accounting_pending_funding_evidence"]
+            try:
+                if value is not None:
+                    from trading.funding_evidence import serialize_funding_evidence
+
+                    serialize_funding_evidence(
+                        value, bot_name=row.get("bot_name"),
+                        mode_is_sim=extra.get("accounting_pending_mode_is_sim"),
+                        symbol=symbol, entry_id=entry_id, buy_time=row.get("buy_time"),
+                        sell_time=extra.get("accounting_pending_sell_time"),
+                        is_futures=True, is_partial=False,
+                        exchange_order_id=extra.get("accounting_pending_exchange_order_id"),
+                        funding_paid=extra.get("accounting_pending_funding_paid"),
+                    )
+                metadata["accounting_pending_funding_evidence"] = copy.deepcopy(value)
+            except (TypeError, ValueError, OverflowError, RecursionError):
+                funding_wal_valid = False
+        if not funding_wal_valid:
+            recovered[symbol] = {"claim_recovery_invalid": True}
+            continue
         basis_keys = (
             "entry_price_unverified", "entry_basis_pending_closes", "entry_basis_remaining_amount",
             "spot_entry_client_order_id", "spot_entry_order_id", "spot_entry_observed_amount",
