@@ -533,31 +533,9 @@ class ScanMixin:
         return True
 
     def _assess_spot_entry_signal(self, r, regime: dict):
-        rsi_values = self._rsi_triplet(r)
-        if rsi_values is None:
-            return "LOW"
-        rsi_15, rsi_h, rsi_4 = rsi_values
-        tf_score = sum(1 for v in (rsi_15, rsi_h, rsi_4) if 50 <= v <= 75)
-        indicators = (
-            self._finite_float(r.get("vol_surge", 1.0)),
-            self._finite_float(r.get("macd_hist", 0.0)),
-            self._finite_float(r.get("body_ratio", 1.0)),
-            self._finite_float(r.get("change_percent", 0.0)),
-        )
-        if any(value is None for value in indicators):
-            return "LOW"
-        vol_surge, macd_hist, body_ratio, change_percent = indicators
-        vol_ok = vol_surge >= 1.15
-        macd_ok = macd_hist >= 0.0
-        body_ok = body_ratio >= 0.35
-        pump_ok = change_percent > 0.0
+        from trading.mechanical_entry_signal import assess_spot_entry_signal
 
-        score = tf_score + int(vol_ok) + int(macd_ok) + int(body_ok) + int(pump_ok)
-        if tf_score >= 2 and score >= 5:
-            return "HIGH"
-        if tf_score >= 2 and score >= 4:
-            return "MEDIUM"
-        return "LOW"
+        return assess_spot_entry_signal(r)
 
     #  Scan-thread body
 

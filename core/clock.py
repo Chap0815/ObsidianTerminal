@@ -27,6 +27,137 @@ _have_offset: bool = False
 _offset_set_monotonic: float | None = None
 _anchor_epoch_ms: float | None = None
 _anchor_monotonic: float | None = None
+
+# Independent research-availability authority. Offset publication and signing
+# neither create nor clear this measured monotonic upper bound.
+_availability_upper_epoch_ms: float | None = None
+_availability_lower_epoch_ms: float | None = None
+_availability_upper_monotonic: float | None = None
+_availability_last_monotonic: float | None = None
+
+
+def _clear_availability_bound_locked() -> None:
+    global _availability_upper_epoch_ms, _availability_upper_monotonic
+    global _availability_last_monotonic, _availability_lower_epoch_ms
+    _availability_upper_epoch_ms = None
+    _availability_lower_epoch_ms = None
+    _availability_upper_monotonic = None
+    _availability_last_monotonic = None
+
+
+def _availability_bound_at_locked(monotonic: float) -> tuple[float | None, bool]:
+    global _availability_last_monotonic
+    if (not math.isfinite(monotonic)
+            or (_availability_last_monotonic is not None
+                and monotonic < _availability_last_monotonic)):
+        _clear_availability_bound_locked()
+        return None, False
+    if _availability_upper_epoch_ms is None or _availability_upper_monotonic is None:
+        return None, True
+    elapsed = monotonic - _availability_upper_monotonic
+    value = _availability_upper_epoch_ms + elapsed * 1000.0
+    if elapsed < 0 or not math.isfinite(value):
+        _clear_availability_bound_locked()
+        return None, False
+    _availability_last_monotonic = monotonic
+    return value, True
+
+
+def publish_availability_upper_bound(server_ms, request_started_monotonic,
+                                     received_monotonic) -> bool:
+    """Bound receipt UTC by raw server time plus measured full RTT and 1ms.
+
+    The sample may have been taken anywhere during the existing request.
+    Publication delay advances monotonically; no request or offset is changed.
+    """
+    global _availability_upper_epoch_ms, _availability_upper_monotonic
+    global _availability_last_monotonic, _availability_lower_epoch_ms
+    with _lock:
+        try:
+            observed = float(time.monotonic())
+        except Exception:
+            _clear_availability_bound_locked()
+            return False
+        previous, continuous = _availability_bound_at_locked(observed)
+        if not continuous:
+            return False
+        previous_lower = None
+        if (_availability_lower_epoch_ms is not None
+                and _availability_upper_monotonic is not None):
+            previous_lower = (_availability_lower_epoch_ms
+                              + (observed - _availability_upper_monotonic) * 1000.0)
+        values = (server_ms, request_started_monotonic, received_monotonic)
+        try:
+            valid = all(type(value) in (int, float) and math.isfinite(value) for value in values)
+        except (OverflowError, TypeError, ValueError):
+            valid = False
+        if not valid:
+            return False
+        if received_monotonic < request_started_monotonic or observed < received_monotonic:
+            _clear_availability_bound_locked()
+            return False
+        upper = server_ms + (received_monotonic - request_started_monotonic) * 1000.0 + 1.0
+        upper += (observed - received_monotonic) * 1000.0
+        # The server sample precedes receipt. Unlike the upper bound, its
+        # conservative lower bound must never add the request RTT.
+        lower = server_ms - 1.0 + (observed - received_monotonic) * 1000.0
+        try:
+            if (server_ms <= 0 or not math.isfinite(upper) or not math.isfinite(lower)
+                    or (previous_lower is not None and not math.isfinite(previous_lower))):
+                return False
+            datetime.fromtimestamp(server_ms / 1000.0, tz=timezone.utc)
+            datetime.fromtimestamp(upper / 1000.0, tz=timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return False
+        _availability_upper_epoch_ms = math.ceil(max(upper, previous) if previous is not None else upper)
+        _availability_lower_epoch_ms = math.floor(max(lower, previous_lower)
+                                                 if previous_lower is not None else lower)
+        _availability_upper_monotonic = observed
+        _availability_last_monotonic = observed
+        return True
+
+
+def availability_upper_bound_ms() -> int | None:
+    """Availability UTC or unknown until an independently measured sample.
+
+    Rollback discards the old authority permanently; the counter catching up
+    cannot revive it. A fresh measured request is needed after invalidation.
+    """
+    with _lock:
+        try:
+            observed = float(time.monotonic())
+        except Exception:
+            _clear_availability_bound_locked()
+            return None
+        value, _continuous = _availability_bound_at_locked(observed)
+        return math.ceil(value) if value is not None else None
+
+
+def availability_time_interval_ms() -> tuple[int, int] | None:
+    """Conservative exchange UTC interval for a predecision causal witness.
+
+    A lower bound may limit a historical fitting cutoff; the upper bound may
+    attest data availability. Neither is a replacement for the trading clock.
+    Both originate in the same measured request and share rollback invalidation.
+    """
+    with _lock:
+        try:
+            observed = float(time.monotonic())
+        except Exception:
+            _clear_availability_bound_locked()
+            return None
+        upper, _continuous = _availability_bound_at_locked(observed)
+        if (upper is None or _availability_lower_epoch_ms is None
+                or _availability_upper_monotonic is None):
+            return None
+        lower = (_availability_lower_epoch_ms
+                 + (observed - _availability_upper_monotonic) * 1000.0)
+        if not math.isfinite(lower) or lower > upper:
+            _clear_availability_bound_locked()
+            return None
+        return math.floor(lower), math.ceil(upper)
+
+
 def set_exchange_offset_ms(offset_ms: float) -> None:
     """Publish the localexchange offset (exchange  local, in ms).
 

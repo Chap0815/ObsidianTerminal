@@ -3508,6 +3508,7 @@ class FuturesExitsMixin:
                 symbol_full,
                 d.get("buy_time"),
                 notional_usdt=(margin * lev if margin > 0 and lev > 0 else None),
+                _expected_position_type=pos_type,
             )
             if exact_funding is None:
                 log_event(
@@ -3999,6 +4000,12 @@ class FuturesExitsMixin:
                         "WARN",
                     )
                     return False
+                from bot_utils.futures_funding import freeze_funding_close_time
+                partial_sell_time = freeze_funding_close_time(
+                    self.state, sym, d, _utc_now_str(), is_partial=True,
+                )
+                if partial_sell_time is None:
+                    return False
                 if d.get("entry_funding_window_unverified") is True:
                     exact_funding = fetch_realized_funding(
                         self.ex,
@@ -4007,6 +4014,8 @@ class FuturesExitsMixin:
                         notional_usdt=(
                             margin * lev if margin > 0 and lev > 0 else None
                         ),
+                        until_time_str=partial_sell_time,
+                        _expected_position_type=pos_type,
                     )
                     exact_funding = FuturesExitsMixin._safe_finite_float(
                         exact_funding,
@@ -4037,6 +4046,14 @@ class FuturesExitsMixin:
                 log_event(f"Partial-TP {sym} failed: {e}", "WARN")
                 return False
 
+        if self.simulation:
+            from bot_utils.futures_funding import freeze_funding_close_time
+            partial_sell_time = freeze_funding_close_time(
+                self.state, sym, d, _utc_now_str(), is_partial=True,
+            )
+            if partial_sell_time is None:
+                return False
+
         if not self.simulation and d.get("entry_price_unverified") is True:
             # A physical SELL is allowed, but never finalize an estimated BUY.
             # This terminal receipt and residual quantity share one durable CAS.
@@ -4049,7 +4066,7 @@ class FuturesExitsMixin:
             fragment = {
                 "client_order_id": client_order_id, "order_id": exch_oid,
                 "filled": partial_amount, "price": fill_price, "fee": partial_fee,
-                "sell_time": _utc_now_str(), "reason": "Partial Take-Profit",
+                "sell_time": partial_sell_time, "reason": "Partial Take-Profit",
                 "funding_total": d.get("funding_paid", 0.0),
                 "funding_window_unverified": d.get("entry_funding_window_unverified") is True,
             }
@@ -4083,14 +4100,24 @@ class FuturesExitsMixin:
             initial_entry_fee, partial_amount, original_amount,
             partial_sold=False
         )
-        funding_partial = safe_funding_scale(
-            float(d.get("funding_paid", 0.0)), partial_amount,
-            original_amount, partial_sold=False
-        )
+        funding_evidence = None
+        if self.simulation:
+            from bot_utils.futures_funding import sim_fragment_funding
+            funding_partial, funding_evidence = sim_fragment_funding(
+                self.ex, bot_name=self.BOT_NAME, symbol=sym, row=d,
+                sell_time=partial_sell_time, closed_amount=partial_amount,
+                contract_size=contract_size, is_partial=True,
+                exchange_order_id=exch_oid,
+            )
+        else:
+            funding_partial = safe_funding_scale(
+                float(d.get("funding_paid", 0.0)), partial_amount,
+                original_amount, partial_sold=False,
+            )
         profit_partial = round(pnl_partial - prop_entry_fee - partial_fee - funding_partial, 2)
 
         # DB row
-        sell_time = _utc_now_str()
+        sell_time = partial_sell_time
         partial_trade = dict(
             bot_name=self.BOT_NAME,
             mode_is_sim=self.simulation,
@@ -4108,6 +4135,7 @@ class FuturesExitsMixin:
             is_futures=True, position_type=pos_type, leverage=lev,
             liquidation_price=liq_price,
             funding_paid=funding_partial,
+            funding_evidence=funding_evidence,
             is_partial=True,
             fees_usdt=prop_entry_fee + partial_fee,
             exchange_order_id=exch_oid,
@@ -4142,6 +4170,7 @@ class FuturesExitsMixin:
             "partial_profit_realized": prev_realized + profit_partial,
             "funding_booked_on_partials": prev_funding_booked + funding_partial,
             "funding_booked_on_partials_known": True,
+            "funding_partial_close_time": None,
             _PARTIAL_EXIT_CLIENT_ID: None,
             _PARTIAL_EXIT_AMOUNT: None,
             _PARTIAL_EXIT_SIDE: None,
@@ -4564,6 +4593,12 @@ class FuturesExitsMixin:
             _defer_verified_flat_close(self, sym, d, reason, log_event)
             return
 
+        from bot_utils.futures_funding import freeze_funding_close_time
+        sell_time = freeze_funding_close_time(self.state, sym, d, _utc_now_str())
+        if sell_time is None:
+            log_event(f"{sym}: close funding cutoff is not durable; accounting deferred", "ERROR")
+            return
+
         # PnL with real fill + funding + proportional entry fee
         move_pct_real = price_move_pct(entry, fill_price, pos_type) if entry > 0 else move_pct
         peak_decision_at = FuturesExitsMixin._safe_positive_float(
@@ -4609,6 +4644,8 @@ class FuturesExitsMixin:
         funding_pd = FuturesExitsMixin._safe_finite_float(
             d.get("funding_paid"), 0.0)
         funding_resolution_pending = False
+        funding_evidence = None
+        funding_resolution = {}
         funding_booked = FuturesExitsMixin._safe_finite_float(
             d.get("funding_booked_on_partials"), 0.0)
         # Scale by ACTUAL remaining ratio via the safe helper so a corrupted
@@ -4636,6 +4673,9 @@ class FuturesExitsMixin:
                         symbol_full,
                         d.get("buy_time"),
                         notional_usdt=notional,
+                        until_time_str=sell_time,
+                        _history_evidence=funding_resolution,
+                        _expected_position_type=pos_type,
                     )
                 else:
                     realized = fetch_or_estimate_funding(
@@ -4646,6 +4686,8 @@ class FuturesExitsMixin:
                                 d.get("funding_paid"), 0.0
                             )
                         ),
+                        until_time_str=sell_time,
+                        _resolution_evidence=funding_resolution,
                     )
                 realized = FuturesExitsMixin._safe_finite_float(realized, None)
                 funding_resolution_pending = realized is None
@@ -4653,7 +4695,12 @@ class FuturesExitsMixin:
                     funding_history_resolved = realized is not None
                 if realized is not None:
                     # Safe helper for the realized-funding scaling too
-                    if partial_sold and original_amount > 0:
+                    if funding_resolution.get("source") == "private_account_payments":
+                        from bot_utils.futures_funding import allocate_private_funding_remaining
+                        realized = allocate_private_funding_remaining(realized, d)
+                        if realized is None:
+                            funding_resolution_pending = True
+                    elif partial_sold and original_amount > 0:
                         realized = safe_remaining_funding(
                             realized, current_amount, original_amount,
                             partial_sold=True,
@@ -4663,9 +4710,24 @@ class FuturesExitsMixin:
                                 is True
                             ),
                         )
-                    funding_pd = realized
+                    if realized is not None:
+                        funding_pd = realized
             except Exception:
                 funding_resolution_pending = True
+            from bot_utils.futures_funding import live_close_funding_evidence
+            funding_evidence = live_close_funding_evidence(
+                bot_name=self.BOT_NAME, symbol=sym, row=d, sell_time=sell_time,
+                closed_amount=current_amount, contract_size=contract_size,
+                booked_cost=funding_pd, resolution=funding_resolution,
+                exchange_order_id=exch_oid,
+            )
+        else:
+            from bot_utils.futures_funding import sim_fragment_funding
+            funding_pd, funding_evidence = sim_fragment_funding(
+                self.ex, bot_name=self.BOT_NAME, symbol=sym, row=d,
+                sell_time=sell_time, closed_amount=current_amount,
+                contract_size=contract_size, exchange_order_id=exch_oid,
+            )
 
         slice_fees = proportional_entry_fee + close_fee
         profit_usdt = round(pnl_real - slice_fees - funding_pd, 2)
@@ -4676,7 +4738,6 @@ class FuturesExitsMixin:
         # Persist the exact replay key before accounting. Once a live close is
         # verified flat, local state is the last recoverable source for PnL.
         buy_time = d.get("buy_time", "")
-        sell_time = _utc_now_str()
         trade_row = {
             "bot_name": self.BOT_NAME,
             "mode_is_sim": self.simulation,
@@ -4700,6 +4761,7 @@ class FuturesExitsMixin:
             "leverage": lev,
             "liquidation_price": liq_price,
             "funding_paid": funding_pd,
+            "funding_evidence": funding_evidence,
             "fees_usdt": slice_fees,
             "exchange_order_id": exch_oid,
             "mfe_pct": mfe_pct,
@@ -4720,6 +4782,7 @@ class FuturesExitsMixin:
             "accounting_pending_mode_is_sim": self.simulation,
             "accounting_pending_fees_usdt": slice_fees,
             "accounting_pending_funding_paid": funding_pd,
+            "accounting_pending_funding_evidence": funding_evidence,
             "accounting_pending_exchange_order_id": exch_oid,
             "accounting_pending_mfe_pct": mfe_pct,
             "accounting_pending_mae_pct": mae_pct,

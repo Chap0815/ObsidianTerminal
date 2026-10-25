@@ -644,7 +644,15 @@ def _publish_clock_offset(ex) -> None:
         if not reservation:
             return
         try:
+            try:
+                request_started_monotonic = time.monotonic()
+            except Exception:
+                request_started_monotonic = None
             server_time = ex.fetch_time()
+            try:
+                received_monotonic = time.monotonic()
+            except Exception:
+                received_monotonic = None
             server_ms = _finite_exchange_epoch_ms(server_time)
             if server_ms is None:
                 raise ValueError(
@@ -660,6 +668,11 @@ def _publish_clock_offset(ex) -> None:
     try:
         offset_ms = server_ms - time.time() * 1000.0
         _publish_clock_offset_ms(offset_ms)
+        try:
+            from core.clock import publish_availability_upper_bound
+            publish_availability_upper_bound(server_ms, request_started_monotonic, received_monotonic)
+        except Exception as bound_exc:
+            _silent("publish_availability_upper_bound", bound_exc)
     except Exception as e:
         _silent("publish_clock_offset", e)
 

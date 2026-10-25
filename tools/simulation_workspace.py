@@ -45,6 +45,107 @@ _HISTORY_COLUMNS = (
 )
 
 
+def add_trial_registry_arguments(parser) -> None:
+    """Opt in to the existing journal registry; never select a runtime default."""
+    parser.add_argument("--registry-root", type=Path,
+                        help="explicit existing offline project with an experiment registry")
+    parser.add_argument("--trial-id", help="unique immutable planned evaluation id")
+
+
+def validate_trial_registry_options(registry_root, trial_id) -> None:
+    if (registry_root is None) != (trial_id is None):
+        raise ValueError("registry-root and trial-id must be supplied together")
+    if trial_id is not None and (
+            type(trial_id) is not str or not 1 <= len(trial_id) <= 128
+            or trial_id != trial_id.strip()
+            or any(not (char.isascii() and (char.isalnum() or char in "._:-"))
+                   for char in trial_id)):
+        raise ValueError("trial-id must be a bounded canonical evaluation identity")
+
+
+def register_planned_trial(
+    registry_root, trial_id, *, experiment_name, sources, dataset,
+    controls, baseline, split_policy, existing="veto",
+):
+    """Commit an immutable plan before evaluation, without a holdout/PIT grant.
+
+    Callers freeze sources/data before this call and recheck them before
+    publishing. Failed evaluations remain PLANNED; reading a report never
+    registers a new trial. Duplicate ids deliberately use the existing veto.
+    """
+    validate_trial_registry_options(registry_root, trial_id)
+    if type(existing) is not str or existing not in {"veto", "resume", "required"}:
+        raise ValueError("unsupported planned evaluation reuse policy")
+    if registry_root is None:
+        return None
+    from trading.experiment_registry_contract import encode_experiment_params, normalize_experiment_metadata
+    from trading.profit_research_runner import register_experiment_trial
+    _identity, experiment_name, _status = normalize_experiment_metadata(trial_id, experiment_name, "PLANNED")
+
+    fields = {"sources": sources, "dataset": dataset, "controls": controls,
+              "baseline": baseline, "split_policy": split_policy}
+    if any(type(value) is not dict or not value for value in fields.values()):
+        raise ValueError("planned evaluation requires explicit sources, dataset, controls, baseline and split policy")
+    if not 1 <= len(sources) <= RUN_FINGERPRINT_MAX_FILES:
+        raise ValueError("planned evaluation source count exceeds its budget")
+    for name, value in sources.items():
+        digest = value.get("sha256") if type(value) is dict else value
+        if (type(name) is not str or not 1 <= len(name) <= 256
+                or type(digest) is not str or len(digest) != 64
+                or any(char not in "0123456789abcdef" for char in digest)):
+            raise ValueError("planned evaluation source identity is invalid")
+    plan = {"schema_version": 1, "kind": "planned_research_evaluation", **fields,
+            "registration_basis": "original_commit_before_this_evaluator_call",
+            "historical_preregistration_verified": False,
+            "independent_trial_count_verified": False}
+    encoded = encode_experiment_params(plan)
+    if len(encoded.encode("utf-8")) > 128 * 1024:
+        raise ValueError("planned evaluation exceeds its byte budget")
+    # Freeze mutable caller dictionaries before handing the plan to the writer.
+    frozen = json.loads(encoded)
+    receipt = None
+    if existing != "veto":
+        # Only callers whose immutable run manifest already binds this exact
+        # registry plan may resume. Completed checkpoints require an existing
+        # receipt; registering a historical result now would be a false claim.
+        import sqlite3
+        from sqlite_safety import harden_sqlite_connection
+        from trading.capture_replay_validation import _finish_read_transaction
+        project = _absolute_without_links(registry_root, label="explicit trial registry")
+        path = _absolute_without_links(project / "data/trading_bot.db", label="trial registry database")
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        conn = harden_sqlite_connection(sqlite3.connect(
+            path.as_uri() + "?mode=ro", uri=True, timeout=1))
+        primary = None
+        try:
+            conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 256 * 1024)
+            row = conn.execute("""SELECT experiment_name,status,
+                CASE WHEN length(CAST(params_json AS BLOB))<=131072 THEN params_json END
+                FROM experiment_registry WHERE trial_id=?""", (trial_id,)).fetchone()
+            if row is not None:
+                if row != (experiment_name, "PLANNED", encoded):
+                    raise ValueError("existing planned evaluation does not match immutable inputs")
+                receipt = {"trial_id": trial_id, "experiment_name": experiment_name,
+                           "status": "PLANNED", "trading_changed": False}
+            elif existing == "required":
+                raise ValueError("completed evaluation has no original registry receipt")
+        except BaseException as exc:
+            primary = exc
+            raise
+        finally:
+            _finish_read_transaction(conn, primary)
+    reused = receipt is not None
+    if receipt is None:
+        receipt = register_experiment_trial(registry_root, trial_id=trial_id,
+            experiment_name=experiment_name, params=frozen, status="PLANNED")
+    return {**receipt, "planned_params_sha256": _sha256_bytes(_canonical_bytes(frozen)),
+            "registration_reused": reused,
+            "registered_before_evaluation": True,
+            "historical_preregistration_verified": False,
+            "independent_trial_count_verified": False}
+
+
 def _jsonable(value: Any) -> Any:
     if value is None or isinstance(value, (str, bool, int)):
         return value

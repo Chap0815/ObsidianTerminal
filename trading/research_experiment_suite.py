@@ -30,6 +30,7 @@ from trading.expectancy_training import (
     ExpectancyPrediction,
     expanding_walk_forward_fit,
 )
+from trading.xsec_signal import select_retained_ranked_symbols
 
 RESEARCH_VENUE_PAYLOAD_MAX_BYTES = 4 * 1024 * 1024
 RESEARCH_REPORT_MAX_BYTES = 64 * 1024 * 1024
@@ -208,6 +209,31 @@ def _performance(returns_bps: Iterable[float]) -> dict:
     }
 
 
+def _label_performance(returns_bps: Iterable[float]) -> dict:
+    """Describe individual labels without assuming reinvestment or independence."""
+    values = [float(value) for value in returns_bps if _finite(value) is not None]
+    return {
+        "samples": len(values),
+        "mean_net_bps": statistics.mean(values) if values else None,
+        "median_net_bps": statistics.median(values) if values else None,
+        "win_rate": sum(value > 0.0 for value in values) / len(values) if values else None,
+        "mean_t_stat": None,
+        "compounded_return_pct": None,
+        "max_drawdown_pct": None,
+    }
+
+
+def _label_performance_contract() -> dict:
+    return {
+        "performance_basis": "individual_trade_labels_not_portfolio",
+        "portfolio_equity_available": False,
+        "uncertainty": {
+            "method": "unavailable", "independent_clusters_verified": False,
+            "reason": "cluster_and_capital_time_contract_unavailable",
+        },
+    }
+
+
 def evaluate_score_thresholds(
     labels: Iterable[CandidateLabel],
     *,
@@ -226,7 +252,7 @@ def evaluate_score_thresholds(
     rows = []
     for threshold in sorted({_finite(value) for value in thresholds} - {None}):
         selected = [outcome for score, outcome in prepared if score >= threshold]
-        metrics = _performance(selected)
+        metrics = _label_performance(selected)
         data_ready = len(selected) >= required_samples
         rows.append(
             {
@@ -246,6 +272,7 @@ def evaluate_score_thresholds(
         "exit_hysteresis_claimed": False,
         "selection_protocol": "exploratory_in_sample_threshold_grid",
         "frozen_holdout_required": True,
+        **_label_performance_contract(),
     }
 
 
@@ -280,14 +307,15 @@ def evaluate_abstention_grid(
             for probability, predicted, actual in prepared
             if probability >= threshold and predicted > 0.0
         ]
-        metrics = _performance(selected)
+        metrics = _label_performance(selected)
         rows.append(
             {
                 "probability_threshold": threshold,
                 **{key: value for key, value in metrics.items() if key != "mean_net_bps"},
                 "mean_actual_net_bps": metrics["mean_net_bps"],
                 "coverage": len(selected) / len(prepared) if prepared else 0.0,
-                "ready": len(selected) >= required_samples,
+                "data_ready": len(selected) >= required_samples,
+                "ready": False,
             }
         )
     return {
@@ -295,6 +323,7 @@ def evaluate_abstention_grid(
         "minimum_samples": required_samples,
         "rows": rows,
         "research_only": True,
+        **_label_performance_contract(),
     }
 
 
@@ -614,42 +643,13 @@ def evaluate_momentum_panel(
         dispersion_exposures.append(dispersion_exposure)
         previous_dispersion_weights = dispersion_weights
 
-        rank_by_symbol = {
-            row[0]: rank for rank, row in enumerate(by_momentum)
-        }
         buffer = max(0, int(hold_rank_buffer))
-        held_longs = [
-            row
-            for row in reversed(by_momentum)
-            if previous_hysteresis_weights.get(row[0], 0.0) > 0.0
-            and rank_by_symbol[row[0]] >= len(by_momentum) - basket - buffer
-        ][:basket]
-        held_long_symbols = {row[0] for row in held_longs}
-        hysteresis_longs = list(held_longs)
-        for row in reversed(by_momentum):
-            if len(hysteresis_longs) >= basket:
-                break
-            if row[0] not in held_long_symbols:
-                hysteresis_longs.append(row)
-                held_long_symbols.add(row[0])
-        held_shorts = [
-            row
-            for row in by_momentum
-            if previous_hysteresis_weights.get(row[0], 0.0) < 0.0
-            and rank_by_symbol[row[0]] < basket + buffer
-            and row[0] not in held_long_symbols
-        ][:basket]
-        held_short_symbols = {row[0] for row in held_shorts}
-        hysteresis_shorts = list(held_shorts)
-        for row in by_momentum:
-            if len(hysteresis_shorts) >= basket:
-                break
-            if (
-                row[0] not in held_short_symbols
-                and row[0] not in held_long_symbols
-            ):
-                hysteresis_shorts.append(row)
-                held_short_symbols.add(row[0])
+        retained_longs, retained_shorts = select_retained_ranked_symbols(
+            [row[0] for row in by_momentum], previous_hysteresis_weights, basket, buffer,
+        )
+        rows_by_symbol = {row[0]: row for row in by_momentum}
+        hysteresis_longs = [rows_by_symbol[symbol] for symbol in retained_longs]
+        hysteresis_shorts = [rows_by_symbol[symbol] for symbol in retained_shorts]
         if len(hysteresis_longs) == basket and len(hysteresis_shorts) == basket:
             hysteresis_weights = {
                 **{row[0]: 0.5 / basket for row in hysteresis_longs},

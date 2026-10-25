@@ -36,10 +36,11 @@ from trading.historical_futures_evidence import (
     HistoricalFundingTimeline,
     OverviewSnapshot,
     load_overview_snapshots,
+    validate_funding_collection_cycle,
 )
 
 
-REPLAY_DATASET_SCHEMA = 3
+REPLAY_DATASET_SCHEMA = 4
 REPLAY_SCAN_SECONDS = 150
 REPLAY_MAX_SNAPSHOT_AGE_SECONDS = 120
 REPLAY_MANIFEST_MAX_BYTES = 16 * 1024 * 1024
@@ -281,7 +282,7 @@ def _normalized_bars(raw_rows, timeframe: str) -> list[list[float | int]]:
 def _normalized_funding(raw_rows) -> list[list[float | int]]:
     by_timestamp = {}
     for raw in raw_rows:
-        if not isinstance(raw, (list, tuple)) or len(raw) < 2:
+        if not isinstance(raw, (list, tuple)) or len(raw) not in (2, 3, 4):
             raise ValueError("funding row must contain timestamp and rate")
         if isinstance(raw[0], bool) or isinstance(raw[1], bool):
             raise ValueError("funding timestamp/rate must be numeric")
@@ -308,6 +309,10 @@ def _normalized_funding(raw_rows) -> list[list[float | int]]:
             if not math.isfinite(mark) or mark <= 0.0:
                 raise ValueError("funding settlement mark must be finite and positive")
             values.append(mark)
+        if len(raw) == 4:
+            if len(values) != 2:
+                raise ValueError("verified funding settlement requires a positive mark")
+            values.append(validate_funding_collection_cycle(raw[3]))
         timestamp = int(timestamp_number)
         if timestamp in by_timestamp and by_timestamp[timestamp] != values:
             raise ValueError("conflicting funding settlement evidence")
@@ -315,11 +320,15 @@ def _normalized_funding(raw_rows) -> list[list[float | int]]:
     rows = [[timestamp, *by_timestamp[timestamp]] for timestamp in sorted(by_timestamp)]
     if len(rows) < 2:
         raise ValueError("funding history requires at least two settlements")
-    if any(
-        not 0 < right[0] - left[0] <= 12 * 3_600_000
-        for left, right in zip(rows, rows[1:])
-    ):
-        raise ValueError("funding settlement history is incomplete")
+    if any(len(row) == 4 for row in rows):
+        if not all(len(row) == 4 for row in rows):
+            raise ValueError("funding settlement cycle evidence must cover every row")
+        if any(
+            left[3] != right[3]
+            or right[0] - left[0] != right[3] * 3_600_000
+            for left, right in zip(rows, rows[1:])
+        ):
+            raise ValueError("funding settlement history or cycle transition is incomplete")
     return rows
 
 
@@ -854,7 +863,7 @@ def load_replay_dataset(dataset_root: str | Path) -> ReplayDataset:
             (
                 datetime.fromtimestamp(row[0] / 1000.0, tz=timezone.utc),
                 row[1],
-                row[2] if len(row) >= 3 else None,
+                *row[2:],
             )
             for row in normalized
         )

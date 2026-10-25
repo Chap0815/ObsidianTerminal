@@ -23,6 +23,9 @@ from sqlite_safety import harden_sqlite_connection
 MAX_OVERVIEW_PAYLOAD_BYTES = 8 * 1024 * 1024
 MAX_FUNDING_ENDPOINT_AGE_SECONDS = 300
 MAX_FUNDING_RATE_AGE_SECONDS = 300
+# Match the recorder's clock-quality bounds without importing its runtime.
+MAX_OVERVIEW_SOURCE_FUTURE_SECONDS = 30
+MAX_OVERVIEW_SOURCE_AGE_SECONDS = 86_400
 
 
 def _unique_evidence_json_object(pairs) -> dict:
@@ -118,6 +121,7 @@ class FundingPeriod:
     observed_time: datetime
     event_id: str
     mark_price: float | None = None
+    collection_cycle_hours: int | None = None
 
 
 @dataclass(frozen=True)
@@ -129,6 +133,19 @@ class FundingCharge:
 
 class IncompleteFundingEvidence(ValueError):
     """Raised when a held position crosses a period absent from evidence."""
+
+
+def validate_funding_collection_cycle(value) -> int:
+    """Validate the explicit hours field from native settled funding evidence."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("funding collection cycle must be positive integer hours")
+    try:
+        numeric = float(value)
+    except (ValueError, OverflowError) as exc:
+        raise ValueError("funding collection cycle is invalid") from exc
+    if not math.isfinite(numeric) or not numeric.is_integer() or numeric <= 0:
+        raise ValueError("funding collection cycle must be positive integer hours")
+    return int(numeric)
 
 
 class HistoricalFundingTimeline:
@@ -233,14 +250,16 @@ class HistoricalFundingTimeline:
         history: Mapping[
             str,
             Iterable[
-                tuple[datetime, float] | tuple[datetime, float, float]
+                tuple[datetime, float]
+                | tuple[datetime, float, float]
+                | tuple[datetime, float, float, int]
             ],
         ],
     ) -> "HistoricalFundingTimeline":
         periods = []
         observations = {}
         settled_values: dict[
-            tuple[str, datetime], tuple[float, float | None]
+            tuple[str, datetime], tuple[float, float | None, int | None]
         ] = {}
         for symbol, rows in history.items():
             canonical = _canonical_symbol(symbol)
@@ -249,31 +268,37 @@ class HistoricalFundingTimeline:
             stamps = []
             for index, raw_row in enumerate(rows):
                 try:
-                    timestamp, raw_rate, *optional_mark = raw_row
+                    timestamp, raw_rate, *optional_values = raw_row
                 except (TypeError, ValueError) as exc:
                     raise ValueError("settled funding row is invalid") from exc
-                if len(optional_mark) > 1:
+                if len(optional_values) > 2:
                     raise ValueError("settled funding row is invalid")
                 settlement = _as_utc_datetime(timestamp, "funding settlement")
                 rate = _finite(raw_rate)
                 if rate is None:
                     raise ValueError("settled funding rate must be finite")
                 mark_price = (
-                    _finite(optional_mark[0]) if optional_mark else None
+                    _finite(optional_values[0]) if optional_values else None
                 )
                 if mark_price is not None and mark_price <= 0.0:
                     raise ValueError("settled funding mark must be positive")
+                cycle = None
+                if len(optional_values) == 2:
+                    cycle = validate_funding_collection_cycle(optional_values[1])
+                    if mark_price is None:
+                        raise ValueError("verified settled funding requires a mark")
                 key = (canonical, settlement)
                 previous_value = settled_values.get(key)
                 if previous_value is not None and previous_value != (
                     rate,
                     mark_price,
+                    cycle,
                 ):
                     raise ValueError(
-                        "conflicting settled funding rates or marks for "
+                        "conflicting settled funding rates, marks or cycles for "
                         f"{canonical} at {settlement.isoformat()}"
                     )
-                settled_values[key] = (rate, mark_price)
+                settled_values[key] = (rate, mark_price, cycle)
                 stamps.append(settlement)
                 periods.append(FundingPeriod(
                     symbol=canonical,
@@ -282,6 +307,7 @@ class HistoricalFundingTimeline:
                     observed_time=settlement,
                     event_id=f"settled:{canonical}:{index}:{settlement.isoformat()}",
                     mark_price=mark_price,
+                    collection_cycle_hours=cycle,
                 ))
             observations[canonical] = stamps
         return cls(
@@ -301,9 +327,8 @@ class HistoricalFundingTimeline:
     ) -> bool:
         entry = _as_utc_datetime(entry_time, "entry_time")
         exit_ = _as_utc_datetime(exit_time, "exit_time")
-        observations = self._observations.get(_canonical_symbol(symbol), ())
         if self._settled_history:
-            return _settled_coverage_is_complete(observations, entry, exit_)
+            return _settled_coverage_is_complete(self.periods(symbol), entry, exit_)
         return self._snapshot_coverage_is_complete(symbol, entry, exit_)
 
     def _snapshot_coverage_is_complete(self, symbol, entry, exit_) -> bool:
@@ -391,9 +416,8 @@ class HistoricalFundingTimeline:
         if exit_ <= entry or notional == 0.0:
             return FundingCharge(0.0, 0, ())
 
-        observations = self._observations.get(_canonical_symbol(symbol), ())
         coverage_complete = (
-            _settled_coverage_is_complete(observations, entry, exit_)
+            _settled_coverage_is_complete(self.periods(symbol), entry, exit_)
             if self._settled_history
             else self._snapshot_coverage_is_complete(symbol, entry, exit_)
         )
@@ -473,23 +497,36 @@ def _coverage_is_complete(
 
 
 def _settled_coverage_is_complete(
-    settlements: tuple[datetime, ...],
+    periods: tuple[FundingPeriod, ...],
     entry: datetime,
     exit_: datetime,
 ) -> bool:
+    if exit_ <= entry:
+        return True
+    settlements = tuple(row.settlement_time for row in periods)
     if len(settlements) < 2:
         return False
-    gaps = [
-        (right - left).total_seconds()
-        for left, right in zip(settlements, settlements[1:])
-    ]
-    if not gaps or any(gap <= 0.0 or gap > 12 * 3600 for gap in gaps):
+    first = bisect_right(settlements, entry) - 1
+    last = bisect_left(settlements, exit_)
+    if first < 0 or last >= len(periods):
         return False
-    maximum_interval = max(gaps)
-    return bool(
-        settlements[0] <= entry
-        and settlements[-1] >= exit_ - timedelta(seconds=maximum_interval)
-    )
+    # Bracket the entire hold with real settlements. Spacing alone cannot prove
+    # the absence of a missing payment, and a cycle change is ambiguous without
+    # an explicitly verified transition schedule. Legacy rows remain readable.
+    relevant = periods[first:last + 1]
+    for left, right in zip(relevant, relevant[1:]):
+        try:
+            cycle = validate_funding_collection_cycle(right.collection_cycle_hours)
+            previous_cycle = validate_funding_collection_cycle(left.collection_cycle_hours)
+        except ValueError:
+            return False
+        if (
+            previous_cycle != cycle
+            or (right.settlement_time - left.settlement_time).total_seconds()
+            != cycle * 3600
+        ):
+            return False
+    return len(relevant) >= 2
 
 
 def _require_aware(value: datetime, label: str) -> datetime:
@@ -534,6 +571,7 @@ def load_overview_snapshots(
         "invalid_tickers_payload",
         "invalid_exchange_timestamp",
         "stale_exchange_timestamp",
+        "future_exchange_timestamp",
     ),
 ) -> list[OverviewSnapshot]:
     """Read copied overview SQLite partitions deterministically and read-only."""
@@ -558,6 +596,10 @@ def load_overview_snapshots(
                 received_time = _utc(received_raw)
                 if exchange_time is None or received_time is None:
                     continue
+                if exchange_time > received_time + timedelta(
+                    seconds=MAX_OVERVIEW_SOURCE_FUTURE_SECONDS
+                ):
+                    continue
                 try:
                     flags_value = _decode_evidence_json(flags_raw)
                     payload = _decode_evidence_json(payload_raw)
@@ -577,7 +619,7 @@ def load_overview_snapshots(
                     continue
                 markets = {}
                 for market_id, raw in raw_markets.items():
-                    market = _market(str(market_id), raw)
+                    market = _market(str(market_id), raw, received_time=received_time)
                     if market is not None:
                         markets[market.symbol] = market
                 if not markets:
@@ -606,9 +648,26 @@ def load_overview_snapshots(
     )
 
 
-def _market(market_id: str, raw) -> HistoricalMarket | None:
+def _market(
+    market_id: str, raw, *, received_time: datetime | None = None
+) -> HistoricalMarket | None:
     if not isinstance(raw, dict):
         return None
+    if "price_stale" in raw and raw["price_stale"] is not False:
+        return None
+    if "exchange_timestamp_ms" in raw:
+        source_ms = _finite(raw["exchange_timestamp_ms"])
+        if (
+            source_ms is None
+            or source_ms <= 0
+            or not source_ms.is_integer()
+            or received_time is None
+            or source_ms > received_time.timestamp() * 1000
+            + MAX_OVERVIEW_SOURCE_FUTURE_SECONDS * 1000
+            or source_ms < received_time.timestamp() * 1000
+            - MAX_OVERVIEW_SOURCE_AGE_SECONDS * 1000
+        ):
+            return None
     symbol = _canonical_symbol(raw.get("symbol") or market_id)
     last = _finite(raw.get("last"))
     quote_volume = _finite(raw.get("quote_volume"))

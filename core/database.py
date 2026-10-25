@@ -1690,6 +1690,7 @@ def _run_migrations(conn) -> None:
     _add_column_if_missing(conn, "trades", "leverage",          "REAL")
     _add_column_if_missing(conn, "trades", "liquidation_price", "REAL")
     _add_column_if_missing(conn, "trades", "funding_paid",      "REAL DEFAULT 0.0")
+    _add_column_if_missing(conn, "trades", "funding_evidence_json", "TEXT")
     _add_column_if_missing(conn, "trades", "fees_usdt",         "REAL DEFAULT 0.0")
     _add_column_if_missing(conn, "trades", "mfe_pct",           "REAL")
     _add_column_if_missing(conn, "trades", "mae_pct",           "REAL")
@@ -2249,6 +2250,11 @@ def _run_migrations(conn) -> None:
         "CREATE INDEX IF NOT EXISTS idx_candidate_microstructure_measured "
         "ON candidate_microstructure(measured_at, entry_id, stage)"
     )
+    _ensure_sim_execution_availability_schema(conn)
+    _ensure_sim_trade_fragment_availability_schema(conn)
+    _ensure_candidate_feature_availability_schema(conn)
+    from trading.funding_forward_corpus import initialize_forward_corpus_schema
+    initialize_forward_corpus_schema(conn)
     c.execute("""
     CREATE TABLE IF NOT EXISTS venue_capture_priority (
         symbol             TEXT PRIMARY KEY,
@@ -2273,7 +2279,7 @@ def _run_migrations(conn) -> None:
     # Record current schema version  every successful migration run leaves a
     # fingerprint, useful for diagnostics ("did the migration run?") and for
     # future versioned migrations.
-    _CURRENT_SCHEMA_VERSION = 8
+    _CURRENT_SCHEMA_VERSION = 14
     try:
         existing = conn.execute(
             "SELECT version FROM schema_versions WHERE version=?",
@@ -3254,7 +3260,7 @@ _TRADE_DEDUP_PAYLOAD_COLUMNS = """
     buy_price, sell_price, profit_pct, profit_usdt, invested_usdt,
     COALESCE(is_partial, 0), COALESCE(is_futures, 0), position_type,
     leverage, liquidation_price, funding_paid, fees_usdt,
-    is_sim, entry_id
+    is_sim, entry_id, funding_evidence_json
 """
 
 
@@ -3370,6 +3376,22 @@ def trade_db_payload_rejection_reason(payload: dict) -> str | None:
         return "invalid prices"
     if normalized["invested_usdt"] <= 0:
         return "invested_usdt <= 0"
+    if payload.get("funding_evidence") is not None:
+        try:
+            from trading.funding_evidence import serialize_funding_evidence
+
+            serialize_funding_evidence(
+                payload["funding_evidence"], bot_name=bot_name,
+                mode_is_sim=True if bot_name.endswith(_SIM_TAG) else explicit_mode,
+                symbol=symbol.strip(), entry_id=_causal_entry_id_db(payload.get("entry_id"), required=False),
+                buy_time=_trade_timestamp_db(payload["buy_time"], "buy_time")[0],
+                sell_time=_trade_timestamp_db(payload["sell_time"], "sell_time")[0],
+                is_futures=is_futures, is_partial=is_partial,
+                exchange_order_id=_trade_exchange_order_id_db(payload.get("exchange_order_id")),
+                funding_paid=normalized["funding_paid"],
+            )
+        except (TypeError, ValueError, OverflowError):
+            return "funding evidence is invalid or does not match the trade fragment"
     return trade_pnl_sanity_reason(
         profit_pct=normalized["profit_pct"],
         profit_usdt=normalized["profit_usdt"],
@@ -3390,7 +3412,7 @@ def save_trade_db(
     liquidation_price=None, funding_paid=0.0, fees_usdt=0.0,
     exchange_order_id=None, mfe_pct=None, mae_pct=None, giveback_pct=None,
     mode_is_sim=None, entry_quality_score=None, entry_quality_label=None,
-    entry_quality_reasons=None, entry_id=None,
+    entry_quality_reasons=None, entry_id=None, funding_evidence=None,
 ) -> bool:
     metadata_error = None
     if not isinstance(bot_name, str) or not bot_name.strip():
@@ -3475,6 +3497,22 @@ def save_trade_db(
                 metadata_error = "futures trade cannot use SPOT position_type"
             elif not is_futures and normalized_position_type != "SPOT":
                 metadata_error = "spot trade cannot use futures position_type"
+    funding_evidence_json = None
+    if metadata_error is None and funding_evidence is not None:
+        try:
+            from trading.funding_evidence import serialize_funding_evidence
+
+            funding_evidence_json = serialize_funding_evidence(
+                funding_evidence, bot_name=bot_name,
+                mode_is_sim=True if bot_name.endswith(_SIM_TAG) else explicit_mode,
+                symbol=symbol, entry_id=normalized_entry_id,
+                buy_time=normalized_buy_time, sell_time=normalized_sell_time,
+                is_futures=is_futures, is_partial=is_partial,
+                exchange_order_id=normalized_exchange_order_id,
+                funding_paid=float(funding_paid) if not isinstance(funding_paid, bool) else funding_paid,
+            )
+        except (TypeError, ValueError, OverflowError):
+            metadata_error = "funding evidence is invalid or does not match the trade fragment"
     if metadata_error is not None:
         try:
             from core.logger import log_event
@@ -3665,9 +3703,13 @@ def save_trade_db(
         fees_usdt,
         trade_is_sim,
         entry_id,
+        funding_evidence_json,
     )
 
     conn = get_connection()
+    fragment_eligible = (bot_name == "FUTURES (SIM)" and trade_is_sim == 1
+                         and is_futures_db == 1 and entry_id is not None)
+    fragment_trade_id = fragment_pending = None
     try:
         # The read-before-insert idempotency checks must be one cross-process
         # critical section. Without an IMMEDIATE transaction, two bot/reconcile
@@ -3675,7 +3717,7 @@ def save_trade_db(
         conn.execute("BEGIN IMMEDIATE")
         if is_partial and exchange_order_id is not None:
             existing_partial = conn.execute(f"""
-            SELECT {_TRADE_DEDUP_PAYLOAD_COLUMNS} FROM trades
+            SELECT {_TRADE_DEDUP_PAYLOAD_COLUMNS},id FROM trades
              WHERE bot_name = ?
                AND symbol = ?
                AND buy_time = ?
@@ -3690,16 +3732,18 @@ def save_trade_db(
             )).fetchone()
             if existing_partial:
                 matches = _trade_dedup_payload_matches(
-                    existing_partial, dedup_payload
+                    existing_partial[:-1], dedup_payload
                 )
                 conn.commit() if matches else conn.rollback()
+                if matches and fragment_eligible:
+                    _finish_sim_trade_fragment_availability(conn, existing_partial[-1], recovery=True)
                 if not matches:
                     _log_trade_dedup_conflict(bot_name, symbol, is_partial)
                 return matches
         if not is_partial:
             if exchange_order_id is not None:
                 existing_final = conn.execute(f"""
-                SELECT {_TRADE_DEDUP_PAYLOAD_COLUMNS} FROM trades
+                SELECT {_TRADE_DEDUP_PAYLOAD_COLUMNS},id FROM trades
                  WHERE bot_name = ?
                    AND symbol = ?
                    AND buy_time = ?
@@ -3714,7 +3758,7 @@ def save_trade_db(
                 )).fetchone()
             elif entry_id is not None:
                 existing_final = conn.execute(f"""
-                SELECT {_TRADE_DEDUP_PAYLOAD_COLUMNS} FROM trades
+                SELECT {_TRADE_DEDUP_PAYLOAD_COLUMNS},id FROM trades
                  WHERE bot_name = ?
                    AND symbol = ?
                    AND COALESCE(is_partial, 0) = 0
@@ -3729,7 +3773,7 @@ def save_trade_db(
                 )).fetchone()
             else:
                 existing_final = conn.execute(f"""
-                SELECT {_TRADE_DEDUP_PAYLOAD_COLUMNS} FROM trades
+                SELECT {_TRADE_DEDUP_PAYLOAD_COLUMNS},id FROM trades
                  WHERE bot_name = ?
                    AND symbol = ?
                    AND buy_time = ?
@@ -3743,9 +3787,11 @@ def save_trade_db(
                 )).fetchone()
             if existing_final:
                 matches = _trade_dedup_payload_matches(
-                    existing_final, dedup_payload
+                    existing_final[:-1], dedup_payload
                 )
                 conn.commit() if matches else conn.rollback()
+                if matches and fragment_eligible:
+                    _finish_sim_trade_fragment_availability(conn, existing_final[-1], recovery=True)
                 if not matches:
                     _log_trade_dedup_conflict(bot_name, symbol, is_partial)
                 return matches
@@ -3761,8 +3807,8 @@ def save_trade_db(
              liquidation_price, funding_paid, fees_usdt,
              exchange_order_id, mfe_pct, mae_pct, giveback_pct,
              is_sim, mode_source, entry_quality_score, entry_quality_label,
-             entry_quality_reasons, entry_id)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+             entry_quality_reasons, entry_id, funding_evidence_json)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
             bot_name, symbol, buy_price, sell_price, buy_time, sell_time,
             profit_pct, profit_usdt, invested_usdt, reason,
             _sanitize_float(rsi_15m, None) if rsi_15m is not None else None,
@@ -3781,7 +3827,7 @@ def save_trade_db(
             str(exchange_order_id) if exchange_order_id is not None else None,
             mfe_pct, mae_pct, giveback_pct,
             trade_is_sim, mode_source, entry_quality_score, entry_quality_label,
-            entry_quality_reasons, entry_id,
+            entry_quality_reasons, entry_id, funding_evidence_json,
         ))
         inserted = cur.rowcount > 0
         if inserted:
@@ -3795,9 +3841,12 @@ def save_trade_db(
                 total_profit = total_profit + excluded.total_profit,
                 trade_count  = trade_count  + 1""",
                 (bot_name, trade_date, profit_usdt))
+            if fragment_eligible:
+                fragment_trade_id = cur.lastrowid
+                fragment_pending = _stage_sim_trade_fragment_availability(conn, fragment_trade_id)
         else:
             existing = conn.execute(f"""
-            SELECT {_TRADE_DEDUP_PAYLOAD_COLUMNS} FROM trades
+            SELECT {_TRADE_DEDUP_PAYLOAD_COLUMNS},id FROM trades
              WHERE bot_name = ?
                AND symbol = ?
                AND buy_time = ?
@@ -3814,12 +3863,19 @@ def save_trade_db(
                 str(exchange_order_id) if exchange_order_id is not None else None,
                 entry_id,
             )).fetchone()
-            matches = _trade_dedup_payload_matches(existing, dedup_payload)
+            matches = _trade_dedup_payload_matches(existing[:-1] if existing else None, dedup_payload)
             if not matches:
                 conn.rollback()
                 _log_trade_dedup_conflict(bot_name, symbol, is_partial)
                 return False
+            if fragment_eligible:
+                fragment_trade_id = existing[-1]
+        if not conn.in_transaction:
+            raise sqlite3.OperationalError("original trade transaction was lost before commit")
         conn.commit()
+        if fragment_eligible and fragment_trade_id is not None:
+            _finish_sim_trade_fragment_availability(
+                conn, fragment_trade_id, fragment_pending, recovery=not inserted)
         return True
     except sqlite3.IntegrityError:
         try:
@@ -3966,8 +4022,12 @@ def save_expectancy_candidate(
     feature_snapshot: dict | None = None,
     direction: str | None = None,
     quality_decision: dict | None = None,
+    feature_fact_context: dict | None = None,
+    feature_receipt_out: dict | None = None,
 ) -> bool:
     """Persist an immutable entry vector and optional feature snapshot atomically."""
+    if type(feature_receipt_out) is dict:
+        feature_receipt_out.clear()
     try:
         normalized_entry_id = _causal_entry_id_db(entry_id, required=True)
         normalized_bot = _required_text_db(
@@ -4092,6 +4152,18 @@ def save_expectancy_candidate(
         normalized_schema,
         encoded_features,
     )
+    feature_fact = feature_pending = None
+    if feature_fact_context is not None:
+        try:
+            from trading.candidate_feature_evidence import build_feature_fact
+            feature_fact = build_feature_fact(entry_id=normalized_entry_id, context=feature_fact_context,
+                candidate_time=normalized_time, feature_schema_version=normalized_schema, features=features)
+            context = feature_fact["context"]
+            if (context["bot_name"], context["mode"], context["symbol"], context["direction"]) != (
+                    normalized_bot, normalized_mode, normalized_symbol, normalized_direction):
+                feature_fact = None
+        except Exception:
+            feature_fact = None
     try:
         conn.execute("BEGIN IMMEDIATE")
         child_scopes = conn.execute(
@@ -4260,7 +4332,23 @@ def save_expectancy_candidate(
                 ):
                     conn.rollback()
                     return False
+        if inserted_candidate and feature_fact is not None:
+            feature_pending = _stage_candidate_feature_availability(conn, feature_fact)
+        if not conn.in_transaction:
+            raise sqlite3.OperationalError("original candidate transaction was lost before commit")
         conn.commit()
+        if feature_fact is not None:
+            try:
+                _finish_candidate_feature_availability(conn, normalized_entry_id, feature_pending)
+                if type(feature_receipt_out) is dict:
+                    from trading.candidate_feature_evidence import feature_fact_sha256
+                    receipt = get_candidate_feature_receipt(entry_id=normalized_entry_id,
+                        expected_fact_sha256=feature_fact_sha256(feature_fact), context=feature_fact["context"])
+                    if receipt is not None:
+                        feature_receipt_out["receipt"] = receipt
+            except Exception:
+                if type(feature_receipt_out) is dict:
+                    feature_receipt_out.clear()
         return True
     except sqlite3.Error:
         try:
@@ -4760,6 +4848,31 @@ def list_venue_capture_priorities(limit: int = 8) -> list[str]:
     return priorities
 
 
+def _execute_research_retention_delete_db(conn, statement, parameters=()):
+    """Retire availability with the exact official original-fact GC selection.
+
+    Only the three static research tables below own these fact bundles. This
+    helper neither broadens their predicates nor treats arbitrary missing facts
+    as retention. Both deletes belong to the caller's existing transaction.
+    """
+    parts = statement.lstrip().split(None, 3)
+    if (len(parts) >= 3 and parts[:2] == ["DELETE", "FROM"]
+            and parts[2] in {"candidate_microstructure", "sim_execution_tca", "sim_execution_markouts"}):
+        if not conn.in_transaction:
+            raise RuntimeError("research availability retirement requires a transaction")
+        selection = "SELECT entry_id FROM " + parts[2]
+        if len(parts) == 4:
+            selection += " " + parts[3]
+        conn.execute("UPDATE funding_forward_generations SET state='RETIRED', "
+                     "retirement_reason='journal_tca_retention' "
+                     "WHERE state IN ('PENDING','ACKED') AND retirement_reason IS NULL "
+                     "AND entry_id IN (" + selection + ")", parameters)
+        conn.execute("DELETE FROM sim_execution_availability WHERE entry_id IN (" + selection + ")",
+                     parameters)
+        conn.execute("DELETE FROM sim_feature_entry_bindings WHERE entry_id IN (" + selection + ")", parameters)
+    return conn.execute(statement, parameters)
+
+
 def _delete_invalid_markout_histories_db(
     conn,
     *,
@@ -4768,7 +4881,8 @@ def _delete_invalid_markout_histories_db(
 ) -> int:
     table = _safe_ident(table)
     identity_column = _safe_ident(identity_column)
-    cursor = conn.execute(
+    cursor = _execute_research_retention_delete_db(
+        conn,
         f"""DELETE FROM {table}
             WHERE {identity_column} IN (
                 SELECT DISTINCT bad.{identity_column} FROM {table} bad
@@ -4855,7 +4969,8 @@ def enforce_research_telemetry_retention(
     deleted: dict[str, int] = {}
     try:
         conn.execute("BEGIN IMMEDIATE")
-        cursor = conn.execute(
+        cursor = _execute_research_retention_delete_db(
+            conn,
             """DELETE FROM candidate_microstructure
                 WHERE entry_id IN (
                     SELECT e.entry_id FROM expectancy_candidates e
@@ -4882,7 +4997,8 @@ def enforce_research_telemetry_retention(
                 )"""
         )
         deleted["candidate_invalid_parent"] = max(0, cursor.rowcount)
-        cursor = conn.execute(
+        cursor = _execute_research_retention_delete_db(
+            conn,
             """DELETE FROM expectancy_candidates
                  WHERE (
                      strftime(
@@ -4907,7 +5023,8 @@ def enforce_research_telemetry_retention(
                    )"""
         )
         deleted["expectancy_invalid_time"] = max(0, cursor.rowcount)
-        cursor = conn.execute(
+        cursor = _execute_research_retention_delete_db(
+            conn,
             """DELETE FROM candidate_microstructure
                 WHERE entry_id IN (
                     SELECT DISTINCT c.entry_id FROM candidate_microstructure c
@@ -4930,7 +5047,8 @@ def enforce_research_telemetry_retention(
                 )"""
         )
         deleted["candidate_invalid_time"] = max(0, cursor.rowcount)
-        cursor = conn.execute(
+        cursor = _execute_research_retention_delete_db(
+            conn,
             """DELETE FROM candidate_microstructure
                 WHERE entry_id IN (
                     SELECT c.entry_id FROM candidate_microstructure c
@@ -4948,7 +5066,8 @@ def enforce_research_telemetry_retention(
             (cutoff,),
         )
         deleted["candidate_age"] = max(0, cursor.rowcount)
-        cursor = conn.execute(
+        cursor = _execute_research_retention_delete_db(
+            conn,
             """DELETE FROM candidate_microstructure
                 WHERE entry_id IN (
                     SELECT c.entry_id FROM candidate_microstructure c
@@ -4966,7 +5085,8 @@ def enforce_research_telemetry_retention(
             (candidate_limit,),
         )
         deleted["candidate_cap"] = max(0, cursor.rowcount)
-        cursor = conn.execute(
+        cursor = _execute_research_retention_delete_db(
+            conn,
             """DELETE FROM execution_tca
                 WHERE intent_id IN (
                     SELECT DISTINCT t.intent_id FROM execution_tca t
@@ -4985,7 +5105,8 @@ def enforce_research_telemetry_retention(
                 )"""
         )
         deleted["tca_invalid_time"] = max(0, cursor.rowcount)
-        cursor = conn.execute(
+        cursor = _execute_research_retention_delete_db(
+            conn,
             """DELETE FROM execution_tca
                 WHERE intent_id IN (
                     SELECT t.intent_id FROM execution_tca t
@@ -4999,7 +5120,8 @@ def enforce_research_telemetry_retention(
             (cutoff,),
         )
         deleted["tca_age"] = max(0, cursor.rowcount)
-        cursor = conn.execute(
+        cursor = _execute_research_retention_delete_db(
+            conn,
             """DELETE FROM execution_tca
                 WHERE intent_id IN (
                     SELECT t.intent_id FROM execution_tca t
@@ -5034,7 +5156,8 @@ def enforce_research_telemetry_retention(
                         WHERE m.entry_id=t.entry_id AND m.status='PENDING'
                    )"""
         )
-        cursor = conn.execute(
+        cursor = _execute_research_retention_delete_db(
+            conn,
             """DELETE FROM sim_execution_tca
                 WHERE entry_id IN (
                     SELECT DISTINCT t.entry_id FROM sim_execution_tca t
@@ -5064,7 +5187,8 @@ def enforce_research_telemetry_retention(
                HAVING MAX(t.measured_at) < ?""",
             (cutoff,),
         )
-        cursor = conn.execute(
+        cursor = _execute_research_retention_delete_db(
+            conn,
             """DELETE FROM sim_execution_tca
                 WHERE entry_id IN (
                     SELECT t.entry_id FROM sim_execution_tca t
@@ -5088,7 +5212,8 @@ def enforce_research_telemetry_retention(
                  ORDER BY t.measured_at DESC, t.id DESC LIMIT -1 OFFSET ?""",
             (tca_limit,),
         )
-        cursor = conn.execute(
+        cursor = _execute_research_retention_delete_db(
+            conn,
             """DELETE FROM sim_execution_tca
                 WHERE entry_id IN (
                     SELECT t.entry_id FROM sim_execution_tca t
@@ -5101,7 +5226,8 @@ def enforce_research_telemetry_retention(
             (tca_limit,),
         )
         deleted["sim_tca_cap"] = max(0, cursor.rowcount)
-        cursor = conn.execute(
+        cursor = _execute_research_retention_delete_db(
+            conn,
             """DELETE FROM sim_execution_markouts
                 WHERE status IN ('COMPLETE','FAILED')
                   AND entry_id IN (SELECT entry_id FROM retention_sim_tca_pruned)
@@ -5127,7 +5253,8 @@ def enforce_research_telemetry_retention(
             table="execution_markouts",
             identity_column="intent_id",
         )
-        cursor = conn.execute(
+        cursor = _execute_research_retention_delete_db(
+            conn,
             """DELETE FROM execution_markouts
                 WHERE status IN ('COMPLETE','FAILED')
                   AND intent_id IN (
@@ -5139,7 +5266,8 @@ def enforce_research_telemetry_retention(
             (cutoff,),
         )
         deleted["markout_age"] = max(0, cursor.rowcount)
-        cursor = conn.execute(
+        cursor = _execute_research_retention_delete_db(
+            conn,
             """DELETE FROM execution_markouts
                 WHERE status IN ('COMPLETE','FAILED')
                   AND intent_id IN (
@@ -5162,7 +5290,8 @@ def enforce_research_telemetry_retention(
             table="sim_execution_markouts",
             identity_column="entry_id",
         )
-        cursor = conn.execute(
+        cursor = _execute_research_retention_delete_db(
+            conn,
             """DELETE FROM sim_execution_markouts
                 WHERE status IN ('COMPLETE','FAILED')
                   AND entry_id IN (
@@ -5174,7 +5303,8 @@ def enforce_research_telemetry_retention(
             (cutoff,),
         )
         deleted["sim_markout_age"] = max(0, cursor.rowcount)
-        cursor = conn.execute(
+        cursor = _execute_research_retention_delete_db(
+            conn,
             """DELETE FROM sim_execution_markouts
                 WHERE status IN ('COMPLETE','FAILED')
                   AND entry_id IN (
@@ -5192,11 +5322,13 @@ def enforce_research_telemetry_retention(
             (markout_limit,),
         )
         deleted["sim_markout_cap"] = max(0, cursor.rowcount)
-        cursor = conn.execute(
+        cursor = _execute_research_retention_delete_db(
+            conn,
             "DELETE FROM venue_capture_priority WHERE expires_at <= ?", (now,)
         )
         deleted["priority_expired"] = max(0, cursor.rowcount)
-        cursor = conn.execute(
+        cursor = _execute_research_retention_delete_db(
+            conn,
             """DELETE FROM expectancy_candidates
                 WHERE candidate_time < ?
                   AND NOT EXISTS (
@@ -5219,7 +5351,8 @@ def enforce_research_telemetry_retention(
             (cutoff,),
         )
         deleted["expectancy_age"] = max(0, cursor.rowcount)
-        cursor = conn.execute(
+        cursor = _execute_research_retention_delete_db(
+            conn,
             """DELETE FROM expectancy_candidates
                 WHERE entry_id IN (
                     SELECT e.entry_id FROM expectancy_candidates e
@@ -12960,7 +13093,774 @@ def record_simulated_execution_tca(
         raise
 
 
-_SIM_TCA_BOTS = frozenset({"CROSS", "FUTREND", "SPOT", "TREND"})
+_FEATURE_AVAILABILITY_TABLES = {"candidate": "candidate_feature_availability", "entry": "sim_feature_entry_bindings"}
+
+
+def _feature_encode_db(value):
+    from trading.candidate_feature_evidence import MAX_FEATURE_EVIDENCE_BYTES
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    if len(raw.encode("utf-8")) > MAX_FEATURE_EVIDENCE_BYTES:
+        raise ValueError("feature evidence byte budget exceeded")
+    return raw
+
+
+def _feature_json_db(raw):
+    from trading.candidate_feature_evidence import MAX_FEATURE_EVIDENCE_BYTES
+    if not isinstance(raw, str) or len(raw.encode("utf-8")) > MAX_FEATURE_EVIDENCE_BYTES:
+        raise ValueError("feature evidence JSON is oversized")
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate feature JSON key")
+            result[key] = value
+        return result
+    def invalid(_value):
+        raise ValueError("nonfinite feature JSON")
+    try:
+        return json.loads(raw, object_pairs_hook=unique, parse_constant=invalid)
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        raise ValueError("invalid bounded feature evidence JSON") from exc
+
+
+def _feature_proof_row_db(conn, family, entry_id):
+    table = _FEATURE_AVAILABILITY_TABLES[family]
+    sizes = {"entry_id": 64, "schema_version": 32, "facts_sha256": 64, "state": 16,
+             "available_by_ms": 64, "witness_kind": 32, "clock_bound_kind": 64}
+    sizes.update({"fact_json": 8192, "receipt_json": 8192, "bot_name": 32, "mode": 8, "symbol": 64}
+                 if family == "candidate" else {"binding_json": 8192, "capsule_json": 8192})
+    bounds = " AND ".join(f"({field} IS NULL OR length(CAST({field} AS BLOB))<={size})" for field, size in sizes.items())
+    cursor = conn.execute(f"SELECT {','.join(sizes)} FROM {table} WHERE entry_id=? AND {bounds} LIMIT 2", (entry_id,))
+    rows = cursor.fetchmany(2)
+    if len(rows) != 1:
+        # Distinguish absent original evidence from a corrupt oversized row.
+        if conn.execute(f"SELECT 1 FROM {table} WHERE entry_id=? LIMIT 1", (entry_id,)).fetchone():
+            raise ValueError("feature proof exceeds read budget")
+        return None
+    return dict(zip((item[0] for item in cursor.description), rows[0]))
+
+
+def _read_candidate_feature_fact_db(conn, entry_id, proof=None):
+    from trading.candidate_feature_evidence import decode_feature_evidence, build_feature_fact, feature_fact_sha256
+    proof = _feature_proof_row_db(conn, "candidate", entry_id) if proof is None else proof
+    if proof is None:
+        return None
+    fact = decode_feature_evidence(proof["fact_json"], kind="fact")
+    cursor = conn.execute("""SELECT entry_id,bot_name,mode,symbol,candidate_time,schema_version,features_json
+        FROM expectancy_candidates WHERE entry_id=? AND length(CAST(features_json AS BLOB))<=8192
+        AND length(CAST(entry_id AS BLOB))<=64 AND length(CAST(bot_name AS BLOB))<=32
+        AND length(CAST(mode AS BLOB))<=8 AND length(CAST(symbol AS BLOB))<=64
+        AND length(CAST(candidate_time AS BLOB))<=32 AND length(CAST(schema_version AS BLOB))<=32 LIMIT 2""", (entry_id,))
+    rows = cursor.fetchmany(2)
+    directions = conn.execute("SELECT direction FROM expectancy_candidate_context WHERE entry_id=? "
+                              "AND length(CAST(direction AS BLOB))<=8 LIMIT 2", (entry_id,)).fetchmany(2)
+    if len(rows) != 1 or len(directions) != 1:
+        raise ValueError("feature original candidate or direction is unavailable")
+    row = dict(zip((item[0] for item in cursor.description), rows[0]))
+    context = fact["context"]
+    if (fact["entry_id"] != entry_id or tuple(proof[key] for key in ("bot_name", "mode", "symbol"))
+            != tuple(context[key] for key in ("bot_name", "mode", "symbol"))
+            or tuple(row[key] for key in ("bot_name", "mode", "symbol"))
+            != tuple(context[key] for key in ("bot_name", "mode", "symbol"))
+            or directions[0][0] != context["direction"]):
+        raise ValueError("feature frozen scope conflicts")
+    actual = build_feature_fact(entry_id=row["entry_id"], context=context, candidate_time=row["candidate_time"],
+        feature_schema_version=row["schema_version"], features=_feature_json_db(row["features_json"]))
+    if actual != fact or feature_fact_sha256(actual) != proof["facts_sha256"]:
+        raise ValueError("feature original facts changed")
+    return fact
+
+
+def read_candidate_feature_evidence(conn, entry_id, *, cutoff_ms=None):
+    """Read exact original facts and FirstACK in the caller's read snapshot."""
+    from trading.candidate_feature_evidence import decode_feature_evidence, CLOCK_BOUND_KIND
+    if not conn.in_transaction:
+        raise ValueError("feature proof reader requires caller-owned snapshot")
+    proof = _feature_proof_row_db(conn, "candidate", entry_id)
+    if proof is not None and proof["state"] == "CONFLICT":
+        raise ValueError("feature original facts conflict")
+    if proof is None or proof["state"] == "PENDING" or proof["clock_bound_kind"] is None:
+        return None
+    fact = _read_candidate_feature_fact_db(conn, entry_id, proof)
+    if (type(proof["schema_version"]) is not int or proof["schema_version"] != 1
+            or proof["state"] != "ACKED" or proof["clock_bound_kind"] != CLOCK_BOUND_KIND
+            or proof["witness_kind"] not in {"commit_ack", "recovery_read"}):
+        raise ValueError("feature availability proof is invalid")
+    receipt = decode_feature_evidence(proof["receipt_json"], kind="receipt")
+    from trading.candidate_feature_evidence import build_feature_receipt
+    expected = build_feature_receipt(fact, available_by_ms=proof["available_by_ms"])
+    if receipt != expected or receipt["available_by_ms"] < _feature_minimum_db("candidate", fact):
+        raise ValueError("feature FirstACK conflicts with original facts")
+    if cutoff_ms is not None:
+        cutoff = _required_finite_float_db(cutoff_ms, "feature cutoff", minimum=0.0)
+        if receipt["available_by_ms"] > cutoff:
+            return None
+    return {"fact": fact, "receipt": receipt, "proof": proof}
+
+
+def get_candidate_feature_receipt(*, entry_id, expected_fact_sha256, context):
+    """Bounded read only; this getter never creates or repairs authority."""
+    from trading.candidate_feature_evidence import normalize_feature_context, normalize_feature_receipt
+    conn, began = None, False
+    try:
+        if not _INIT_DB_DONE:
+            return None
+        context = normalize_feature_context(context)
+        conn = get_connection()
+        if conn.in_transaction:
+            return None
+        conn.execute("BEGIN")
+        began = True
+        result = read_candidate_feature_evidence(conn, entry_id)
+        if result is None:
+            return None
+        return normalize_feature_receipt(result["receipt"], expected_entry_id=entry_id,
+            expected_fact_sha256=expected_fact_sha256, expected_context=context)
+    except Exception:
+        return None
+    finally:
+        if began:
+            try:
+                conn.rollback()
+            except Exception as exc:
+                _discard_feature_connection_db(conn, exc)
+
+
+def _read_feature_entry_pair_db(conn, entry_id):
+    from trading.sim_evidence_availability import read_sim_availability_facts
+    prior = conn.getlimit(sqlite3.SQLITE_LIMIT_LENGTH)
+    try:
+        conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, min(prior, 65536))
+        return read_sim_availability_facts(conn, entry_id, "entry_pair")
+    finally:
+        conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, prior)
+
+
+def _read_feature_entry_fact_db(conn, entry_id, proof=None):
+    import hashlib
+    from trading.candidate_feature_evidence import decode_feature_evidence, build_feature_entry_binding
+    from trading.sim_evidence_availability import sim_availability_facts_digest
+    proof = _feature_proof_row_db(conn, "entry", entry_id) if proof is None else proof
+    if proof is None:
+        return None
+    capsule = decode_feature_evidence(proof["capsule_json"], kind="capsule")
+    binding = decode_feature_evidence(proof["binding_json"], kind="binding")
+    first = read_candidate_feature_evidence(conn, entry_id)
+    if first is None or capsule["prefill"]["receipt"] != first["receipt"]:
+        raise ValueError("feature entry does not reference the original FirstACK")
+    pair = _read_feature_entry_pair_db(conn, entry_id)
+    expected = build_feature_entry_binding(capsule, entry_pair_facts_sha256=sim_availability_facts_digest(pair))
+    fill = next(row["payload"] for row in pair["stages"] if row["stage"] == "fill")
+    arrival = next(row["payload"] for row in pair["stages"] if row["stage"] == "arrival")
+    context = binding["context"]
+    expected_side = "buy" if context["direction"] == "LONG" else "sell"
+    if (binding != expected or binding["entry_id"] != entry_id
+            or capsule["fill_time_ms"] != fill.get("fill_time_ms")
+            or context["venue_symbol"] != pair["arrival_book"]["symbol"]
+            or arrival.get("side") != expected_side
+            or any(row["side"] != expected_side for row in pair["scheduled_markouts"])
+            or pair.get("capture_scope") != {key: context[key] for key in ("bot_name", "mode", "venue", "market_type")}
+            or hashlib.sha256(_feature_encode_db(binding).encode("utf-8")).hexdigest() != proof["facts_sha256"]):
+        raise ValueError("feature entry binding conflicts with original SIM facts")
+    return {"binding": binding, "capsule": capsule}
+
+
+def read_sim_feature_entry_binding(conn, entry_id, *, cutoff_ms=None):
+    from trading.candidate_feature_evidence import CLOCK_BOUND_KIND
+    if not conn.in_transaction:
+        raise ValueError("feature entry reader requires caller-owned snapshot")
+    proof = _feature_proof_row_db(conn, "entry", entry_id)
+    if proof is not None and proof["state"] == "CONFLICT":
+        raise ValueError("feature entry original facts conflict")
+    if proof is None or proof["state"] == "PENDING" or proof["clock_bound_kind"] is None:
+        return None
+    result = _read_feature_entry_fact_db(conn, entry_id, proof)
+    if (type(proof["schema_version"]) is not int or proof["schema_version"] != 1
+            or proof["state"] != "ACKED" or proof["clock_bound_kind"] != CLOCK_BOUND_KIND
+            or proof["witness_kind"] not in {"commit_ack", "recovery_read"}
+            or type(proof["available_by_ms"]) not in (int, float)
+            or not math.isfinite(proof["available_by_ms"])
+            or proof["available_by_ms"] < _feature_minimum_db("entry", result)):
+        raise ValueError("feature entry availability is invalid")
+    if cutoff_ms is not None and proof["available_by_ms"] > _required_finite_float_db(cutoff_ms, "feature cutoff", minimum=0.0):
+        return None
+    return {**result, "proof": proof}
+
+
+def _feature_minimum_db(family, facts):
+    if family == "candidate":
+        return datetime.strptime(facts["candidate_time"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp() * 1000
+    capsule = facts["capsule"]
+    return max(capsule["fill_time_ms"], capsule["prefill"]["receipt"]["available_by_ms"], capsule["prefill"]["decision_upper_ms"])
+
+
+def _ensure_candidate_feature_availability_schema(conn):
+    for family, table in _FEATURE_AVAILABILITY_TABLES.items():
+        payload = ("fact_json TEXT NOT NULL,receipt_json TEXT,bot_name TEXT NOT NULL,mode TEXT NOT NULL,symbol TEXT NOT NULL,"
+                   if family == "candidate" else "binding_json TEXT NOT NULL,capsule_json TEXT NOT NULL,")
+        conn.execute(f"""CREATE TABLE IF NOT EXISTS {table} (
+            entry_id TEXT PRIMARY KEY REFERENCES expectancy_candidates(entry_id) ON DELETE CASCADE,
+            schema_version INTEGER NOT NULL CHECK(schema_version=1),{payload}
+            facts_sha256 TEXT NOT NULL CHECK(length(facts_sha256)=64),
+            state TEXT NOT NULL DEFAULT 'PENDING' CHECK(state IN ('PENDING','ACKED','CONFLICT')),
+            available_by_ms REAL,witness_kind TEXT CHECK(witness_kind IN ('commit_ack','recovery_read')),
+            clock_bound_kind TEXT,
+            CHECK((available_by_ms IS NULL AND witness_kind IS NULL AND clock_bound_kind IS NULL)
+                OR (available_by_ms>0 AND witness_kind IS NOT NULL AND clock_bound_kind IS NOT NULL)))""")
+        conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_pending ON {table}(state,entry_id)")
+
+
+def _discard_feature_connection_db(conn, exc):
+    _log_db_background_failure_preserving("rollback optional feature evidence", exc, primary=exc)
+    try:
+        conn.close()
+    except Exception as close_error:
+        _log_db_background_failure_preserving("close failed feature evidence handle", close_error, primary=exc)
+    finally:
+        if getattr(_conn_local, "conn", None) is conn:
+            del _conn_local.conn
+
+
+def _stage_feature_savepoint_db(conn, operation):
+    if not conn.in_transaction:
+        raise sqlite3.OperationalError("feature staging requires original transaction")
+    saved = False
+    try:
+        conn.execute("SAVEPOINT optional_feature_evidence")
+        saved = True
+        pending = operation()
+        conn.execute("RELEASE optional_feature_evidence")
+        return pending
+    except Exception:
+        if not conn.in_transaction:
+            raise sqlite3.OperationalError("original transaction lost during optional feature staging")
+        if saved:
+            try:
+                conn.execute("ROLLBACK TO optional_feature_evidence")
+                conn.execute("RELEASE optional_feature_evidence")
+            except Exception as exc:
+                _discard_feature_connection_db(conn, exc)
+                raise sqlite3.OperationalError("optional feature savepoint rollback failed") from exc
+        return None
+
+
+def _stage_candidate_feature_availability(conn, fact):
+    from trading.candidate_feature_evidence import feature_fact_sha256
+    def stage():
+        context = fact["context"]
+        digest = feature_fact_sha256(fact)
+        conn.execute("""INSERT INTO candidate_feature_availability
+            (entry_id,schema_version,fact_json,facts_sha256,bot_name,mode,symbol) VALUES (?,1,?,?,?,?,?)""",
+            (fact["entry_id"], _feature_encode_db(fact), digest, context["bot_name"], context["mode"], context["symbol"]))
+        if _read_candidate_feature_fact_db(conn, fact["entry_id"]) != fact:
+            raise ValueError("new feature original facts conflict")
+        try:
+            witness = _sim_availability_clock_witness()
+        except Exception:
+            witness = None
+        return digest, witness
+    return _stage_feature_savepoint_db(conn, stage)
+
+
+def _stage_sim_feature_entry_binding(conn, entry_id, capsule, pair_digest):
+    import hashlib
+    from trading.candidate_feature_evidence import normalize_feature_capsule, build_feature_entry_binding
+    def stage():
+        normalized = normalize_feature_capsule(capsule, expected_entry_id=entry_id)
+        binding = build_feature_entry_binding(normalized, entry_pair_facts_sha256=pair_digest)
+        raw = _feature_encode_db(binding)
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        conn.execute("""INSERT INTO sim_feature_entry_bindings
+            (entry_id,schema_version,binding_json,capsule_json,facts_sha256) VALUES (?,1,?,?,?)""",
+            (entry_id, raw, _feature_encode_db(normalized), digest))
+        _read_feature_entry_fact_db(conn, entry_id)
+        try:
+            witness = _sim_availability_clock_witness()
+        except Exception:
+            witness = None
+        return digest, witness
+    return _stage_feature_savepoint_db(conn, stage)
+
+
+def _ack_feature_availability_db(conn, family, entry_id, digest, *, witness=None, recovery=False):
+    from trading.candidate_feature_evidence import CLOCK_BOUND_KIND, build_feature_receipt
+    if conn.in_transaction:
+        return False
+    timeout, began = None, False
+    table = _FEATURE_AVAILABILITY_TABLES[family]
+    try:
+        timeout = int(conn.execute("PRAGMA busy_timeout").fetchone()[0])
+        conn.execute("PRAGMA busy_timeout=100")
+        wall, mono = _sim_availability_clock_witness()
+        if witness is not None:
+            previous, observed = witness
+            if (not all(type(value) in (int, float) and math.isfinite(value) for value in witness)
+                    or previous <= 0 or mono < observed):
+                return False
+            wall = max(wall, previous + (mono - observed) * 1000)
+        conn.execute("BEGIN IMMEDIATE")
+        began = True
+        proof = _feature_proof_row_db(conn, family, entry_id)
+        if proof is None or proof["facts_sha256"] != digest or proof["state"] == "CONFLICT":
+            return False
+        try:
+            facts = (_read_candidate_feature_fact_db(conn, entry_id, proof) if family == "candidate"
+                     else _read_feature_entry_fact_db(conn, entry_id, proof))
+        except (KeyError, TypeError, ValueError, OverflowError, StopIteration):
+            conn.execute(f"UPDATE {table} SET state='CONFLICT' WHERE entry_id=?", (entry_id,))
+            conn.commit()
+            began = False
+            return False
+        if proof["state"] == "ACKED":
+            return proof["available_by_ms"] is not None and proof["clock_bound_kind"] == CLOCK_BOUND_KIND
+        minimum = _feature_minimum_db(family, facts)
+        if witness is None and wall < minimum:
+            return False
+        available = max(wall, minimum)
+        extra, values = "", []
+        if family == "candidate":
+            extra = ",receipt_json=?"
+            values.append(_feature_encode_db(build_feature_receipt(facts, available_by_ms=available)))
+        changed = conn.execute(f"""UPDATE {table} SET state='ACKED',available_by_ms=?,witness_kind=?,clock_bound_kind=?{extra}
+            WHERE entry_id=? AND facts_sha256=? AND state='PENDING' AND available_by_ms IS NULL""",
+            (available, "recovery_read" if recovery else "commit_ack", CLOCK_BOUND_KIND, *values, entry_id, digest))
+        conn.commit()
+        began = False
+        return changed.rowcount == 1
+    except Exception:
+        return False
+    finally:
+        if began:
+            try:
+                conn.rollback()
+            except Exception as exc:
+                _discard_feature_connection_db(conn, exc)
+        if timeout is not None:
+            try:
+                conn.execute(f"PRAGMA busy_timeout={timeout}")
+            except Exception:
+                pass
+
+
+def _finish_candidate_feature_availability(conn, entry_id, pending=None, *, family="candidate"):
+    try:
+        if pending is None:
+            row = _feature_proof_row_db(conn, family, entry_id)
+            if row is None or row["state"] != "PENDING":
+                return
+            digest, witness, recovery = row["facts_sha256"], None, True
+        else:
+            digest, witness = pending
+            recovery = False
+        _ack_feature_availability_db(conn, family, entry_id, digest, witness=witness, recovery=recovery)
+    except Exception:
+        pass
+
+
+def _recover_feature_availability_db(*, family, limit=5, producer_bots=None):
+    count = min(5, _positive_integer_db(limit, "feature availability recovery limit"))
+    bots = _markout_producer_bots_db(producer_bots)
+    if bots and "FUTURES" not in bots:
+        return 0
+    conn = get_connection()
+    if conn.in_transaction:
+        return 0
+    table = _FEATURE_AVAILABILITY_TABLES[family]
+    rows = conn.execute(f"SELECT entry_id,facts_sha256 FROM {table} WHERE state='PENDING' ORDER BY entry_id LIMIT ?", (count,)).fetchall()
+    return sum(bool(_ack_feature_availability_db(conn, family, entry_id, digest, recovery=True)) for entry_id, digest in rows)
+
+
+def recover_candidate_feature_availability(*, limit=5, producer_bots=None):
+    return _recover_feature_availability_db(family="candidate", limit=limit, producer_bots=producer_bots)
+
+
+def recover_sim_feature_entry_bindings(*, limit=5, producer_bots=None):
+    return _recover_feature_availability_db(family="entry", limit=limit, producer_bots=producer_bots)
+
+
+def _ensure_sim_trade_fragment_availability_schema(conn) -> None:
+    """A separate forward-only family; no legacy journal backfill."""
+    conn.execute("""CREATE TABLE IF NOT EXISTS sim_trade_fragment_availability (
+        trade_id INTEGER PRIMARY KEY REFERENCES trades(id) ON DELETE CASCADE,
+        schema_version INTEGER NOT NULL CHECK(schema_version=1),
+        entry_id TEXT NOT NULL,bot_name TEXT NOT NULL,is_sim INTEGER NOT NULL CHECK(is_sim=1),
+        facts_sha256 TEXT NOT NULL CHECK(length(facts_sha256)=64),
+        state TEXT NOT NULL DEFAULT 'PENDING' CHECK(state IN ('PENDING','ACKED','CONFLICT')),
+        available_by_ms REAL,witness_kind TEXT CHECK(witness_kind IN ('commit_ack','recovery_read')),
+        clock_bound_kind TEXT,
+        CHECK((available_by_ms IS NULL AND witness_kind IS NULL AND clock_bound_kind IS NULL)
+           OR (available_by_ms>0 AND witness_kind IS NOT NULL AND clock_bound_kind IS NOT NULL))
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sim_trade_fragment_pending "
+                 "ON sim_trade_fragment_availability(state,bot_name,trade_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sim_trade_fragment_entry "
+                 "ON sim_trade_fragment_availability(entry_id,available_by_ms,trade_id)")
+
+
+def _discard_sim_trade_fragment_connection(conn, primary) -> None:
+    _log_db_background_failure_preserving("rollback SIM fragment witness", primary, primary=primary)
+    try:
+        conn.close()
+    except Exception as close_error:
+        _log_db_background_failure_preserving("close failed SIM fragment handle", close_error, primary=primary)
+    finally:
+        if getattr(_conn_local, "conn", None) is conn:
+            del _conn_local.conn
+
+
+def _stage_sim_trade_fragment_availability(conn, trade_id):
+    """Optional staging shares the original trade/daily-PnL transaction."""
+    from trading.sim_trade_fragment_availability import (
+        read_trade_fragment_facts, trade_fragment_facts_digest,
+    )
+    if not conn.in_transaction:
+        raise sqlite3.OperationalError("trade fragment staging requires the original transaction")
+    saved = False
+    try:
+        conn.execute("SAVEPOINT sim_trade_fragment_stage")
+        saved = True
+        facts = read_trade_fragment_facts(conn, trade_id)
+        digest = trade_fragment_facts_digest(facts)
+        row = facts["trade"]
+        conn.execute("""INSERT INTO sim_trade_fragment_availability
+            (trade_id,schema_version,entry_id,bot_name,is_sim,facts_sha256)
+            VALUES (?,1,?,?,?,?)""",
+            (trade_id, row["entry_id"], row["bot_name"], row["is_sim"], digest))
+        try:
+            witness = _sim_availability_clock_witness()
+        except Exception:
+            witness = None
+        conn.execute("RELEASE sim_trade_fragment_stage")
+        return digest, witness
+    except Exception:
+        if not conn.in_transaction:
+            raise sqlite3.OperationalError("original trade transaction was lost during optional staging")
+        if saved:
+            # Failure here must reach the normal accounting error path. An
+            # uncertain/lost original transaction must never report success.
+            try:
+                conn.execute("ROLLBACK TO sim_trade_fragment_stage")
+                conn.execute("RELEASE sim_trade_fragment_stage")
+            except Exception as rollback_error:
+                _discard_sim_trade_fragment_connection(conn, rollback_error)
+                raise
+        return None
+
+
+def _ack_sim_trade_fragment_availability(conn, trade_id, expected_digest,
+                                        *, witness=None, recovery=False) -> bool:
+    """Optional separate CAS attests only already committed original rows."""
+    from trading.sim_evidence_availability import CLOCK_BOUND_KIND
+    from trading.sim_trade_fragment_availability import (
+        read_trade_fragment_facts, trade_fragment_facts_digest, trade_fragment_minimum_time_ms,
+    )
+    if conn.in_transaction:
+        return False
+    prior_timeout, began = None, False
+    try:
+        prior_timeout = int(conn.execute("PRAGMA busy_timeout").fetchone()[0])
+        conn.execute("PRAGMA busy_timeout=100")
+        wall, mono = _sim_availability_clock_witness()
+        if witness is not None:
+            previous_wall, previous_mono = witness
+            if (not all(type(value) in (int, float) and math.isfinite(value)
+                        for value in (previous_wall, previous_mono))
+                    or previous_wall <= 0 or mono < previous_mono):
+                return False
+            wall = max(wall, previous_wall + (mono - previous_mono) * 1000)
+        conn.execute("BEGIN IMMEDIATE")
+        began = True
+        proof = conn.execute("""SELECT facts_sha256,state,available_by_ms,entry_id,bot_name,is_sim,
+            clock_bound_kind FROM sim_trade_fragment_availability WHERE trade_id=?""", (trade_id,)).fetchone()
+        if proof is None or proof[0] != expected_digest or proof[1] == "CONFLICT":
+            return False
+        try:
+            facts = read_trade_fragment_facts(conn, trade_id)
+            row = facts["trade"]
+            matching = (trade_fragment_facts_digest(facts) == expected_digest
+                        and tuple(proof)[3:6] == tuple(row[key] for key in ("entry_id", "bot_name", "is_sim")))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            matching = False
+        if not matching:
+            conn.execute("UPDATE sim_trade_fragment_availability SET state='CONFLICT' WHERE trade_id=?", (trade_id,))
+            conn.commit()
+            began = False
+            return False
+        if proof[1] == "ACKED":
+            return proof[2] is not None and proof[6] == CLOCK_BOUND_KIND
+        minimum = trade_fragment_minimum_time_ms(facts)
+        if witness is None and wall < minimum:
+            return False
+        updated = conn.execute("""UPDATE sim_trade_fragment_availability
+            SET state='ACKED',available_by_ms=?,witness_kind=?,clock_bound_kind=?
+            WHERE trade_id=? AND facts_sha256=? AND state='PENDING' AND available_by_ms IS NULL""",
+            (max(wall, minimum), "recovery_read" if recovery else "commit_ack", CLOCK_BOUND_KIND,
+             trade_id, expected_digest))
+        conn.commit()
+        began = False
+        return updated.rowcount == 1
+    except Exception:
+        return False
+    finally:
+        if began:
+            try:
+                conn.rollback()
+            except Exception as rollback_error:
+                # An optional failed transaction may not retain a write lock
+                # or poison the thread's next genuine accounting operation.
+                _discard_sim_trade_fragment_connection(conn, rollback_error)
+        if prior_timeout is not None:
+            try:
+                conn.execute(f"PRAGMA busy_timeout={prior_timeout}")
+            except Exception:
+                pass
+
+
+def _finish_sim_trade_fragment_availability(conn, trade_id, pending=None, *, recovery=False) -> None:
+    try:
+        if pending is None:
+            # Dedup is a later read, never permission to invent original
+            # staging for a legacy row whose original commit was unwitnessed.
+            row = conn.execute("SELECT facts_sha256 FROM sim_trade_fragment_availability "
+                               "WHERE trade_id=? AND state='PENDING'", (trade_id,)).fetchone()
+            if row is None:
+                return
+            digest, witness = row[0], None
+            recovery = True
+        else:
+            digest, witness = pending
+        _ack_sim_trade_fragment_availability(conn, trade_id, digest, witness=witness, recovery=recovery)
+    except Exception:
+        # The original trade has already committed. This is not an accounting
+        # failure and must never replace its successful public return value.
+        pass
+
+
+def recover_sim_trade_fragment_availability(*, limit=25, producer_bots=None) -> int:
+    count = min(25, _positive_integer_db(limit, "trade fragment recovery limit"))
+    bots = _markout_producer_bots_db(producer_bots)
+    if bots and "FUTURES" not in bots:
+        return 0
+    conn = get_connection()
+    if conn.in_transaction:
+        return 0
+    rows = conn.execute("""SELECT trade_id,facts_sha256 FROM sim_trade_fragment_availability
+        WHERE state='PENDING' AND bot_name='FUTURES (SIM)' AND is_sim=1 ORDER BY trade_id LIMIT ?""",
+        (count,)).fetchall()
+    return sum(bool(_ack_sim_trade_fragment_availability(conn, identity, digest, recovery=True))
+               for identity, digest in rows)
+
+
+def _ensure_sim_execution_availability_schema(conn) -> None:
+    """Add only nullable post-commit witnesses; old facts remain unattested."""
+    conn.execute("""CREATE TABLE IF NOT EXISTS sim_execution_availability (
+        entry_id TEXT NOT NULL,
+        fact_key TEXT NOT NULL,
+        schema_version INTEGER NOT NULL CHECK(schema_version=1),
+        facts_sha256 TEXT NOT NULL CHECK(length(facts_sha256)=64),
+        state TEXT NOT NULL DEFAULT 'PENDING' CHECK(state IN ('PENDING','ACKED','CONFLICT')),
+        available_by_ms REAL,
+        witness_kind TEXT CHECK(witness_kind IN ('commit_ack','recovery_read')),
+        PRIMARY KEY(entry_id,fact_key),
+        FOREIGN KEY(entry_id) REFERENCES expectancy_candidates(entry_id) ON DELETE CASCADE,
+        CHECK((available_by_ms IS NULL AND witness_kind IS NULL)
+           OR (available_by_ms>0 AND witness_kind IS NOT NULL))
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sim_availability_pending "
+                 "ON sim_execution_availability(state,entry_id,fact_key)")
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(sim_execution_availability)")}
+    for field in ("bot_name", "mode", "venue", "market_type", "clock_bound_kind"):
+        if field not in columns:
+            try:
+                conn.execute(f"ALTER TABLE sim_execution_availability ADD COLUMN {field} TEXT")
+            except sqlite3.OperationalError:
+                if field not in {row[1] for row in conn.execute("PRAGMA table_info(sim_execution_availability)")}:
+                    raise
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_sim_availability_scope "
+                 "ON sim_execution_availability(bot_name,mode,venue,market_type,available_by_ms)")
+
+
+def _sim_availability_clock_witness():
+    from core.clock import availability_upper_bound_ms
+
+    bound = availability_upper_bound_ms()
+    if bound is None:
+        raise ValueError("SIM availability requires a measured exchange RTT upper bound")
+    wall, monotonic = float(bound), float(_time.monotonic())
+    if not math.isfinite(wall) or wall <= 0 or not math.isfinite(monotonic):
+        raise ValueError("invalid SIM availability clock witness")
+    return wall, monotonic
+
+
+def _stage_sim_execution_availability(conn, entry_id, fact_key):
+    """Stage the immutable digest inside the ORIGINAL facts transaction."""
+    from trading.sim_evidence_availability import (
+        read_sim_availability_facts, sim_availability_facts_digest,
+    )
+
+    try:
+        if not conn.in_transaction:
+            return None
+        facts = read_sim_availability_facts(conn, entry_id, fact_key)
+        digest = sim_availability_facts_digest(facts)
+        scope = facts.get("capture_scope") or {}
+        scope_values = tuple(scope.get(key) for key in ("bot_name", "mode", "venue", "market_type"))
+        conn.execute("""INSERT OR IGNORE INTO sim_execution_availability
+            (entry_id,fact_key,schema_version,facts_sha256,bot_name,mode,venue,market_type)
+            VALUES (?,?,1,?,?,?,?,?)""", (entry_id, fact_key, digest, *scope_values))
+        row = conn.execute("SELECT facts_sha256,bot_name,mode,venue,market_type FROM sim_execution_availability "
+                           "WHERE entry_id=? AND fact_key=?", (entry_id, fact_key)).fetchone()
+        if row is None or tuple(row) != (digest, *scope_values):
+            return None
+        try:
+            witness = _sim_availability_clock_witness()
+        except Exception:
+            witness = None
+        return digest, witness
+    except Exception:
+        # Telemetry without a complete digest remains diagnostic. It must not
+        # undo the independently valid original execution-evidence transaction.
+        return None
+
+
+def _ack_sim_execution_availability(conn, entry_id, fact_key, expected_digest,
+                                    *, witness=None, recovery=False) -> bool:
+    """Attest original facts AFTER their commit, in a separate bounded CAS.
+
+    The second transaction's own availability is not being backdated. This
+    later witness certifies only the availability of the original facts.
+    """
+    from trading.sim_evidence_availability import (
+        read_sim_availability_facts, sim_availability_facts_digest,
+        sim_availability_minimum_time_ms, CLOCK_BOUND_KIND,
+    )
+
+    if conn.in_transaction:
+        return False
+    prior_timeout = None
+    began = False
+    try:
+        prior_timeout = int(conn.execute("PRAGMA busy_timeout").fetchone()[0])
+        conn.execute("PRAGMA busy_timeout=100")
+        now_wall, now_mono = _sim_availability_clock_witness()
+        if witness is not None:
+            wall, mono = witness
+            if now_mono < mono:
+                return False
+            now_wall = max(now_wall, wall + (now_mono - mono) * 1000)
+        conn.execute("BEGIN IMMEDIATE")
+        began = True
+        facts = read_sim_availability_facts(conn, entry_id, fact_key)
+        if sim_availability_facts_digest(facts) != expected_digest:
+            conn.execute("UPDATE sim_execution_availability SET state='CONFLICT' "
+                         "WHERE entry_id=? AND fact_key=?", (entry_id, fact_key))
+            conn.commit()
+            began = False
+            return False
+        minimum = sim_availability_minimum_time_ms(facts)
+        if witness is None and now_wall < minimum:
+            return False
+        available = max(now_wall, minimum)
+        row = conn.execute("SELECT facts_sha256,state,available_by_ms,bot_name,mode,venue,market_type,clock_bound_kind FROM sim_execution_availability "
+                           "WHERE entry_id=? AND fact_key=?", (entry_id, fact_key)).fetchone()
+        if row is None or row[0] != expected_digest or row[1] == "CONFLICT":
+            return False
+        scope = facts.get("capture_scope") or {}
+        if tuple(row)[3:7] != tuple(scope.get(key) for key in ("bot_name", "mode", "venue", "market_type")):
+            raise ValueError("SIM availability frozen scope conflicts")
+        if row[1] == "ACKED":
+            return row[2] is not None and row[7] == CLOCK_BOUND_KIND
+        updated = conn.execute("""UPDATE sim_execution_availability
+            SET state='ACKED',available_by_ms=?,witness_kind=?,clock_bound_kind=?
+            WHERE entry_id=? AND fact_key=? AND facts_sha256=?
+              AND state='PENDING' AND available_by_ms IS NULL""",
+            (available, "recovery_read" if recovery else "commit_ack", CLOCK_BOUND_KIND,
+             entry_id, fact_key, expected_digest))
+        conn.commit()
+        began = False
+        return updated.rowcount == 1
+    except (KeyError, TypeError, ValueError, OverflowError):
+        if began:
+            try:
+                conn.execute("UPDATE sim_execution_availability SET state='CONFLICT' "
+                             "WHERE entry_id=? AND fact_key=? AND state='PENDING'", (entry_id, fact_key))
+                conn.commit()
+                began = False
+            except Exception:
+                pass
+        return False
+    except Exception:
+        return False
+    finally:
+        if began:
+            try:
+                conn.rollback()
+            except Exception as rollback_error:
+                _log_db_background_failure_preserving(
+                    "rollback SIM availability witness", rollback_error,
+                    primary=rollback_error,
+                )
+                # Only this optional transaction is affected. Do not let its
+                # failed rollback poison the next call on a cached handle.
+                try:
+                    conn.close()
+                except Exception as close_error:
+                    _log_db_background_failure_preserving(
+                        "close failed SIM availability handle", close_error,
+                        primary=rollback_error,
+                    )
+                finally:
+                    if getattr(_conn_local, "conn", None) is conn:
+                        del _conn_local.conn
+        if prior_timeout is not None:
+            try:
+                conn.execute(f"PRAGMA busy_timeout={prior_timeout}")
+            except Exception:
+                pass
+
+
+def _finish_sim_execution_availability(conn, entry_id, fact_key, pending) -> None:
+    if pending is None:
+        return
+    try:
+        digest, witness = pending
+        _ack_sim_execution_availability(conn, entry_id, fact_key, digest, witness=witness)
+    except Exception:
+        # Original facts already committed; a missing witness is not a failed fill.
+        pass
+
+
+def recover_sim_execution_availability(*, limit=25, producer_bots=None) -> int:
+    """Bounded conservative recovery in the existing execution worker."""
+    count = min(25, _positive_integer_db(limit, "SIM availability recovery limit"))
+    bots = _markout_producer_bots_db(producer_bots)
+    conn = get_connection()
+    if conn.in_transaction:
+        return 0
+    clause, values = "", []
+    if bots:
+        clause = " AND candidate.bot_name IN (" + ",".join("?" for _ in bots) + ")"
+        values.extend(bots)
+    rows = conn.execute("""SELECT proof.entry_id,proof.fact_key,proof.facts_sha256
+        FROM sim_execution_availability proof JOIN expectancy_candidates candidate
+          ON candidate.entry_id=proof.entry_id
+        WHERE proof.state='PENDING' AND candidate.mode='SIM'""" + clause
+        + " ORDER BY proof.entry_id,proof.fact_key LIMIT ?", (*values, count)).fetchall()
+    completed = 0
+    for entry_id, fact_key, digest in rows:
+        completed += bool(_ack_sim_execution_availability(
+            conn, entry_id, fact_key, digest, recovery=True))
+    # Two new optional families have a fixed extra budget of at most 5 each,
+    # also capped by the requested batch. The old V1 return count is unchanged.
+    for recover in (recover_candidate_feature_availability, recover_sim_feature_entry_bindings):
+        try:
+            recover(limit=min(5, count), producer_bots=producer_bots)
+        except Exception:
+            pass
+    return completed
+
+
+_SIM_TCA_BOTS = frozenset({"FUTURES", "CROSS", "FUTREND", "SPOT", "TREND"})
 
 
 def has_simulated_expectancy_candidate(entry_id: str, bot_name: str) -> bool:
@@ -12994,6 +13894,7 @@ def persist_simulated_entry_tca_bundle(
     arrival_payload: dict,
     fill_payload: dict,
     horizons: tuple[int, ...] = (1, 10, 60, 300, 900),
+    feature_capsule: dict | None = None,
 ) -> None:
     """Atomically persist one idempotent SIM execution-evidence bundle."""
     validated_entry_id = _causal_entry_id_db(entry_id, required=True)
@@ -13064,8 +13965,15 @@ def persist_simulated_entry_tca_bundle(
         init_db()
     conn = get_connection()
     inserted_markout = False
+    feature_binding_pending = None
     try:
         conn.execute("BEGIN IMMEDIATE")
+        feature_bundle_is_new = (feature_capsule is not None and conn.execute("""SELECT 1 FROM sim_execution_tca
+            WHERE entry_id=? AND stage IN ('arrival','fill') LIMIT 1""", (validated_entry_id,)).fetchone() is None
+            and conn.execute("SELECT 1 FROM candidate_microstructure WHERE entry_id=? AND stage='arrival_book' LIMIT 1",
+                             (validated_entry_id,)).fetchone() is None
+            and conn.execute("SELECT 1 FROM sim_execution_markouts WHERE entry_id=? LIMIT 1",
+                             (validated_entry_id,)).fetchone() is None)
         candidate = conn.execute(
             """SELECT symbol FROM expectancy_candidates
                 WHERE entry_id=? AND bot_name=? AND mode='SIM'""",
@@ -13203,6 +14111,14 @@ def persist_simulated_entry_tca_bundle(
                 inserted_markout = True
             elif tuple(existing) != expected:
                 raise ValueError("conflicting SIM markout evidence already exists")
+        availability_pending = _stage_sim_execution_availability(
+            conn, validated_entry_id, "entry_pair"
+        )
+        if feature_bundle_is_new and feature_capsule is not None and availability_pending is not None:
+            feature_binding_pending = _stage_sim_feature_entry_binding(
+                conn, validated_entry_id, feature_capsule, availability_pending[0])
+        if not conn.in_transaction:
+            raise ValueError("SIM evidence transaction lost before commit")
         conn.commit()
     except BaseException as exc:
         _rollback_transaction_preserving(
@@ -13211,6 +14127,11 @@ def persist_simulated_entry_tca_bundle(
             "SIM entry TCA bundle persistence",
         )
         raise
+    _finish_sim_execution_availability(
+        conn, validated_entry_id, "entry_pair", availability_pending
+    )
+    if normalized_bot == "FUTURES":
+        _finish_candidate_feature_availability(conn, validated_entry_id, feature_binding_pending, family="entry")
     if inserted_markout:
         _notify_markout_queue_changed()
 
@@ -13724,6 +14645,7 @@ def complete_simulated_execution_markout(
         measured_at,
     )
     conn = get_connection()
+    availability_pending = None
     try:
         conn.execute("BEGIN IMMEDIATE")
         pending = conn.execute(
@@ -13798,8 +14720,12 @@ def complete_simulated_execution_markout(
                 encoded,
                 require_measured_at_match=True,
             )
+            availability_pending = _stage_sim_execution_availability(
+                conn, str(entry_id), f"markout_{horizon}"
+            )
+        if not conn.in_transaction:
+            raise ValueError("SIM markout transaction lost before commit")
         conn.commit()
-        return cursor.rowcount == 1
     except BaseException as exc:
         _rollback_transaction_preserving(
             conn,
@@ -13807,6 +14733,10 @@ def complete_simulated_execution_markout(
             "SIM execution markout completion",
         )
         raise
+    _finish_sim_execution_availability(
+        conn, str(entry_id), f"markout_{horizon}", availability_pending
+    )
+    return cursor.rowcount == 1
 
 
 def fail_simulated_execution_markout(
@@ -14122,3 +15052,118 @@ def get_performance_metrics(bot_name: str, days: int = 30) -> dict:
         "trade_count":      n,
         "exposure_pct":     round(exposure_pct, 2),
     }
+
+
+def reset_cross_risk_epoch(
+    payload: str, *, mode_is_sim: bool, expected_old_sha256: str,
+    expected_trade_hwm: int, expected_state: dict, reason: str,
+    native_evidence: dict | None = None,
+) -> None:
+    """Administrative epoch reset, never historical-return reconstruction.
+
+    The supported caller must hold the official lifecycle lock and have proved
+    that project processes are stopped. LIVE native evidence is obtained by
+    that caller with the exact credential scope in this new payload. This
+    helper rechecks local files, claims, recovery and cursor under one write
+    transaction and commits the seed and its audit together.
+    """
+    import hashlib
+    from core.cross_bot import _decode_rebalance_state
+    from trading.cross_rebalance_evidence import (
+        cross_epoch_local_blockers, read_empty_cross_state_evidence,
+        validate_risk_evidence,
+    )
+
+    if type(mode_is_sim) is not bool:
+        raise ValueError("epoch mode must be explicit")
+    payload = _param_value_text_db(payload)
+    slot, history, crash_flat = _decode_rebalance_state(payload)
+    parsed = json.loads(payload)
+    risk = validate_risk_evidence(parsed.get("risk"))
+    if (parsed.get("schema") != 2 or slot < 0 or history or crash_flat
+            or risk["pending"] is not None or risk["reentry_slot"] is not None
+            or not risk["scope"].startswith("SIM:" if mode_is_sim else "LIVE:")):
+        raise ValueError("epoch reset requires a new empty risk history")
+    if (type(expected_trade_hwm) is not int or expected_trade_hwm < 0
+            or expected_trade_hwm > (1 << 63) - 1
+            or risk["cursor"] != expected_trade_hwm):
+        raise ValueError("epoch cursor is invalid")
+    if (not isinstance(expected_old_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected_old_sha256) is None):
+        raise ValueError("expected old payload hash is invalid")
+    if type(expected_state) is not dict or set(expected_state) != {
+        "trades.json", "trades.sim.json",
+    } or any(value is not None and (
+        not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
+    ) for value in expected_state.values()):
+        raise ValueError("expected file-state evidence is invalid")
+    reason = _required_text_db(reason, "epoch reset reason", max_length=400)
+
+    def require_native_freshness():
+        if mode_is_sim:
+            if native_evidence is not None:
+                raise ValueError("SIM reset must not claim private evidence")
+            return
+        if (type(native_evidence) is not dict or set(native_evidence) != {
+            "scope", "observed_monotonic",
+        } or native_evidence["scope"] != risk["scope"]):
+            raise ValueError("LIVE credential evidence is missing")
+        observed = native_evidence["observed_monotonic"]
+        now = _steady_monotonic()
+        if (type(observed) not in (int, float) or not math.isfinite(observed)
+                or type(now) not in (int, float) or not math.isfinite(now)
+                or not 0 <= now - observed <= 5.0):
+            raise ValueError("LIVE reset evidence is stale")
+
+    require_native_freshness()
+    conn = get_connection()
+    if conn.in_transaction:
+        raise ValueError("epoch reset requires an independent transaction")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        old_row = conn.execute(
+            """SELECT LENGTH(param_value) AS n,SUBSTR(param_value,1,65537) AS param_value
+               FROM bot_params WHERE bot_name='CROSS' AND param_name='REBALANCE_STATE_V2'""",
+        ).fetchone()
+        old = "" if old_row is None else old_row["param_value"]
+        if (type(old) is not str or len(old) > 65_536
+                or (old_row is not None and (type(old_row["n"]) is not int
+                                             or old_row["n"] > 65_536))):
+            raise ValueError("old risk payload is not bounded text")
+        if hashlib.sha256(old.encode("utf-8")).hexdigest() != expected_old_sha256:
+            raise ValueError("old risk payload changed")
+        hwm = conn.execute("SELECT COALESCE(MAX(id),0) FROM trades").fetchone()[0]
+        if type(hwm) is not int or hwm != expected_trade_hwm:
+            raise ValueError("trade journal changed")
+        if cross_epoch_local_blockers(conn, simulation=mode_is_sim):
+            raise ValueError("local positions or recovery remain")
+        if read_empty_cross_state_evidence() != expected_state:
+            raise ValueError("file-state evidence changed")
+        now_text = _utcnow_str()
+        conn.execute(
+            """INSERT INTO bot_params(bot_name,param_name,param_value,updated_at,reason)
+               VALUES('CROSS','REBALANCE_STATE_V2',?,?,?)
+               ON CONFLICT(bot_name,param_name) DO UPDATE SET
+                 param_value=excluded.param_value,updated_at=excluded.updated_at,
+                 reason=excluded.reason""",
+            (payload, now_text, "explicit administrative CROSS risk epoch reset"),
+        )
+        conn.execute(
+            """INSERT INTO learning_log(timestamp,bot_name,action,param_name,
+                      old_value,new_value,reason,trades_analyzed)
+               VALUES(?,?,'CROSS_RISK_EPOCH_RESET','REBALANCE_STATE_V2',?,?,?,0)""",
+            (now_text, "CROSS (SIM)" if mode_is_sim else "CROSS",
+             expected_old_sha256, hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+             "New administrative epoch; prior returns unverified. " + reason),
+        )
+        require_native_freshness()
+        if read_empty_cross_state_evidence() != expected_state:
+            raise ValueError("file-state evidence changed before commit")
+        with _PARAM_CACHE_LOCK:
+            key = ("CROSS", "REBALANCE_STATE_V2")
+            _PARAM_CACHE_EPOCHS[key] = _PARAM_CACHE_EPOCHS.get(key, 0) + 1
+            _PARAM_CACHE.pop(key, None)
+            conn.commit()
+    except BaseException as exc:
+        _rollback_transaction_preserving(conn, exc, "CROSS risk epoch reset")
+        raise

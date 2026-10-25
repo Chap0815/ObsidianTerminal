@@ -13,8 +13,8 @@ reuses ScanMixin._place_buy_order; the sell path reuses
 ExitsMixin._execute_full_exit  so order placement, fills, fees, PnL, SIM and
 state removal are exactly the proven spot machinery.
 
-Cadence is daily-ish (TREND_CHECK_HOURS, default 12h)  the signal only changes
-on new daily candles, so there is nothing to gain from scanning faster.
+Trend signals use TREND_CHECK_HOURS (default 12h). Recovery, the disaster
+brake and daily-loss protection run on the existing fast monitor cadence.
 """
 from __future__ import annotations
 
@@ -73,6 +73,47 @@ class TrendBot(SpotBot):
             hours = 12.0
         return int(hours) * 3600
 
+    def _monitor_interval_sec(self) -> int:
+        # Match Spot's existing runtime scheduler bounds; strategy candle
+        # cadence remains independently controlled by TREND_CHECK_HOURS.
+        try:
+            raw = self.C("MONITOR_INTERVAL", self.DEFAULT_MONITOR_INTERVAL)
+            if isinstance(raw, bool):
+                return self.DEFAULT_MONITOR_INTERVAL
+            interval = float(raw)
+            if math.isfinite(interval) and interval.is_integer() and 5 <= interval <= 600:
+                return int(interval)
+        except Exception:
+            pass
+        return self.DEFAULT_MONITOR_INTERVAL
+
+    def _is_in_cooldown(self, sym: str) -> bool:
+        try:
+            from trading.cooldown_utils import check_in_cooldown
+            return check_in_cooldown(getattr(self, "cool", None), sym)
+        except Exception:
+            return True
+
+    def _place_buy_order_with_runtime_guard(self, sym, row, trade_usdt, *, entry_id):
+        # The order engine invokes this guard at its actual submit boundary,
+        # after quote/admission work may have raced a freshly completed stop.
+        missing = object()
+        previous = getattr(self, "_active_entry_pre_submit_guard", missing)
+        self._active_entry_pre_submit_guard = lambda: (
+            self._entry_pre_submit_allowed() is True
+            and self._is_in_cooldown(sym) is False
+        )
+        try:
+            return self._place_buy_order(sym, row, trade_usdt, entry_id=entry_id)
+        finally:
+            if previous is missing:
+                try:
+                    del self._active_entry_pre_submit_guard
+                except AttributeError:
+                    pass
+            else:
+                self._active_entry_pre_submit_guard = previous
+
     #  Market data 
 
     def _get_daily_closes(self, sym: str, need: int) -> List[float]:
@@ -85,11 +126,21 @@ class TrendBot(SpotBot):
         cache_age = cache_now - ent[0] if ent else None
         if (
             ent
+            and len(ent) == 3
             and cache_age is not None
             and 0 <= cache_age < self.DAILY_CACHE_TTL_SEC
             and len(ent[1]) >= need
         ):
-            return ent[1]
+            try:
+                from core.clock import now_ms as _clock_now_ms
+                current_bucket = int(_clock_now_ms()) // 86_400_000
+            except Exception as exc:
+                self._log_error(f"trend cached candle clock {sym}", exc)
+                return []
+            # The latest completed daily candle changes at UTC midnight even
+            # when this process's monotonic cache TTL has not expired yet.
+            if ent[2] == current_bucket:
+                return ent[1]
         try:
             reservation = try_consume_api_call(
                 "trend_fetch_ohlcv",
@@ -144,7 +195,7 @@ class TrendBot(SpotBot):
         except Exception as e:
             self._log_error(f"trend fetch_ohlcv {sym}", e)
             return []
-        cache[sym] = (cache_now, closes)
+        cache[sym] = (cache_now, closes, current_time_ms // 86_400_000)
         return closes
 
     def _current_price(self, sym: str) -> float:
@@ -382,6 +433,9 @@ class TrendBot(SpotBot):
         for sym in universe:
             if self._shutdown_event.is_set():
                 return
+            if self._is_in_cooldown(sym):
+                parts.append(f"{sym} cooldown")
+                continue
             held = self.state.has(sym)
             in_trend, votes, detail = self._evaluate(sym, held=held, p=p)
             # Leeres detail = _evaluate hat den Insufficient-Data-Guard getroffen
@@ -533,6 +587,11 @@ class TrendBot(SpotBot):
                         reason="entry_admission",
                     )
                     continue
+            if self._is_in_cooldown(sym):
+                emit_entry_lifecycle(entry_id, bot=self.BOT_NAME, symbol=sym,
+                                     stage="blocked", mode=entry_mode,
+                                     reason="cooldown_recheck")
+                continue
             if not self.simulation:
                 from core.database import claim_symbol_for_entry
                 if not claim_symbol_for_entry(
@@ -560,22 +619,22 @@ class TrendBot(SpotBot):
                     )
                     continue
             _trend_claimed = not self.simulation
-            emit_entry_lifecycle(
-                entry_id,
-                bot=self.BOT_NAME,
-                symbol=sym,
-                stage="order_attempt",
-                mode=entry_mode,
-            )
             from core.spot_bot_scan import SpotBuyOutcomeUnknown
 
+            blocked_by_cooldown = False
             try:
-                entry = self._place_buy_order_with_runtime_guard(
-                    sym,
-                    {"price": price},
-                    coin_size,
-                    entry_id=entry_id,
-                )
+                if self._is_in_cooldown(sym):
+                    blocked_by_cooldown = True
+                    entry = None
+                    emit_entry_lifecycle(entry_id, bot=self.BOT_NAME, symbol=sym,
+                                         stage="blocked", mode=entry_mode,
+                                         reason="cooldown_recheck")
+                else:
+                    emit_entry_lifecycle(entry_id, bot=self.BOT_NAME, symbol=sym,
+                                         stage="order_attempt", mode=entry_mode)
+                    entry = self._place_buy_order_with_runtime_guard(
+                        sym, {"price": price}, coin_size, entry_id=entry_id,
+                    )
             except SpotBuyOutcomeUnknown as _buy_exc:
                 self._mark_spot_entry_recovery_pending(_buy_exc.client_order_id)
                 emit_entry_lifecycle(
@@ -626,14 +685,12 @@ class TrendBot(SpotBot):
                 # unresolved post-submit recovery.
                 raise
             if entry is None:
-                emit_entry_lifecycle(
-                    entry_id,
-                    bot=self.BOT_NAME,
-                    symbol=sym,
-                    stage="order_failed",
-                    mode=entry_mode,
-                    reason="no_verified_fill",
-                )
+                if not blocked_by_cooldown:
+                    emit_entry_lifecycle(
+                        entry_id, bot=self.BOT_NAME, symbol=sym,
+                        stage="order_failed", mode=entry_mode,
+                        reason="no_verified_fill",
+                    )
                 if _trend_claimed:
                     released = self._release_entry_claim_if_untracked(
                         sym,
@@ -842,45 +899,115 @@ class TrendBot(SpotBot):
 
     def _monitor_loop(self):
         from core.logger import log_event
-        interval = self._check_interval_sec()
-        log_event(f"Trend monitor-loop started (every {interval/3600:.1f}h)",
+        interval = self._monitor_interval_sec()
+        log_event(f"Trend safety monitor started (every {interval}s)",
                   "INFO")
+        last_trend_check = None
+        last_trend_attempt = None
+        last_killswitch_check = None
         while not self._shutdown_event.is_set():
-            interval = self._check_interval_sec()
+            interval = self._monitor_interval_sec()
+            now = None
+            evaluate_trend = False
             try:
-                self._trend_killswitch()
-                self._trend_exit_pass()
+                current = _time.monotonic()
+                if isinstance(current, bool) or not math.isfinite(current):
+                    raise ValueError("invalid monotonic scheduler clock")
+                now = current
+                trend_interval = self._check_interval_sec()
+                evaluate_trend = (
+                    last_trend_check is None or now < last_trend_check
+                    or now - last_trend_check >= trend_interval
+                )
+                # Unknown daily evidence must not consume the strategy slot,
+                # but retrying every fast safety tick would waste API budget.
+                if (evaluate_trend and last_trend_attempt is not None
+                        and now >= last_trend_attempt
+                        and now - last_trend_attempt < 60.0):
+                    evaluate_trend = False
             except Exception as e:
-                log_event(f"Trend monitor error: {e}", "WARN")
-                self._log_error("trend monitor", e)
+                self._log_error("trend candle scheduler", e)
+            if (now is None or last_killswitch_check is None
+                    or now < last_killswitch_check or now - last_killswitch_check >= 60):
+                try:
+                    self._trend_killswitch()
+                    last_killswitch_check = now
+                except Exception as e:
+                    self._log_error("trend killswitch", e)
+            try:
+                if evaluate_trend:
+                    last_trend_attempt = now
+                completed = self._trend_exit_pass(evaluate_trend=evaluate_trend)
+                if evaluate_trend and completed is True:
+                    last_trend_check = now
+            except Exception as e:
+                self._log_error("trend safety monitor", e)
             if self._shutdown_event.wait(timeout=interval):
                 return
 
-    def _trend_exit_pass(self):
+    def _trend_exit_pass(self, *, evaluate_trend: bool = True) -> bool:
         from core.logger import log_event
-        p = self._trend_params()
-        disaster = safe_stop_loss_pct(
-            self.C("INITIAL_STOP_LOSS", -30.0), -30.0
-        )
-        for sym in list(self.state.keys()):
-            if self._shutdown_event.is_set():
-                return
+        p = None
+        completed = True
+        if evaluate_trend:
             try:
-                self._trend_exit_one(sym, p, disaster)
+                p = self._trend_params()
             except Exception as e:
+                evaluate_trend = False
+                completed = False
+                self._log_error("trend signal parameters", e)
+        try:
+            raw_disaster = self.C("INITIAL_STOP_LOSS", -30.0)
+        except Exception as e:
+            raw_disaster = -30.0
+            self._log_error("trend disaster-stop config", e)
+        disaster = safe_stop_loss_pct(raw_disaster, -30.0)
+        symbols = list(self.state.keys())
+        self._prune_spot_price_unavailable(dict.fromkeys(symbols))
+        for sym in symbols:
+            if self._shutdown_event.is_set():
+                return False
+            try:
+                result = self._trend_exit_one(sym, p, disaster, evaluate_trend=evaluate_trend)
+                if result is not True:
+                    completed = False
+            except Exception as e:
+                completed = False
                 log_event(
                     f"Trend exit {sym} failed: {type(e).__name__}",
                     "WARN",
                 )
                 self._log_error(f"trend exit {sym}", e)
+        return completed
 
-    def _trend_exit_one(self, sym: str, p, disaster: float) -> None:
+    def _trend_exit_one(self, sym: str, p, disaster: float, *, evaluate_trend: bool = True) -> bool:
         from core.logger import log_event
+        from bot_utils.trade_state import same_position_generation
 
+        if self._shutdown_event.is_set():
+            return False
         d = self.state.get(sym)
-        if not d or self._handle_exit_recovery_gate(sym, d):
-            return
-        curr = self._current_price(sym)
+        if not d:
+            return True
+        d = dict(d)
+        if self._handle_exit_recovery_gate(sym, d):
+            return False
+        fresh = self.state.get(sym)
+        if (self._shutdown_event.is_set() or not isinstance(fresh, dict)
+                or not (same_position_generation(fresh, d) or fresh == d)):
+            return False
+        d = dict(fresh)
+        # Held-position protection reuses the existing Spot exit-critical quote
+        # policy. Entry prices and daily candles retain normal budget admission.
+        curr = self._get_current_price(sym, {}, position=d)
+        fresh = self.state.get(sym)
+        if (self._shutdown_event.is_set() or not isinstance(fresh, dict)
+                or not (same_position_generation(fresh, d) or fresh == d)):
+            return False
+        if curr <= 0:
+            self._note_spot_price_unavailable(sym, log_event)
+            return False
+        self._clear_spot_price_unavailable(sym, log_event)
         buy = float(d.get("buy", 0) or 0)
 
         # Disaster brake: hard stop far below entry (flash-crash / gap
@@ -891,14 +1018,19 @@ class TrendBot(SpotBot):
             log_event(f" Trend disaster-stop {sym}: "
                       f"{(curr/buy-1)*100:.1f}% <= {disaster:.0f}%", "WARN")
             self._execute_full_exit(sym, d, curr, "Disaster stop")
-            return
+            return not bool(self.state.get(sym))
 
-        in_trend, votes, _ = self._evaluate(sym, held=True, p=p)
-        if in_trend or curr <= 0:
-            return
+        if not evaluate_trend:
+            return True
+        in_trend, votes, detail = self._evaluate(sym, held=True, p=p)
+        if not detail or curr <= 0:
+            return False
+        if in_trend:
+            return True
         log_event(f" Trend EXIT {sym}  out of trend ({votes}/3 votes)",
                   "INFO")
         self._execute_full_exit(sym, d, curr, f"Trend exit ({votes}/3 votes)")
+        return not bool(self.state.get(sym))
 
     def _trend_killswitch(self):
         """Simple daily-loss killswitch (spot, no leverage  no liquidation, so

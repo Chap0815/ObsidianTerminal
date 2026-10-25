@@ -162,7 +162,8 @@ def fetch_or_estimate_funding(ex,
                                 notional_usdt: float,
                                 pos_type: str,
                                 fallback_state_value: float = 0.0,
-                                until_time_str: str | None = None) -> Optional[float]:
+                                until_time_str: str | None = None,
+                                *, _resolution_evidence: dict | None = None) -> Optional[float]:
     """Best-effort funding amount paid since trade open, in USDT.
 
     Strategy:
@@ -176,6 +177,8 @@ def fetch_or_estimate_funding(ex,
       SHORT +rate  shorts receive  negative return ( -raw)
       SHORT -rate  shorts pay  positive return ( -raw)
     """
+    if isinstance(_resolution_evidence, dict):
+        _resolution_evidence.clear()
     normalized_notional = _finite_float_or_none(notional_usdt)
     if normalized_notional is None or normalized_notional <= 0.0:
         return None
@@ -197,10 +200,14 @@ def fetch_or_estimate_funding(ex,
         until_time_str=until_time_str,
         notional_usdt=normalized_notional,
         _history_evidence=history_evidence,
+        _expected_position_type=normalized_position_type,
     )
     if realized is not None:
         if realized != 0.0 or history_evidence.get("has_matching_events") is True:
+            if isinstance(_resolution_evidence, dict):
+                _resolution_evidence.update(history_evidence)
             return realized
+        model_evidence = {}
         estimated = estimate_funding_paid(
             ex,
             symbol_full,
@@ -209,7 +216,10 @@ def fetch_or_estimate_funding(ex,
             normalized_position_type,
             fallback_state_value,
             until_time_str=until_time_str,
+            _model_evidence=model_evidence,
         )
+        if isinstance(_resolution_evidence, dict) and model_evidence:
+            _resolution_evidence.update(model_evidence, source="public_current_rate_schedule")
         return (
             estimated
             if funding_amount_is_plausible(estimated, normalized_notional)
@@ -222,6 +232,7 @@ def fetch_or_estimate_funding(ex,
         and funding_amount_is_plausible(fallback, normalized_notional)
     ):
         return fallback
+    model_evidence = {}
     estimated = estimate_funding_paid(
         ex,
         symbol_full,
@@ -230,7 +241,10 @@ def fetch_or_estimate_funding(ex,
         normalized_position_type,
         fallback_state_value=0.0,
         until_time_str=until_time_str,
+        _model_evidence=model_evidence,
     )
+    if isinstance(_resolution_evidence, dict) and model_evidence:
+        _resolution_evidence.update(model_evidence, source="public_current_rate_schedule")
     return (
         estimated
         if funding_amount_is_plausible(estimated, normalized_notional)
@@ -246,7 +260,8 @@ def fetch_realized_funding(ex,
                              until_time_str: str | None = None,
                              notional_usdt: float | None = None,
                              *,
-                             _history_evidence: dict | None = None) -> Optional[float]:
+                             _history_evidence: dict | None = None,
+                             _expected_position_type: str | None = None) -> Optional[float]:
     """Fetch sum of funding payments from exchange API.
 
     Returns:
@@ -279,6 +294,23 @@ def fetch_realized_funding(ex,
     except Exception:
         return None
 
+    # Pinned MEXC fetch_funding_history ignores ``since`` and only forwards
+    # native params. Freeze one query window and page explicitly; never infer
+    # an oldest/newest ordering from the adapter's unchanged resultList.
+    native_mexc = getattr(ex, "id", None) == "mexc"
+    native_until = until_ms
+    if native_mexc and native_until is None:
+        try:
+            from core.clock import now_ms
+            observed = _finite_float_or_none(now_ms())
+            if observed is None or observed < since_ms:
+                return None
+            native_until = int(observed)
+        except Exception:
+            return None
+    if native_mexc:
+        until_ms = native_until
+
     try:
         max_pages = int(os.getenv("FUNDING_HISTORY_MAX_PAGES", "10"))
         max_pages = min(max(max_pages, 1), 50)
@@ -291,6 +323,7 @@ def fetch_realized_funding(ex,
     seen_fallback_keys: set[tuple[int, float, str]] = set()
     unverifiable_row = False
     pagination_complete = False
+    position_side_verified = _expected_position_type in {"LONG", "SHORT"}
 
     def _record_page_error(reservation) -> None:
         if not isinstance(reservation, ApiCallReservation):
@@ -313,11 +346,15 @@ def fetch_realized_funding(ex,
         if not reservation:
             return None
         try:
-            page = fn(
-                symbol_full,
-                since=next_since,
-                limit=_FUNDING_HISTORY_PAGE_LIMIT,
-            )
+            options = {}
+            if native_mexc:
+                native_params = {"page_num": _page + 1, "start_time": since_ms,
+                                 "end_time": native_until}
+                if _expected_position_type in {"LONG", "SHORT"}:
+                    native_params["position_type"] = 1 if _expected_position_type == "LONG" else 2
+                options["params"] = native_params
+            page = fn(symbol_full, since=next_since,
+                      limit=_FUNDING_HISTORY_PAGE_LIMIT, **options)
         except Exception:
             _record_page_error(reservation)
             return None
@@ -343,7 +380,8 @@ def fetch_realized_funding(ex,
             amt = _finite_float_or_none(h.get("amount"))
             ts = h.get("timestamp")
             try:
-                ts_i = int(ts) if ts is not None and not isinstance(ts, bool) else None
+                parsed_ts = _finite_float_or_none(ts)
+                ts_i = int(parsed_ts) if parsed_ts is not None and parsed_ts > 0 and parsed_ts.is_integer() else None
             except Exception:
                 ts_i = None
             if amt is None or ts_i is None:
@@ -353,9 +391,24 @@ def fetch_realized_funding(ex,
             if ts_i < since_ms or (until_ms is not None and ts_i > until_ms):
                 continue
             info = h.get("info") if isinstance(h.get("info"), dict) else {}
-            raw_event_id = h.get("id")
+            if _expected_position_type in {"LONG", "SHORT"}:
+                side = h.get("positionSide")
+                side = side.upper() if isinstance(side, str) else None
+                if getattr(ex, "id", None) == "mexc":
+                    native_side = info.get("positionType")
+                    side = {1: "LONG", 2: "SHORT"}.get(native_side) if type(native_side) is int else None
+                if side not in {"LONG", "SHORT"}:
+                    position_side_verified = False
+                elif side != _expected_position_type:
+                    continue
+            # MEXC's pinned adapter parses the numeric id as a float, which can
+            # lose 64-bit identifiers. Keep the native raw integer/string.
+            raw_event_id = info.get("id") if native_mexc else h.get("id")
             if raw_event_id is None:
                 raw_event_id = info.get("id")
+            if native_mexc and raw_event_id is None:
+                unverifiable_row = True
+                continue
             if raw_event_id is not None:
                 event_id = order_id_text_or_none(raw_event_id)
                 if event_id is None:
@@ -383,9 +436,14 @@ def fetch_realized_funding(ex,
         if unverifiable_row:
             _record_page_error(reservation)
             return None
-        if len(page) < 50:
+        if len(page) < _FUNDING_HISTORY_PAGE_LIMIT:
             pagination_complete = True
             break
+        if native_mexc:
+            # A full page of opposite-side/out-of-window rows is still a full
+            # native page. Only a real short/empty page establishes completion;
+            # a capped, denied or repeatedly ignored page never publishes sums.
+            continue
         if added == 0 or max_ts <= next_since:
             break
         next_since = max_ts + 1
@@ -408,6 +466,18 @@ def fetch_realized_funding(ex,
         # validated. A real zero (including offsetting credits/debits) must not
         # be replaced by an estimate intended for an empty adapter response.
         _history_evidence["has_matching_events"] = bool(history)
+        import hashlib
+        import json
+
+        rows = sorted((int(h["timestamp"]), float(h["amount"])) for h in history)
+        _history_evidence.update(
+            source="private_account_payments",
+            observed_settlements=len({row[0] for row in rows}),
+            source_sha256=hashlib.sha256(json.dumps(
+                rows, separators=(",", ":"), allow_nan=False,
+            ).encode("utf-8")).hexdigest(),
+            position_side_verified=position_side_verified,
+        )
     return total
 
 
@@ -465,7 +535,8 @@ def estimate_funding_paid(ex,
                             notional_usdt: float,
                             pos_type: str = "LONG",
                             fallback_state_value: float = 0.0,
-                            until_time_str: str | None = None) -> Optional[float]:
+                            until_time_str: str | None = None,
+                            *, _model_evidence: dict | None = None) -> Optional[float]:
     """Estimate funding when history API returns empty.
 
     Requires the SDK's explicit interval and settlement timestamp. Unknown
@@ -473,6 +544,8 @@ def estimate_funding_paid(ex,
     Position held within one verified settlement window: returns 0.0.
     Position that crossed N settlements:  notional  rate  N.
     """
+    if isinstance(_model_evidence, dict):
+        _model_evidence.clear()
     if not isinstance(symbol_full, str) or not symbol_full.strip():
         return None
     normalized_position_type = _funding_position_type(pos_type)
@@ -528,6 +601,21 @@ def estimate_funding_paid(ex,
     n_settlements = count_funding_settlements(
         ts_open, ts_close, interval_sec=schedule[0], anchor_sec=schedule[1]
     )
+    if isinstance(_model_evidence, dict):
+        import hashlib
+        import json
+
+        payload = {
+            "symbol": symbol_full, "funding_rate": funding_rate_dec,
+            "interval_sec": schedule[0], "anchor_sec": schedule[1],
+            "modeled_settlements": n_settlements,
+        }
+        _model_evidence.update(
+            modeled_settlements=n_settlements,
+            source_sha256=hashlib.sha256(json.dumps(
+                payload, sort_keys=True, separators=(",", ":"), allow_nan=False,
+            ).encode("utf-8")).hexdigest(),
+        )
     if n_settlements == 0:
         return 0.0
     # Epsilon comparison  exchanges occasionally return microscopic rates
@@ -539,6 +627,176 @@ def estimate_funding_paid(ex,
     if normalized_position_type == "LONG":
         return raw
     return -raw
+
+
+def freeze_funding_close_time(state, symbol: str, row: dict,
+                              close_time: str, *, is_partial: bool = False) -> str | None:
+    """Persist the observed execution cutoff before any funding I/O or retry."""
+    from bot_utils.trade_state import same_position_generation, update_many_if_current
+
+    field = "funding_partial_close_time" if is_partial else "funding_close_time"
+    frozen = row.get(field)
+    selected_time = frozen if frozen is not None else close_time
+    for value in (row.get("buy_time"), selected_time):
+        if type(value) is not str or len(value) != 19:
+            return None
+        try:
+            if datetime.strptime(value, "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%d %H:%M:%S") != value:
+                return None
+        except ValueError:
+            return None
+    opened = _utc_ms_or_none(row.get("buy_time"))
+    cutoff = _utc_ms_or_none(selected_time)
+    if opened is None or cutoff is None or cutoff < opened:
+        return None
+    try:
+        # A failed state save may already have changed RAM. Re-ACK the exact
+        # cutoff even when present; mere memory presence is not durability.
+        if not update_many_if_current(state, symbol, {field: selected_time}, row):
+            return None
+        getter = getattr(state, "get", None)
+        if callable(getter):
+            current = getter(symbol)
+            if (
+                not isinstance(current, dict)
+                or not same_position_generation(current, row)
+                or current.get(field) != selected_time
+            ):
+                return None
+        row[field] = selected_time
+        return selected_time
+    except Exception:
+        return None
+
+
+def sim_fragment_funding(ex, *, bot_name: str, symbol: str, row: dict,
+                         sell_time: str, closed_amount: float, contract_size: float,
+                         is_partial: bool = False, exchange_order_id=None) -> tuple[float, dict]:
+    """Model only this closed quantity's lifetime; never query real payments.
+
+    A fragment held from entry through its own close owes its own notional at
+    each crossed settlement. Earlier fragments' booked costs are diagnostics,
+    not another subtraction from this independently modelled quantity.
+    """
+    from trading.funding_evidence import build_funding_evidence
+
+    amount = _finite_float_or_none(closed_amount)
+    size = _finite_float_or_none(contract_size)
+    entry = _finite_float_or_none(row.get("buy"))
+    original = _finite_float_or_none(row.get("original_amount", row.get("amount")))
+    base_quantity = amount * size if amount is not None and size is not None and amount > 0 and size > 0 else None
+    position_quantity = original * size if original is not None and size is not None and original > 0 and size > 0 else None
+    notional = base_quantity * entry if base_quantity is not None and entry is not None and entry > 0 else None
+    current_amount = _finite_float_or_none(row.get("amount"))
+    margin = _finite_float_or_none(row.get("invested_usdt"))
+    leverage = _finite_float_or_none(row.get("leverage"))
+    current_notional = margin * leverage if margin is not None and leverage is not None and margin > 0 and leverage > 0 else None
+    bounded_notional = (
+        current_notional * amount / current_amount
+        if current_notional is not None and amount is not None and current_amount is not None and current_amount > 0
+        else None
+    )
+    # Legacy paper states can contain coin/contract unit corruption. A new
+    # funding model must not resurrect costs already rejected by accounting.
+    if (
+        notional is not None and bounded_notional is not None
+        and not math.isclose(notional, bounded_notional, rel_tol=1e-6, abs_tol=1e-4)
+    ):
+        notional = None
+        base_quantity = position_quantity = None
+    model = {}
+    estimate = None
+    if notional is not None:
+        try:
+            estimate = estimate_funding_paid(
+                ex, f"{symbol}/USDT:USDT", row.get("buy_time"), notional,
+                row.get("position_type", "LONG"), until_time_str=sell_time,
+                _model_evidence=model,
+            )
+        except Exception:
+            estimate = None
+    known = bool(model) and funding_amount_is_plausible(estimate, notional)
+    # Preserve the existing numeric accounting placeholder when public inputs
+    # are unavailable, but explicitly forbid interpreting it as measured zero.
+    fallback = _finite_float_or_none(row.get("funding_paid")) or 0.0
+    if amount is not None and original is not None and original > 0:
+        fallback *= min(1.0, max(0.0, amount / original))
+    booked = float(estimate) if known else fallback
+    if not funding_amount_is_plausible(booked, bounded_notional if bounded_notional is not None else notional):
+        booked = 0.0
+    evidence = build_funding_evidence(
+        status="estimated_public_model" if known else "unknown",
+        bot_name=bot_name, mode_is_sim=True, symbol=symbol,
+        entry_id=row.get("entry_id"), buy_time=row.get("buy_time"),
+        sell_time=sell_time, is_partial=is_partial,
+        exchange_order_id=exchange_order_id,
+        cost_usdt=float(estimate) if known else None, booked_cost_usdt=booked,
+        source="public_current_rate_schedule" if known else "unavailable",
+        model_basis="entry_notional_current_rate_schedule_v1" if known else "unknown",
+        coverage_complete=known,
+        observed_settlements=0,
+        source_sha256=model.get("source_sha256"),
+        fragment_base_quantity=base_quantity, pos_base_quantity=position_quantity,
+        previously_booked_cost_usdt=(
+            _finite_float_or_none(row.get("funding_booked_on_partials"))
+            if row.get("funding_booked_on_partials_known") is True else None
+        ),
+    )
+    return booked, evidence
+
+
+def live_close_funding_evidence(*, bot_name: str, symbol: str, row: dict,
+                                sell_time: str, closed_amount: float,
+                                contract_size: float, booked_cost: float,
+                                resolution: dict, exchange_order_id=None,
+                                is_partial: bool = False) -> dict:
+    """Certify only a fully bound, whole-position account payment result."""
+    from trading.funding_evidence import build_funding_evidence
+
+    amount = _finite_float_or_none(closed_amount)
+    size = _finite_float_or_none(contract_size)
+    original = _finite_float_or_none(row.get("original_amount", row.get("amount")))
+    fragment = amount * size if amount is not None and size is not None and amount > 0 and size > 0 else None
+    position = original * size if original is not None and size is not None and original > 0 and size > 0 else None
+    previous = _finite_float_or_none(row.get("funding_booked_on_partials")) if row.get("funding_booked_on_partials_known") is True else None
+    whole = not is_partial and not row.get("partial_sold") and fragment is not None and fragment == position
+    source = resolution.get("source", "unavailable")
+    verified = (
+        whole and source == "private_account_payments"
+        and resolution.get("position_side_verified") is True
+        and resolution.get("position_identity_verified") is True
+        and resolution.get("has_matching_events") is True
+        and bool(resolution.get("source_sha256")) and previous in (None, 0.0)
+    )
+    estimated = whole and source == "public_current_rate_schedule" and bool(resolution.get("source_sha256"))
+    known = verified or estimated
+    basis = {
+        "private_account_payments": "account_payment_sum_v1",
+        "public_current_rate_schedule": "entry_notional_current_rate_schedule_v1",
+    }.get(source, "unknown")
+    return build_funding_evidence(
+        status="verified_account_payment" if verified else "estimated_public_model" if estimated else "unknown",
+        bot_name=bot_name, mode_is_sim=False, symbol=symbol,
+        entry_id=row.get("entry_id"), buy_time=row.get("buy_time"), sell_time=sell_time,
+        is_partial=is_partial, exchange_order_id=exchange_order_id,
+        cost_usdt=booked_cost if known else None, booked_cost_usdt=booked_cost,
+        source=source, model_basis=basis, coverage_complete=known,
+        observed_settlements=resolution.get("observed_settlements", 0),
+        source_sha256=resolution.get("source_sha256"),
+        fragment_base_quantity=fragment, pos_base_quantity=position,
+        previously_booked_cost_usdt=previous,
+    )
+
+
+def allocate_private_funding_remaining(total: float, row: dict) -> float | None:
+    """Account payments already reflect changing size; subtract known bookings."""
+    if not row.get("partial_sold"):
+        return _finite_float_or_none(total)
+    previous = _finite_float_or_none(row.get("funding_booked_on_partials"))
+    if row.get("funding_booked_on_partials_known") is not True or previous is None:
+        return None
+    value = _finite_float_or_none(total)
+    return value - previous if value is not None else None
 
 
 #  Current funding rate + OI snapshot 

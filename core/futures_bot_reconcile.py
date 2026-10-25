@@ -3523,6 +3523,7 @@ class FuturesReconcileMixin:
                 "initial_entry_fee", state_row.get("fees_paid", 0))) or 0.0
             funding_total = _finite_float_or_none(
                 state_row.get("funding_paid", 0))
+            funding_resolution = {}
             if funding_total is None:
                 funding_total = 0.0
             funding_requires_history = (
@@ -3556,30 +3557,7 @@ class FuturesReconcileMixin:
                     )
                 ):
                     funding_requires_history = True
-            if funding_requires_history:
-                from bot_utils.futures_funding import fetch_realized_funding
-
-                exact_funding = fetch_realized_funding(
-                    self.ex,
-                    f"{sym}/USDT:USDT",
-                    buy_time,
-                    until_time_str=state_row.get(
-                        "accounting_pending_sell_time"
-                    ) or receipt_sell_time,
-                    notional_usdt=funding_notional,
-                )
-                if exact_funding is None:
-                    retry_delay = _defer_offline_accounting_retry(
-                        self, sym, state_row
-                    )
-                    log_event(
-                        f" {sym}: offline-close accounting deferred; exact "
-                        f"funding history unavailable; retry in "
-                        f"{retry_delay:.0f}s",
-                        "ERROR",
-                    )
-                    return False
-                funding_total = exact_funding
+            funding_requires_history = funding_requires_history and not accounting_mode_is_sim
             funding_booked = _finite_float_or_none(
                 state_row.get("funding_booked_on_partials", 0))
             if funding_booked is None:
@@ -3643,6 +3621,33 @@ class FuturesReconcileMixin:
                 )
                 return False
 
+            from bot_utils.futures_funding import freeze_funding_close_time
+            sell_time = freeze_funding_close_time(
+                self.state, sym, state_row,
+                state_row.get("accounting_pending_sell_time") or receipt_sell_time
+                or now_utc().strftime("%Y-%m-%d %H:%M:%S"),
+            )
+            if sell_time is None:
+                return False
+            if funding_requires_history:
+                from bot_utils.futures_funding import fetch_realized_funding
+
+                exact_funding = fetch_realized_funding(
+                    self.ex, symbol_full, buy_time, until_time_str=sell_time,
+                    notional_usdt=funding_notional,
+                    _history_evidence=funding_resolution,
+                    _expected_position_type=pos_type,
+                )
+                if exact_funding is None:
+                    retry_delay = _defer_offline_accounting_retry(self, sym, state_row)
+                    log_event(
+                        f" {sym}: offline-close accounting deferred; exact "
+                        f"funding history unavailable; retry in {retry_delay:.0f}s",
+                        "ERROR",
+                    )
+                    return False
+                funding_total = exact_funding
+
             # Calculate PnL the same way the bot's normal close does
             if pos_type == "LONG":
                 price_move_pct = ((close_price - entry) / entry) * 100
@@ -3703,6 +3708,12 @@ class FuturesReconcileMixin:
                     state_row.get("funding_booked_on_partials_known") is True
                 ),
             )
+            if funding_resolution.get("source") == "private_account_payments":
+                from bot_utils.futures_funding import allocate_private_funding_remaining
+                funding_pd = allocate_private_funding_remaining(funding_total, state_row)
+                if funding_pd is None:
+                    _defer_offline_accounting_retry(self, sym, state_row)
+                    return False
 
             # Net PnL  fees and funding deducted. If emergency-close already
             # flattened the exchange position but DB accounting failed, prefer
@@ -3713,18 +3724,6 @@ class FuturesReconcileMixin:
                     entry_fee = 0.0
                     close_fee = pending_fee_total
                 if funding_requires_history:
-                    funding_pd = safe_remaining_funding(
-                        funding_total,
-                        amount,
-                        original_amount,
-                        partial_sold=partial_sold,
-                        booked_on_partials=funding_booked,
-                        booked_on_partials_known=(
-                            state_row.get(
-                                "funding_booked_on_partials_known"
-                            ) is True
-                        ),
-                    )
                     net_pnl = round(
                         gross_pnl - entry_fee - close_fee - funding_pd,
                         4,
@@ -3756,10 +3755,6 @@ class FuturesReconcileMixin:
             mae_pct = min(0.0, close_move_pct, mae_pct or 0.0)
             giveback_pct = max(0.0, mfe_pct - close_move_pct)
 
-            sell_time = str(
-                state_row.get("accounting_pending_sell_time")
-                or receipt_sell_time
-                or now_utc().strftime("%Y-%m-%d %H:%M:%S"))
             reason = str(
                 state_row.get("accounting_pending_reason")
                 or f"Offline close ({close_source})")
@@ -3789,6 +3784,30 @@ class FuturesReconcileMixin:
                 "accounting_pending_entry_quality_reasons",
                 state_row.get("entry_quality_reasons"),
             )
+            funding_evidence = state_row.get("accounting_pending_funding_evidence")
+            if not accounting_mode_is_sim and (funding_requires_history or not pending_accounting):
+                from bot_utils.futures_funding import live_close_funding_evidence
+                funding_cs = _positive_float_or_none(state_row.get("entry_contract_size"))
+                if funding_cs is None:
+                    funding_cs = futures_contract_size_or_none(self.ex, symbol_full)
+                funding_evidence = live_close_funding_evidence(
+                    bot_name=self.BOT_NAME, symbol=sym, row=state_row,
+                    sell_time=sell_time, closed_amount=amount, contract_size=funding_cs,
+                    booked_cost=funding_pd, resolution=funding_resolution,
+                    exchange_order_id=accounting_exchange_order_id,
+                )
+            if accounting_mode_is_sim and not pending_accounting:
+                from bot_utils.futures_funding import sim_fragment_funding
+                funding_cs = _positive_float_or_none(state_row.get("entry_contract_size"))
+                if funding_cs is None:
+                    funding_cs = futures_contract_size_or_none(self.ex, symbol_full)
+                funding_pd, funding_evidence = sim_fragment_funding(
+                    self.ex, bot_name=self.BOT_NAME, symbol=sym, row=state_row,
+                    sell_time=sell_time, closed_amount=amount,
+                    contract_size=funding_cs,
+                    exchange_order_id=accounting_exchange_order_id,
+                )
+                net_pnl = round(gross_pnl - entry_fee - close_fee - funding_pd, 4)
             replay_fields = {
                 "accounting_pending": True,
                 "accounting_pending_sell_price": close_price,
@@ -3798,6 +3817,7 @@ class FuturesReconcileMixin:
                 "accounting_pending_profit_pct": price_move_pct,
                 "accounting_pending_fees_usdt": entry_fee + close_fee,
                 "accounting_pending_funding_paid": funding_pd,
+                "accounting_pending_funding_evidence": funding_evidence,
                 "accounting_pending_mode_is_sim": accounting_mode_is_sim,
                 "accounting_pending_exchange_order_id": (
                     accounting_exchange_order_id
@@ -3849,6 +3869,7 @@ class FuturesReconcileMixin:
                 leverage=lev,
                 liquidation_price=liq_price,
                 funding_paid=funding_pd,
+                funding_evidence=funding_evidence,
                 fees_usdt=entry_fee + close_fee,
                 exchange_order_id=accounting_exchange_order_id,
                 mfe_pct=mfe_pct,

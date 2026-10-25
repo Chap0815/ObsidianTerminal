@@ -5,8 +5,10 @@ import math
 import os
 import threading
 import time
+import uuid
 
 from bot_utils.runtime_threads import thread_definitely_never_started
+from trading.candidate_feature_evidence import FeatureContext, FeatureReceiptOutput
 
 
 EXPECTANCY_FEATURES: dict[str, tuple[str, ...]] = {
@@ -61,6 +63,39 @@ _RETENTION_INTERVAL_SECONDS = 3600.0
 _RETENTION_RETRY_SECONDS = 60.0
 _RETENTION_ADVISORY_LOCK_NAME = "research_telemetry_retention"
 _RETENTION_ADVISORY_TTL_SECONDS = 900
+_FEATURE_PROCESS_NONCE = uuid.uuid4().hex
+
+
+def capture_prefill_feature_observation(*, entry_id, receipt, context):
+    """Re-read real committed feature evidence before the actual SIM calculation.
+
+    Missing storage/clock authority is observational unavailability, never an
+    entry gate. A restart finalizer must not call this function to mint history.
+    """
+    try:
+        from trading.candidate_feature_evidence import (
+            build_prefill_observation, normalize_feature_receipt,
+        )
+        from core.database import get_candidate_feature_receipt
+        from core.clock import availability_time_interval_ms
+
+        expected = normalize_feature_receipt(receipt, expected_entry_id=entry_id,
+                                              expected_context=context)
+        retrieved = get_candidate_feature_receipt(
+            entry_id=entry_id, expected_fact_sha256=expected["feature_fact_sha256"], context=context)
+        retrieved = normalize_feature_receipt(retrieved, expected_entry_id=entry_id,
+                                               expected_context=context,
+                                               expected_fact_sha256=expected["feature_fact_sha256"])
+        if retrieved != expected:
+            return None
+        received_monotonic = time.monotonic()
+        interval = availability_time_interval_ms()
+        before_sim_execution = time.monotonic()
+        return build_prefill_observation(retrieved, process_nonce=_FEATURE_PROCESS_NONCE,
+            retrieved_monotonic=received_monotonic,
+            before_sim_execution_monotonic=before_sim_execution, decision_interval_ms=interval)
+    except Exception:
+        return None
 
 
 def _log_telemetry_error(context: str, exc: BaseException) -> None:
@@ -355,8 +390,12 @@ def emit_expectancy_candidate(
     log_struct=None,
     persist_candidate=None,
     venue_symbol: str | None = None,
+    feature_fact_context: FeatureContext | None = None,
+    feature_receipt_out: FeatureReceiptOutput | None = None,
 ) -> bool:
     """Persist the exact causal feature vector later joined to a closed trade."""
+    if type(feature_receipt_out) is dict:
+        feature_receipt_out.clear()
     normalized_bot = str(bot).strip().upper()
     normalized_direction = str(direction).strip().upper()
     schemas = EXPECTANCY_FEATURE_SCHEMAS.get(normalized_bot)
@@ -411,6 +450,8 @@ def emit_expectancy_candidate(
     persisted = False
     default_persistence = persist_candidate is None
     persistence_error = None
+    expected_feature_fact = None
+    feature_wire_receipt = {}
     try:
         if default_persistence:
             from core.database import save_expectancy_candidate as persister
@@ -428,6 +469,26 @@ def emit_expectancy_candidate(
         )
         if default_persistence:
             persistence_fields["feature_snapshot"] = snapshot_payload
+            if feature_fact_context is not None:
+                try:
+                    import core.database as feature_store
+                    if not callable(getattr(feature_store, "get_candidate_feature_receipt", None)):
+                        raise ValueError("feature evidence store is not available")
+                    from trading.candidate_feature_evidence import build_feature_fact
+                    expected_feature_fact = build_feature_fact(
+                        entry_id=str(entry_id), context=feature_fact_context,
+                        candidate_time=candidate_time, feature_schema_version=schema_version,
+                        features=normalized_features)
+                    if (expected_feature_fact["context"]["bot_name"] != normalized_bot
+                            or expected_feature_fact["context"]["mode"] != str(mode).strip().upper()
+                            or expected_feature_fact["context"]["symbol"] != str(symbol)
+                            or expected_feature_fact["context"]["direction"] != normalized_direction):
+                        raise ValueError("feature context conflicts with emitted candidate")
+                except Exception:
+                    expected_feature_fact = None
+                if expected_feature_fact is not None:
+                    persistence_fields["feature_fact_context"] = expected_feature_fact["context"]
+                    persistence_fields["feature_receipt_out"] = feature_wire_receipt
         if normalized_decision is not None:
             persistence_fields["quality_decision"] = normalized_decision
         persistence_result = persister(**persistence_fields)
@@ -439,6 +500,19 @@ def emit_expectancy_candidate(
     except Exception as exc:
         persistence_error = exc
         persisted = False
+    if persisted and expected_feature_fact is not None and type(feature_receipt_out) is dict:
+        try:
+            from trading.candidate_feature_evidence import (
+                feature_fact_sha256, normalize_feature_receipt,
+            )
+            if set(feature_wire_receipt) != {"receipt"}:
+                raise ValueError("feature receipt result is absent or ambiguous")
+            feature_receipt_out["receipt"] = normalize_feature_receipt(
+                feature_wire_receipt["receipt"], expected_entry_id=str(entry_id),
+                expected_context=expected_feature_fact["context"],
+                expected_fact_sha256=feature_fact_sha256(expected_feature_fact))
+        except Exception:
+            feature_receipt_out.clear()
     if default_persistence and not persisted:
         _log_telemetry_error(
             "persist expectancy candidate",

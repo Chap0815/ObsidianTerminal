@@ -557,6 +557,8 @@ def process_due_tca_markouts(
         quarantine_execution_markout,
         release_advisory_lock,
         renew_advisory_lock,
+        recover_sim_execution_availability,
+        recover_sim_trade_fragment_availability,
     )
 
     completed = 0
@@ -625,6 +627,20 @@ def process_due_tca_markouts(
 
     primary_error: BaseException | None = None
     try:
+        # A crashed post-commit witness is recovered at the actual later read,
+        # never at the original fill/observation time. No exchange call is made.
+        try:
+            recover_sim_execution_availability(
+                limit=min(25, row_limit), producer_bots=producer_bots
+            )
+        except Exception as exc:
+            silent_log("recover SIM evidence availability", exc)
+        try:
+            recover_sim_trade_fragment_availability(
+                limit=min(25, row_limit), producer_bots=producer_bots
+            )
+        except Exception as exc:
+            silent_log("recover SIM trade fragment availability", exc)
         try:
             list_kwargs = {"limit": row_limit}
             if producer_bots is not None:

@@ -17,7 +17,7 @@ from core.constants import SIM_CAPTURE_CONTRACT_SCHEMA
 from bot_utils.order_utils import explicit_trade_symbol_matches
 
 
-_SUPPORTED_SIM_TCA_BOTS = frozenset({"CROSS", "FUTREND", "SPOT", "TREND"})
+_SUPPORTED_SIM_TCA_BOTS = frozenset({"FUTURES", "CROSS", "FUTREND", "SPOT", "TREND"})
 _SIM_TCA_RATE_LIMIT_COOLDOWN_SECONDS = 12.0
 _SIM_TCA_RATE_LIMIT_LOCK = threading.Lock()
 _SIM_TCA_RATE_LIMIT_UNTIL = 0.0
@@ -60,6 +60,39 @@ def _positive(value, name: str) -> float:
     return parsed
 
 
+def _simulated_execution_scope(exchange, symbol: str) -> dict:
+    """Describe the actual public client and loaded market; never infer a venue."""
+    unknown = {"capture_scope_schema": 1, "venue": None, "market_type": None}
+    try:
+        venue = getattr(exchange, "id", None)
+        markets = getattr(exchange, "markets", None)
+        market = markets.get(symbol) if isinstance(markets, dict) else None
+        if not isinstance(venue, str) or not venue.strip():
+            return unknown
+        venue = venue.strip().lower()
+        if not venue.isascii() or not venue.replace("_", "").replace("-", "").isalnum():
+            return unknown
+        if not isinstance(market, dict) or market.get("symbol") != symbol:
+            return {**unknown, "venue": venue}
+        market_type = market.get("type")
+        if market_type == "spot":
+            valid = (
+                market.get("spot") is True and market.get("swap") is not True
+                and market.get("future") is not True and market.get("contract") is not True
+            )
+        elif market_type == "swap":
+            valid = (
+                market.get("swap") is True and market.get("contract") is True
+                and market.get("spot") is not True and market.get("future") is not True
+            )
+        else:
+            valid = False
+        return {**unknown, "venue": venue, "market_type": market_type if valid else None}
+    except Exception:
+        # Missing provenance degrades research eligibility, never the entry.
+        return unknown
+
+
 def _persist_sim_tca_capture_failure(
     *,
     entry_id: str,
@@ -95,6 +128,68 @@ def _persist_sim_tca_capture_failure(
         return False
 
 
+def prepare_simulated_entry_book(*, exchange, symbol: str, side: str,
+                                 amount: float, contract_size: float,
+                                 depth_levels: int = 20):
+    """Read one budgeted public arrival before the SIM fill, or return no book.
+
+    The caller freezes its fill only afterwards. No order, candidate mutation or
+    persistence occurs here; failed research capture must not veto the entry.
+    """
+    reservation = None
+    endpoint = "candidate_microstructure_fetch_order_book"
+    try:
+        if _sim_tca_rate_limit_active():
+            return None
+        markets = getattr(exchange, "markets", None)
+        market = markets.get(symbol) if isinstance(markets, dict) else None
+        if (not isinstance(market, dict) or market.get("symbol") != symbol
+                or market.get("swap") is not True or market.get("contract") is not True
+                or market.get("linear") is not True
+                or type(market.get("contractSize")) not in (int, float)
+                or type(contract_size) not in (int, float)
+                or not math.isfinite(contract_size) or contract_size <= 0
+                or market["contractSize"] != contract_size):
+            return None
+        levels = int(depth_levels)
+        if not 5 <= levels <= 100:
+            return None
+        from bot_utils.api_budget import try_consume_api_call
+
+        reservation = _consume_with_optional_reservation(try_consume_api_call, endpoint)
+        if not reservation:
+            return None
+        raw = exchange.fetch_order_book(symbol, limit=levels)
+        received = float(exchange_clock.now_ms())
+        if not math.isfinite(received) or received <= 0:
+            raise ValueError("SIM arrival receipt time is invalid")
+        if not isinstance(raw, dict) or raw.get("symbol") != symbol:
+            raise ValueError("SIM arrival book identity is unverified")
+        book = {"symbol": symbol, "timestamp": raw.get("timestamp"),
+                "bids": [list(level) for level in (raw.get("bids") or [])[:levels]],
+                "asks": [list(level) for level in (raw.get("asks") or [])[:levels]]}
+        timestamp = book["timestamp"]
+        if (type(timestamp) not in (int, float) or not math.isfinite(timestamp)
+                or timestamp <= 0 or abs(received - timestamp) > 30_000):
+            raise ValueError("SIM arrival source time is unverified or stale")
+        from trading.execution_quality import build_arrival_tca
+
+        build_arrival_tca(book, side=side, amount=amount, local_time_ms=int(received))
+        return book, received
+    except Exception as exc:
+        try:
+            from bot_utils.api_budget import ApiCallReservation, record_api_error
+            from bot_utils.network_retry import is_rate_limited
+
+            if isinstance(reservation, ApiCallReservation):
+                record_api_error(endpoint, reservation)
+            if is_rate_limited(exc):
+                _open_sim_tca_rate_limit_cooldown()
+        except Exception:
+            pass
+        return None
+
+
 def capture_simulated_entry_tca(
     *,
     exchange,
@@ -114,6 +209,9 @@ def capture_simulated_entry_tca(
     schedule_markouts=None,
     persist_snapshot=None,
     arrival_book: dict | None = None,
+    arrival_received_at_ms: float | None = None,
+    fill_time_ms: float | None = None,
+    feature_capsule: dict | None = None,
 ) -> bool:
     """Record SIM arrival/fill/markouts without creating an order intent."""
     default_persistence = False
@@ -162,6 +260,29 @@ def capture_simulated_entry_tca(
             and schedule_markouts is None
             and persist_snapshot is None
         )
+        timing = {}
+        if arrival_received_at_ms is not None or fill_time_ms is not None:
+            if (any(type(value) not in (int, float) or not math.isfinite(value)
+                    or value <= 0 for value in (arrival_received_at_ms, fill_time_ms))
+                    or arrival_book is None or filled_at is None):
+                raise ValueError("prepared arrival requires exact receipt and fill times")
+            if not 0 <= fill_time_ms - arrival_received_at_ms <= 1000:
+                raise ValueError("prepared arrival does not precede this SIM fill")
+            source_time = arrival_book.get("timestamp")
+            if (type(source_time) not in (int, float) or not math.isfinite(source_time)
+                    or source_time <= 0 or source_time > fill_time_ms):
+                raise ValueError("SIM arrival source time does not precede the exact fill")
+            # Existing queue timestamps have whole-second precision. This is
+            # explicitly a conservative scheduling anchor, not the exact fill.
+            if parsed_time.timestamp() != math.ceil(fill_time_ms / 1000):
+                raise ValueError("SIM markout schedule anchor must ceil the exact fill")
+            recorded = float(exchange_clock.now_ms())
+            if not math.isfinite(recorded) or recorded < fill_time_ms:
+                raise ValueError("SIM serialization time precedes the exact fill")
+            timing = {"arrival_receipt_ms": arrival_received_at_ms,
+                      "fill_time_ms": fill_time_ms,
+                      "capture_recorded_at_ms": recorded,
+                      "capture_anchor_semantics": "ceil_fill_markout_schedule"}
         if default_persistence:
             from core.database import has_simulated_expectancy_candidate
 
@@ -239,7 +360,8 @@ def capture_simulated_entry_tca(
         failure_reason = "arrival_tca_invalid"
         from trading.execution_quality import build_arrival_tca, compute_fill_tca
 
-        local_time_ms = int(exchange_clock.now_ms())
+        local_time_ms = (int(arrival_received_at_ms) if arrival_received_at_ms is not None
+                         else int(exchange_clock.now_ms()))
         try:
             if (
                 isinstance(book, dict)
@@ -275,8 +397,11 @@ def capture_simulated_entry_tca(
             average_fill_price=reference,
             fee_rate=fee,
         )
+        execution_scope = _simulated_execution_scope(exchange, normalized_symbol)
         arrival_payload = {
             **asdict(arrival),
+            **execution_scope,
+            **timing,
             "capture_anchor_utc": measured_at,
             "capture_contract_schema": SIM_CAPTURE_CONTRACT_SCHEMA,
             "bot_name": normalized_bot,
@@ -289,6 +414,8 @@ def capture_simulated_entry_tca(
         }
         fill_payload = {
             **asdict(fill),
+            **execution_scope,
+            **timing,
             "capture_anchor_utc": measured_at,
             "capture_contract_schema": SIM_CAPTURE_CONTRACT_SCHEMA,
             "bot_name": normalized_bot,
@@ -298,6 +425,21 @@ def capture_simulated_entry_tca(
         if default_persistence:
             failure_reason = "bundle_persist_failed"
             from core.database import persist_simulated_entry_tca_bundle
+            decoded_feature_capsule = None
+            if feature_capsule is not None and fill_time_ms is not None:
+                try:
+                    from trading.candidate_feature_evidence import normalize_feature_capsule
+                    decoded = normalize_feature_capsule(feature_capsule,
+                        expected_entry_id=normalized_entry_id, expected_fill_time_ms=fill_time_ms)
+                    context = decoded["prefill"]["receipt"]["context"]
+                    if (normalized_bot != "FUTURES" or context["venue_symbol"] != normalized_symbol
+                            or context["direction"] != ("LONG" if normalized_side == "buy" else "SHORT")
+                            or context["venue"] != execution_scope["venue"]
+                            or context["market_type"] != execution_scope["market_type"]):
+                        raise ValueError("feature capsule conflicts with this execution")
+                    decoded_feature_capsule = decoded
+                except Exception:
+                    pass
 
             persist_simulated_entry_tca_bundle(
                 normalized_entry_id,
@@ -308,6 +450,7 @@ def capture_simulated_entry_tca(
                 measured_at=measured_at,
                 arrival_payload=arrival_payload,
                 fill_payload=fill_payload,
+                **({"feature_capsule": decoded_feature_capsule} if decoded_feature_capsule is not None else {}),
             )
         else:
             if record_tca is None:

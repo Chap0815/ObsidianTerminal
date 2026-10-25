@@ -1,14 +1,13 @@
 """
 trading/xsec_signal.py  Cross-sectional momentum signal (PURE, no I/O).
 
-The validated logic from tools/xsec_momentum.py, extracted as a pure, unit-
+The signal logic shared with tools/xsec_momentum.py, extracted as a pure, unit-
 testable module (mirrors trading/trend_signal.py for the trend bot). The
 orchestrator (core/cross_bot.py) handles all exchange I/O, state and execution.
 
 Strategy: long the strongest K coins by lookback return / short the weakest K,
 DOLLAR-NEUTRAL, with an own-momentum CRASH FILTER (exposure overlay that goes
-flat after the strategy's own recent rebalances turn net-negative  the robust
-drawdown-halving overlay from the research).
+flat after the strategy's recent gross rebalance returns average negative).
 
 NO look-ahead: rankings use only past closes; the crash filter uses only PAST
 realized rebalance returns.
@@ -92,16 +91,65 @@ def rank_and_select(returns: Dict[str, float], k: int) -> Tuple[List[str], List[
     return ranked[:k_eff], ranked[-k_eff:]
 
 
+def select_retained_ranked_symbols(
+    ranked_symbols: List[str], previous_weights: Dict[str, float],
+    k: int, hold_rank_buffer: int,
+) -> Tuple[List[str], List[str]]:
+    """Research retention selection from an ascending, already fixed ranking.
+
+    Preserve the caller's tie order and the experiment suite's long-first
+    allocation. Inputs contain no forward outcomes; weights supply only the
+    previous side. This is not enabled in the runtime signal contract.
+    """
+    if (type(k) is not int or k <= 0 or type(hold_rank_buffer) is not int
+            or hold_rank_buffer < 0):
+        raise ValueError("retention rank parameters must be non-negative integers with K positive")
+    if (any(not isinstance(symbol, str) or not symbol for symbol in ranked_symbols)
+            or len(set(ranked_symbols)) != len(ranked_symbols)):
+        raise ValueError("retention rank symbols must be unique and non-empty")
+    ranks = {symbol: rank for rank, symbol in enumerate(ranked_symbols)}
+    held_longs = [
+        symbol for symbol in reversed(ranked_symbols)
+        if previous_weights.get(symbol, 0.0) > 0.0
+        and ranks[symbol] >= len(ranked_symbols) - k - hold_rank_buffer
+    ][:k]
+    long_symbols = set(held_longs)
+    longs = list(held_longs)
+    for symbol in reversed(ranked_symbols):
+        if len(longs) >= k:
+            break
+        if symbol not in long_symbols:
+            longs.append(symbol)
+            long_symbols.add(symbol)
+    held_shorts = [
+        symbol for symbol in ranked_symbols
+        if previous_weights.get(symbol, 0.0) < 0.0
+        and ranks[symbol] < k + hold_rank_buffer and symbol not in long_symbols
+    ][:k]
+    short_symbols = set(held_shorts)
+    shorts = list(held_shorts)
+    for symbol in ranked_symbols:
+        if len(shorts) >= k:
+            break
+        if symbol not in short_symbols and symbol not in long_symbols:
+            shorts.append(symbol)
+            short_symbols.add(symbol)
+    return longs, shorts
+
+
 def crash_exposure(recent_rebalance_returns: List[float],
-                   params: XSecParams) -> float:
+                   params: XSecParams, *,
+                   completed_crash_flat_slot: bool = False) -> float:
     """Own-momentum crash filter  exposure multiplier in {0.0, 1.0}.
 
     Go FLAT (0.0) when the strategy's own last ``crash_window`` rebalance
-    returns are net-negative; otherwise full exposure. A trailing neutral
-    sample is the persisted marker for one completed crash-flat slot and permits
-    the next anchored-slot re-entry without erasing the loss history. Uses only
-    PAST realized returns (no look-ahead). During warmup  full exposure.
+    gross returns average negative; otherwise full exposure. An explicitly
+    proven completed crash-flat slot permits anchored-slot re-entry. A numeric
+    zero by itself can also be a real traded return and is never such proof.
+    Uses only PAST realized returns (no look-ahead). During warmup full exposure.
     """
+    if not isinstance(completed_crash_flat_slot, bool):
+        raise ValueError("completed crash-flat slot proof must be boolean")
     if not params.crash_filter:
         return 1.0
     try:
@@ -121,7 +169,7 @@ def crash_exposure(recent_rebalance_returns: List[float],
         if not math.isfinite(value):
             return 0.0
         window.append(value)
-    if window[-1] == 0.0:
+    if completed_crash_flat_slot and window[-1] == 0.0:
         return 1.0
     return 0.0 if statistics.mean(window) < 0.0 else 1.0
 
@@ -136,9 +184,11 @@ def advance_crash_history(
 ) -> List[float]:
     """Return the next bounded own-momentum history.
 
-    A crash-flat book has no realized price move. Recording one neutral marker
+    A crash-flat book has no realized price move. Recording one neutral sample
     at the *next anchored rebalance slot* proves that one full slot elapsed and
-    permits re-entry without inventing profit or deleting the negative history.
+    preserves history without inventing profit or deleting negative returns.
+    The orchestrator must separately prove completion of that crash-flat slot;
+    the numeric sample alone cannot authorize re-entry.
     Repeated polls/manual retries cannot age the history. This also makes the
     live transition reproducible in replay.
     """
@@ -180,9 +230,11 @@ def advance_crash_history(
 
 def compute_target_book(prices_by_symbol: Dict[str, List[float]],
                         recent_rebalance_returns: List[float],
-                        params: XSecParams) -> TargetBook:
+                        params: XSecParams, *,
+                        completed_crash_flat_slot: bool = False) -> TargetBook:
     """PURE: from price histories + own recent realized PnL  the target book."""
-    mult = crash_exposure(recent_rebalance_returns, params)
+    mult = crash_exposure(recent_rebalance_returns, params,
+                          completed_crash_flat_slot=completed_crash_flat_slot)
     if mult <= 0.0:
         return TargetBook(longs=[], shorts=[], exposure_mult=0.0)
     returns = {
